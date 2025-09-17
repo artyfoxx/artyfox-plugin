@@ -1,0 +1,34 @@
+{
+    "tasks": [
+        {
+            "type": "cppbuild",
+            "label": "C/C++: gcc.exe сборка активного файла",
+            "command": "C:/msys64/ucrt64/bin/gcc.exe",
+            "args": [
+                "-shared",
+                "-O2",
+                "-ffast-math",
+                "-Wall",
+                "-Wextra",
+                // "-fdiagnostics-color=always",
+                // "-g",
+                "-I\"C:\\Program Files\\VapourSynth\\sdk\\include\\vapoursynth\"",
+                "${file}",
+                "-o",
+                "${fileDirname}\\${fileBasenameNoExtension}.dll"
+            ],
+            "options": {
+                "cwd": "C:/msys64/ucrt64/bin"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "detail": "Задача создана отладчиком."
+        }
+    ],
+    "version": "2.0.0"
+}
