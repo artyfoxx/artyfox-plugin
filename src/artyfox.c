@@ -17,6 +17,9 @@ typedef struct {
     float start_h;
     float real_w;
     float real_h;
+    int kernel;
+    float tale_w;
+    float tale_h;
     float gamma;
     float sharp;
 } ResizeData;
@@ -57,7 +60,98 @@ static void yuv_to_linear(const float *srcp, float *dstp, ptrdiff_t stride, int 
     }
 }
 
-static void resize_width(const float *srcp, float *dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride, int src_w, int src_h, int dst_w, bool chroma, int subsampling_w, float start_w, float real_w, int chromaloc) {
+static inline float area_kernel(float x, float scale) {
+    if (scale > 1.0f) {
+        scale = 1.0f / scale;
+    }
+    if (x <= -0.5f - scale / 2.0f) {
+        return 0.0f;
+    }
+    if (x <= -0.5f + scale / 2.0f) {
+        return 0.5f - (-x - 0.5f) / scale;
+    }
+    if (x <= 0.5f - scale / 2.0f) {
+        return 1.0f;
+    }
+    if (x <= 0.5f + scale / 2.0f) {
+        return 0.5f - (x - 0.5f) / scale;
+    }
+    return 0.0f;
+}
+
+static inline float magic_kernel(float x) {
+    if (x <= -1.5f) {
+        return 0.0f;
+    }
+    if (x <= -0.5f) {
+        return 0.5f * powf(x + 1.5f, 2.0f);
+    }
+    if (x <= 0.5f) {
+        return 0.75f - powf(x, 2.0f);
+    }
+    if (x <= 1.5f) {
+        return 0.5f * powf(x - 1.5f, 2.0f);
+    }
+    return 0.0f;
+}
+
+static inline float magic_kernel_2013(float x) {
+    if (x <= -2.5f) {
+        return 0.0f;
+    }
+    if (x <= -1.5f) {
+        return -0.125f * powf(x + 2.5f, 2.0f);
+    }
+    if (x <= -0.5f) {
+        return 0.25f * (4.0f * powf(x, 2.0f) + 11.0f * x + 7.0f);
+    }
+    if (x <= 0.5f) {
+        return 1.0625f - 1.75f * powf(x, 2.0f);
+    }
+    if (x <= 1.5f) {
+        return 0.25f * (4.0f * powf(x, 2.0f) - 11.0f * x + 7.0f);
+    }
+    if (x <= 2.5f) {
+        return -0.125f * powf(x - 2.5f, 2.0f);
+    }
+    return 0.0f;
+}
+
+static inline float magic_kernel_2021(float x) {
+    if (x <= -4.5f) {
+        return 0.0f;
+    }
+    if (x <= -3.5f) {
+        return -1.0f / 1152.0f * powf(2.0f * x + 9.0f, 2.0f);
+    }
+    if (x <= -2.5f) {
+        return 1.0f / 144.0f * (4.0f * powf(x, 2.0f) + 27.0f * x + 45.0f);
+    }
+    if (x <= -1.5f) {
+        return -1.0f / 144.0f * (24.0f * powf(x, 2.0f) + 113.0f * x + 130.0f);
+    }
+    if (x <= -0.5f) {
+        return 1.0f / 144.0f * (140.0f * powf(x, 2.0f) + 379.0f * x + 239.0f);
+    }
+    if (x <= 0.5f) {
+        return 577.0f / 576.0f - 239.0f / 144.0f * powf(x, 2.0f);
+    }
+    if (x <= 1.5f) {
+        return 1.0f / 144.0f * (140.0f * powf(x, 2.0f) - 379.0f * x + 239.0f);
+    }
+    if (x <= 2.5f) {
+        return -1.0f / 144.0f * (24.0f * powf(x, 2.0f) - 113.0f * x + 130.0f);
+    }
+    if (x <= -3.5f) {
+        return 1.0f / 144.0f * (4.0f * powf(x, 2.0f) - 27.0f * x + 45.0f);
+    }
+    if (x <= -4.5f) {
+        return -1.0f / 1152.0f * powf(2.0f * x - 9.0f, 2.0f);
+    }
+    return 0.0f;
+}
+
+static void resize_width(const float *srcp, float *dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride, int src_w, int src_h, int dst_w, bool chroma, int subsampling_w, float start_w, float real_w, int chromaloc, float tale, int kernel) {
     // Для люмы и RGB сдвиги считаются напрямую, а для хромы - с учётом сабсэмплинга и выравнивания
     if (chroma) {
         start_w /= 1 << subsampling_w;
@@ -68,42 +162,79 @@ static void resize_width(const float *srcp, float *dstp, ptrdiff_t src_stride, p
         }
     }
     
-    int low_w = floorf(start_w);
-    float shift_w = start_w - low_w;
-    int high_w = ceilf(real_w + start_w);
-    int max_w = src_w - 1;
+    float scale = dst_w / real_w;
+    float **weights = (float **)malloc(sizeof(float *) * dst_w);
+    int min_w = (int)floorf(start_w);
+    int max_w = (int)ceilf(real_w + start_w);
     
-    for (int y = 0; y < src_h; y++) {
-        memset(dstp, 0, dst_stride * sizeof(float));
-        float dist = real_w - dst_w + shift_w * dst_w;
-        int k = 0;
-        dstp[k] -= srcp[CLAMP(low_w, 0, max_w)] * shift_w * dst_w;
-        for (int x = low_w; x < high_w; x++) {
-            if (dist > 0.0f) {
-                dstp[k] += srcp[CLAMP(x, 0, max_w)] * dst_w;
-                dist -= dst_w;
-            }
-            else if (dist == 0.0f) {
-                dstp[k++] += srcp[CLAMP(x, 0, max_w)] * dst_w;
-                dist = real_w - dst_w;
-            }
-            else {
-                dstp[k++] += srcp[CLAMP(x, 0, max_w)] * (dst_w + dist);
-                if (k < dst_w) {
-                    dstp[k] -= srcp[CLAMP(x, 0, max_w)] * dist;
-                }
-                dist += real_w - dst_w;
+    if (kernel == 1) {
+        for (int x = 0; x < dst_w; x++) {
+            float center = (x + 0.5f) / scale - 0.5f + start_w;
+            int low = MAX((int)floorf(center - tale / scale), min_w);
+            int high = MIN((int)ceilf(center + tale / scale), max_w);
+            weights[x] = (float *)malloc(sizeof(float) * (high - low + 1));
+            for (int i = low; i <= high; i++) {
+                weights[x][i - low] = magic_kernel((i + 0.5f - start_w) * scale - 0.5f - x);
             }
         }
+    }
+    else if (kernel == 2) {
         for (int x = 0; x < dst_w; x++) {
-            dstp[x] /= real_w;
+            float center = (x + 0.5f) / scale - 0.5f + start_w;
+            int low = MAX((int)floorf(center - tale / scale), min_w);
+            int high = MIN((int)ceilf(center + tale / scale), max_w);
+            weights[x] = (float *)malloc(sizeof(float) * (high - low + 1));
+            for (int i = low; i <= high; i++) {
+                weights[x][i - low] = magic_kernel_2013((i + 0.5f - start_w) * scale - 0.5f - x);
+            }
+        }
+    }
+    else if (kernel == 3) {
+        for (int x = 0; x < dst_w; x++) {
+            float center = (x + 0.5f) / scale - 0.5f + start_w;
+            int low = MAX((int)floorf(center - tale / scale), min_w);
+            int high = MIN((int)ceilf(center + tale / scale), max_w);
+            weights[x] = (float *)malloc(sizeof(float) * (high - low + 1));
+            for (int i = low; i <= high; i++) {
+                weights[x][i - low] = magic_kernel_2021((i + 0.5f - start_w) * scale - 0.5f - x);
+            }
+        }
+    }
+    else {
+        for (int x = 0; x < dst_w; x++) {
+            float center = (x + 0.5f) / scale - 0.5f + start_w;
+            int low = MAX((int)floorf(center - tale / scale), min_w);
+            int high = MIN((int)ceilf(center + tale / scale), max_w);
+            weights[x] = (float *)malloc(sizeof(float) * (high - low + 1));
+            for (int i = low; i <= high; i++) {
+                weights[x][i - low] = area_kernel((i + 0.5f - start_w) * scale - 0.5f - x, scale);
+            }
+        }
+    }
+    
+    for (int y = 0; y < src_h; y++) {
+        for (int x = 0; x < dst_w; x++) {
+            float center = (x + 0.5f) / scale - 0.5f + start_w;
+            int low = MAX((int)floorf(center - tale / scale), min_w);
+            int high = MIN((int)ceilf(center + tale / scale), max_w);
+            float sum = 0.0f;
+            float norm = 0.0f;
+            for (int i = low; i <= high; i++) {
+                sum += srcp[CLAMP(i, 0, src_w - 1)] * weights[x][i - low];
+                norm += weights[x][i - low];
+            }
+            dstp[x] = (norm > 0.0f) ? sum / norm : 0.0f;
         }
         dstp += dst_stride;
         srcp += src_stride;
     }
+    for (int x = 0; x < dst_w; x++) {
+        free(weights[x]);
+    }
+    free(weights);
 }
 
-static void resize_height(const float *srcp, float *dstp, int src_w, int src_h, int dst_h, bool chroma, int subsampling_h, float start_h, float real_h, int chromaloc) {
+static void resize_height(const float *srcp, float *dstp, ptrdiff_t dst_stride, int src_w, int src_h, int dst_h, bool chroma, int subsampling_h, float start_h, float real_h, int chromaloc, float tale, int kernel) {
     // Для люмы и RGB сдвиги считаются напрямую, а для хромы - с учётом сабсэмплинга и выравнивания
     if (chroma) {
         start_h /= 1 << subsampling_h;
@@ -117,41 +248,75 @@ static void resize_height(const float *srcp, float *dstp, int src_w, int src_h, 
         }
     }
     
-    int low_h = floorf(start_h);
-    float shift_h = start_h - low_h;
-    int high_h = ceilf(real_h + start_h);
-    int max_h = src_h - 1;
+    float scale = dst_h / real_h;
+    float **weights = (float **)malloc(sizeof(float *) * dst_h);
+    int min_h = (int)floorf(start_h);
+    int max_h = (int)ceilf(real_h + start_h);
     
-    for (int y = 0; y < src_w; y++) {
+    if (kernel == 1) {
         for (int x = 0; x < dst_h; x++) {
-            dstp[x * src_w] = 0.0f;
-        }
-        float dist = real_h - dst_h + shift_h * dst_h;
-        int k = 0;
-        dstp[k] -= srcp[CLAMP(low_h, 0, max_h) * src_w] * shift_h * dst_h;
-        for (int x = low_h; x < high_h; x++) {
-            if (dist > 0.0f) {
-                dstp[k * src_w] += srcp[CLAMP(x, 0, max_h) * src_w] * dst_h;
-                dist -= dst_h;
-            }
-            else if (dist == 0.0f) {
-                dstp[k++ * src_w] += srcp[CLAMP(x, 0, max_h) * src_w] * dst_h;
-                dist = real_h - dst_h;
-            }
-            else {
-                dstp[k++ * src_w] += srcp[CLAMP(x, 0, max_h) * src_w] * (dst_h + dist);
-                if (k < dst_h) {
-                    dstp[k * src_w] -= srcp[CLAMP(x, 0, max_h) * src_w] * dist;
-                }
-                dist += real_h - dst_h;
+            float center = (x + 0.5f) / scale - 0.5f + start_h;
+            int low = MAX((int)floorf(center - tale / scale), min_h);
+            int high = MIN((int)ceilf(center + tale / scale), max_h);
+            weights[x] = (float *)malloc(sizeof(float) * (high - low + 1));
+            for (int i = low; i <= high; i++) {
+                weights[x][i - low] = magic_kernel((i + 0.5f - start_h) * scale - 0.5f - x);
             }
         }
-        for (int x = 0; x < dst_h; x++) {
-            dstp[x * src_w] /= real_h;
-        }
-        dstp++;
-        srcp++;
     }
+    else if (kernel == 2) {
+        for (int x = 0; x < dst_h; x++) {
+            float center = (x + 0.5f) / scale - 0.5f + start_h;
+            int low = MAX((int)floorf(center - tale / scale), min_h);
+            int high = MIN((int)ceilf(center + tale / scale), max_h);
+            weights[x] = (float *)malloc(sizeof(float) * (high - low + 1));
+            for (int i = low; i <= high; i++) {
+                weights[x][i - low] = magic_kernel_2013((i + 0.5f - start_h) * scale - 0.5f - x);
+            }
+        }
+    }
+    else if (kernel == 3) {
+        for (int x = 0; x < dst_h; x++) {
+            float center = (x + 0.5f) / scale - 0.5f + start_h;
+            int low = MAX((int)floorf(center - tale / scale), min_h);
+            int high = MIN((int)ceilf(center + tale / scale), max_h);
+            weights[x] = (float *)malloc(sizeof(float) * (high - low + 1));
+            for (int i = low; i <= high; i++) {
+                weights[x][i - low] = magic_kernel_2021((i + 0.5f - start_h) * scale - 0.5f - x);
+            }
+        }
+    }
+    else {
+        for (int x = 0; x < dst_h; x++) {
+            float center = (x + 0.5f) / scale - 0.5f + start_h;
+            int low = MAX((int)floorf(center - tale / scale), min_h);
+            int high = MIN((int)ceilf(center + tale / scale), max_h);
+            weights[x] = (float *)malloc(sizeof(float) * (high - low + 1));
+            for (int i = low; i <= high; i++) {
+                weights[x][i - low] = area_kernel((i + 0.5f - start_h) * scale - 0.5f - x, scale);
+            }
+        }
+    }
+    
+    for (int y = 0; y < dst_h; y++) {
+        for (int x = 0; x < src_w; x++) {
+            float center = (y + 0.5f) / scale - 0.5f + start_h;
+            int low = MAX((int)floorf(center - tale / scale), min_h);
+            int high = MIN((int)ceilf(center + tale / scale), max_h);
+            float sum = 0.0f;
+            float norm = 0.0f;
+            for (int i = low; i <= high; i++) {
+                sum += srcp[CLAMP(i, 0, src_h - 1) * src_w + x] * weights[y][i - low];
+                norm += weights[y][i - low];
+            }
+            dstp[x] = (norm > 0.0f) ? sum / norm : 0.0f;
+        }
+        dstp += dst_stride;
+    }
+    for (int x = 0; x < dst_h; x++) {
+        free(weights[x]);
+    }
+    free(weights);
 }
 
 static void linear_to_rgb(const float *srcp, float *dstp, ptrdiff_t stride, int src_w, int src_h, float gamma) {
@@ -212,7 +377,7 @@ static void sharp_height(const float *srcp, float *dstp, int src_w, int src_h, f
     }
 }
 
-static const VSFrame *VS_CC AreaResizeGetFrame(int n, int activationReason, void *instanceData, void **frameData, VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
+static const VSFrame *VS_CC ResizeGetFrame(int n, int activationReason, void *instanceData, void **frameData, VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
     ResizeData *d = (ResizeData *)instanceData;
     
     if (activationReason == arInitial) {
@@ -225,10 +390,7 @@ static const VSFrame *VS_CC AreaResizeGetFrame(int n, int activationReason, void
         
         int err;
         int chromaloc = vsapi->mapGetIntSaturated(props, "_ChromaLocation", 0, &err);
-        if (err) {
-            chromaloc = 0;
-        }
-        if (chromaloc < 0 || chromaloc > 5) {
+        if (err || chromaloc < 0 || chromaloc > 5) {
             chromaloc = 0;
         }
         
@@ -266,13 +428,13 @@ static const VSFrame *VS_CC AreaResizeGetFrame(int n, int activationReason, void
                 else {
                     yuv_to_linear(srcp, linp, src_stride, src_w, src_h, d->gamma);
                 }
-                resize_width(linp, tmpp, src_stride, dst_stride, src_w, src_h, dst_w, chroma, fi->subSamplingW, d->start_w, d->real_w, chromaloc);
+                resize_width(linp, tmpp, src_stride, dst_stride, src_w, src_h, dst_w, chroma, fi->subSamplingW, d->start_w, d->real_w, chromaloc, d->tale_w, d->kernel);
             }
             else {
-                resize_width(srcp, tmpp, src_stride, dst_stride, src_w, src_h, dst_w, chroma, fi->subSamplingW, d->start_w, d->real_w, chromaloc);
+                resize_width(srcp, tmpp, src_stride, dst_stride, src_w, src_h, dst_w, chroma, fi->subSamplingW, d->start_w, d->real_w, chromaloc, d->tale_w, d->kernel);
             }
             
-            resize_height(tmpp, dstp, dst_w, src_h, dst_h, chroma, fi->subSamplingH, d->start_h, d->real_h, chromaloc);
+            resize_height(tmpp, dstp, dst_stride, dst_w, src_h, dst_h, chroma, fi->subSamplingH, d->start_h, d->real_h, chromaloc, d->tale_h, d->kernel);
             
             if (d->sharp != 1.0f) {
                 float * VS_RESTRICT shrp = (float *)vsapi->getWritePtr(shr, plane);
@@ -300,25 +462,25 @@ static const VSFrame *VS_CC AreaResizeGetFrame(int n, int activationReason, void
     return NULL;
 }
 
-static void VS_CC AreaResizeFree(void *instanceData, VSCore *core, const VSAPI *vsapi) {
+static void VS_CC ResizeFree(void *instanceData, VSCore *core, const VSAPI *vsapi) {
     ResizeData *d = (ResizeData *)instanceData;
     vsapi->freeNode(d->node);
     free(d);
 }
 
-static void VS_CC AreaResizeCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core, const VSAPI *vsapi) {
+static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core, const VSAPI *vsapi) {
     ResizeData d;
     d.node = vsapi->mapGetNode(in, "clip", 0, NULL);
     d.vi = *vsapi->getVideoInfo(d.node);
     
     if (!vsh_isConstantVideoFormat(&d.vi) || d.vi.format.sampleType != stFloat || d.vi.format.bitsPerSample != 32) {
-        vsapi->mapSetError(out, "AreaResize: only constant format 32bit float input supported");
+        vsapi->mapSetError(out, "Resize: only constant format 32bit float input supported");
         vsapi->freeNode(d.node);
         return;
     }
     
     if (d.vi.format.colorFamily == cfUndefined) {
-        vsapi->mapSetError(out, "AreaResize: undefined color family");
+        vsapi->mapSetError(out, "Resize: undefined color family");
         vsapi->freeNode(d.node);
         return;
     }
@@ -327,25 +489,25 @@ static void VS_CC AreaResizeCreate(const VSMap *in, VSMap *out, void *userData, 
     d.dst_height = vsapi->mapGetIntSaturated(in, "height", 0, NULL);
     
     if (d.dst_width <= 1 << d.vi.format.subSamplingW || d.dst_width > d.vi.width) {
-        vsapi->mapSetError(out, "AreaResize: width any of the planes must be greater than 1 and less than or equal to clip width");
+        vsapi->mapSetError(out, "Resize: width any of the planes must be greater than 1 and less than or equal to clip width");
         vsapi->freeNode(d.node);
         return;
     }
     
     if (d.dst_width >> d.vi.format.subSamplingW << d.vi.format.subSamplingW != d.dst_width) {
-        vsapi->mapSetError(out, "AreaResize: width must be a multiple of the subsampling");
+        vsapi->mapSetError(out, "Resize: width must be a multiple of the subsampling");
         vsapi->freeNode(d.node);
         return;
     }
     
     if (d.dst_height <= 1 << d.vi.format.subSamplingH || d.dst_height > d.vi.height) {
-        vsapi->mapSetError(out, "AreaResize: height any of the planes must be greater than 1 and less than or equal to clip height");
+        vsapi->mapSetError(out, "Resize: height any of the planes must be greater than 1 and less than or equal to clip height");
         vsapi->freeNode(d.node);
         return;
     }
     
     if (d.dst_height >> d.vi.format.subSamplingH << d.vi.format.subSamplingH != d.dst_height) {
-        vsapi->mapSetError(out, "AreaResize: height must be a multiple of the subsampling");
+        vsapi->mapSetError(out, "Resize: height must be a multiple of the subsampling");
         vsapi->freeNode(d.node);
         return;
     }
@@ -372,7 +534,7 @@ static void VS_CC AreaResizeCreate(const VSMap *in, VSMap *out, void *userData, 
     }
     
     if (d.dst_width > d.real_w) {
-        vsapi->mapSetError(out, "AreaResize: width must be less than or equal to src_width");
+        vsapi->mapSetError(out, "Resize: width must be less than or equal to src_width");
         vsapi->freeNode(d.node);
         return;
     }
@@ -387,7 +549,34 @@ static void VS_CC AreaResizeCreate(const VSMap *in, VSMap *out, void *userData, 
     }
     
     if (d.dst_height > d.real_h) {
-        vsapi->mapSetError(out, "AreaResize: height must be less than or equal to src_height");
+        vsapi->mapSetError(out, "Resize: height must be less than or equal to src_height");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    const char *kernel = vsapi->mapGetData(in, "kernel", 0, &err);
+    if (err || !strcmp(kernel, "area")) {
+        d.kernel = 0;
+        d.tale_w = 0.5f + (d.dst_width / d.real_w) / 2.0f;
+        d.tale_h = 0.5f + (d.dst_height / d.real_h) / 2.0f;
+    }
+    else if (!strcmp(kernel, "magic")) {
+        d.kernel = 1;
+        d.tale_w = 1.5f;
+        d.tale_h = 1.5f;
+    }
+    else if (!strcmp(kernel, "magic13")) {
+        d.kernel = 2;
+        d.tale_w = 2.5f;
+        d.tale_h = 2.5f;
+    }
+    else if (!strcmp(kernel, "magic21")) {
+        d.kernel = 3;
+        d.tale_w = 4.5f;
+        d.tale_h = 4.5f;
+    }
+    else {
+        vsapi->mapSetError(out, "Resize: invalid kernel specified");
         vsapi->freeNode(d.node);
         return;
     }
@@ -398,7 +587,7 @@ static void VS_CC AreaResizeCreate(const VSMap *in, VSMap *out, void *userData, 
     }
     
     if (d.gamma < 0.1f || d.gamma > 5.0f) {
-        vsapi->mapSetError(out, "AreaResize: gamma must be between 0.1 and 5");
+        vsapi->mapSetError(out, "Resize: gamma must be between 0.1 and 5");
         vsapi->freeNode(d.node);
         return;
     }
@@ -409,7 +598,7 @@ static void VS_CC AreaResizeCreate(const VSMap *in, VSMap *out, void *userData, 
     }
     
     if (d.sharp < 0.1f || d.sharp > 5.0f) {
-        vsapi->mapSetError(out, "AreaResize: sharp must be between 0.1 and 5");
+        vsapi->mapSetError(out, "Resize: sharp must be between 0.1 and 5");
         vsapi->freeNode(d.node);
         return;
     }
@@ -421,7 +610,7 @@ static void VS_CC AreaResizeCreate(const VSMap *in, VSMap *out, void *userData, 
     d.vi.height = d.dst_height;
     
     VSFilterDependency deps[] = {{d.node, rpStrictSpatial}};
-    vsapi->createVideoFilter(out, "AreaResize", &d.vi, AreaResizeGetFrame, AreaResizeFree, fmParallel, deps, 1, data, core);
+    vsapi->createVideoFilter(out, "Resize", &d.vi, ResizeGetFrame, ResizeFree, fmParallel, deps, 1, data, core);
 }
 
 typedef struct {
@@ -459,7 +648,7 @@ static const VSFrame *VS_CC LinearizeGetFrame(int n, int activationReason, void 
                 }
             }
             else {
-                memcpy(dstp, srcp, src_stride * src_h * sizeof(float));
+                memcpy(dstp, srcp, sizeof(float) * src_stride * src_h);
             }
         }
         vsapi->freeFrame(src);
@@ -563,7 +752,7 @@ static const VSFrame *VS_CC GammaCorrGetFrame(int n, int activationReason, void 
                 }
             }
             else {
-                memcpy(dstp, srcp, src_stride * src_h * sizeof(float));
+                memcpy(dstp, srcp, sizeof(float) * src_stride * src_h);
             }
         }
         vsapi->freeFrame(src);
@@ -640,8 +829,8 @@ static void VS_CC GammaCorrCreate(const VSMap *in, VSMap *out, void *userData, V
 }
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
-    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(1, 0), VAPOURSYNTH_API_VERSION, 0, plugin);
-    vspapi->registerFunction("AreaResize",
+    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(2, 0), VAPOURSYNTH_API_VERSION, 0, plugin);
+    vspapi->registerFunction("Resize",
                              "clip:vnode;"
                              "width:int;"
                              "height:int;"
@@ -649,10 +838,11 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
                              "src_top:float:opt;"
                              "src_width:float:opt;"
                              "src_height:float:opt;"
+                             "kernel:data:opt;"
                              "gamma:float:opt;"
                              "sharp:float:opt;",
                              "clip:vnode;",
-                             AreaResizeCreate,
+                             ResizeCreate,
                              NULL,
                              plugin);
     vspapi->registerFunction("Linearize",

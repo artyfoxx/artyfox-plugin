@@ -1,11 +1,13 @@
 # artyfox-plugin
 A disjointed set of filters for VapourSynth, I write everything that seems interesting.  
 The author is a lover of long sheets of code stuffed into a single file. Don't judge too harshly.  
-## AreaResize
-`artyfox.AreaResize(clip clip, int width, int height[, float src_left = 0.0, float src_top = 0.0, float src_width = clip.width, float src_height = clip.height, float gamma = 2.4 or ≈2.2, float sharp = 1.0])`
+## Resize
+`artyfox.Resize(clip clip, int width, int height[, float src_left = 0.0, float src_top = 0.0, float src_width = clip.width, float src_height = clip.height, string kernel = "area", float gamma = 2.4 or ≈2.2, float sharp = 1.0])`
 
-Basic implementation of area resize with a loop through the source. Based on the publication "Algorithm and program to downsizing the digital images" by S. Z. Sverdlov.  
-Downscaling only, resizing up is not possible.  
+Implementation of multiple resize functions using convolution method.  
+Area Resize based on the publications "Algorithm and program to downsizing the digital images" by S. Z. Sverdlov and "Pixel mixing" by Jason Summers.  
+Magic Kernel is based on the publication "The magic kernel" by John Costella.  
+Downscaling only, upscaling is not possible yet.  
 * `clip`: Source clip to downscale. Must be RGB, YUV or GRAY. 32-bit float sample type only. The range must be converted to full.
 * `width`: Target width. Must be integer and match the source clip's subsampling.
 * `height`: Target height. Must be integer and match the source clip's subsampling.
@@ -13,6 +15,11 @@ Downscaling only, resizing up is not possible.
 * `src_top`: The `y` coordinate of the point where the region to be resized starts. Defaults to 0.0
 * `src_width`: The width of the region to be resized relative to `src_left`. Defaults to the width of the source clip.
 * `src_height`: The height of the region to be resized relative to `src_top`. Defaults to the height of the source clip.
+* `kernel`: Selecting a kernel for convolution. Possible values:
+  * `area`: Area Resize, used by default.
+  * `magic`: Magic Kernel.
+  * `magic13`: Magic Kernel Sharp 2013.
+  * `magic21`: Magic Kernel Sharp 2021.
 * `gamma`: The inverse and forward gamma correction value. Correction is performed before and after resizing, in order to produce the resize itself in a linear color space. The default values ​​are 2.4 for RGB and ≈2.2 (1 / 0.45) for YUV and GRAY. Two different formulas are used for RGB and YUV/GRAY. The formula for YUV/GRAY is suitable for SMPTE 170M, BT.601, BT.709, BT.2020 and is not suitable for SMPTE 240M, DCI-P3.  
 `gamma = 1` - completely disables correction, resizing occurs directly, in a logarithmic color space.  
 The allowed range of values ​​is from 0.1 to 5.0
@@ -37,4 +44,4 @@ Gamma correction of color space.
 * `gamma`: Gamma correction value. The default values ​​are 2.4 for RGB and ≈2.2 (1 / 0.45) for YUV and GRAY. Two different formulas are used for RGB and YUV/GRAY. The formula for YUV/GRAY is suitable for SMPTE 170M, BT.601, BT.709, BT.2020 and is not suitable for SMPTE 240M, DCI-P3. The allowed range of values ​​is from 0.1 to 5.0
 * `planes`: List of planes to be gamma corrected. Default is all.
 ## To do
-Rewrite area resize with a loop over the target clip, which will get rid of the tail in "else" (srcp * dist). After that, it will be possible to do precomputing and avx2. But since even the basic implementation gives quite a decent speed, and writing something new is much more interesting than optimizing the old, this will clearly not happen soon.
+Move weight normalization to precomputing, move the precomputing itself into a separate function, thereby eliminating duplicate code. Consider AVX2. And, of course, implement upscaling.
