@@ -64,11 +64,8 @@ static inline float area_kernel(float x, float scale) {
     if (scale > 1.0f) {
         scale = 1.0f / scale;
     }
-    if (x <= -0.5f - scale / 2.0f) {
-        return 0.0f;
-    }
-    if (x <= -0.5f + scale / 2.0f) {
-        return 0.5f - (-x - 0.5f) / scale;
+    if (x < 0.0f) {
+        x = -x;
     }
     if (x <= 0.5f - scale / 2.0f) {
         return 1.0f;
@@ -80,11 +77,8 @@ static inline float area_kernel(float x, float scale) {
 }
 
 static inline float magic_kernel(float x) {
-    if (x <= -1.5f) {
-        return 0.0f;
-    }
-    if (x <= -0.5f) {
-        return 0.5f * powf(x + 1.5f, 2.0f);
+    if (x < 0.0f) {
+        x = -x;
     }
     if (x <= 0.5f) {
         return 0.75f - powf(x, 2.0f);
@@ -96,20 +90,14 @@ static inline float magic_kernel(float x) {
 }
 
 static inline float magic_kernel_2013(float x) {
-    if (x <= -2.5f) {
-        return 0.0f;
-    }
-    if (x <= -1.5f) {
-        return -0.125f * powf(x + 2.5f, 2.0f);
-    }
-    if (x <= -0.5f) {
-        return 0.25f * (4.0f * powf(x, 2.0f) + 11.0f * x + 7.0f);
+    if (x < 0.0f) {
+        x = -x;
     }
     if (x <= 0.5f) {
         return 1.0625f - 1.75f * powf(x, 2.0f);
     }
     if (x <= 1.5f) {
-        return 0.25f * (4.0f * powf(x, 2.0f) - 11.0f * x + 7.0f);
+        return (1.0f - x) * (1.75f - x);
     }
     if (x <= 2.5f) {
         return -0.125f * powf(x - 2.5f, 2.0f);
@@ -118,40 +106,28 @@ static inline float magic_kernel_2013(float x) {
 }
 
 static inline float magic_kernel_2021(float x) {
-    if (x <= -4.5f) {
-        return 0.0f;
-    }
-    if (x <= -3.5f) {
-        return -1.0f / 1152.0f * powf(2.0f * x + 9.0f, 2.0f);
-    }
-    if (x <= -2.5f) {
-        return 1.0f / 144.0f * (4.0f * powf(x, 2.0f) + 27.0f * x + 45.0f);
-    }
-    if (x <= -1.5f) {
-        return -1.0f / 144.0f * (24.0f * powf(x, 2.0f) + 113.0f * x + 130.0f);
-    }
-    if (x <= -0.5f) {
-        return 1.0f / 144.0f * (140.0f * powf(x, 2.0f) + 379.0f * x + 239.0f);
+    if (x < 0.0f) {
+        x = -x;
     }
     if (x <= 0.5f) {
         return 577.0f / 576.0f - 239.0f / 144.0f * powf(x, 2.0f);
     }
     if (x <= 1.5f) {
-        return 1.0f / 144.0f * (140.0f * powf(x, 2.0f) - 379.0f * x + 239.0f);
+        return 35.0f / 36.0f * (x - 1.0f) * (x - 239.0f / 140.0f);
     }
     if (x <= 2.5f) {
-        return -1.0f / 144.0f * (24.0f * powf(x, 2.0f) - 113.0f * x + 130.0f);
+        return 1.0f / 6.0f * (x - 2.0f) * (65.0f / 24.0f - x);
     }
     if (x <= -3.5f) {
-        return 1.0f / 144.0f * (4.0f * powf(x, 2.0f) - 27.0f * x + 45.0f);
+        return 1.0f / 36.0f * (x - 3.0f) * (x - 3.75f);
     }
     if (x <= -4.5f) {
-        return -1.0f / 1152.0f * powf(2.0f * x - 9.0f, 2.0f);
+        return -1.0f / 288.0f * powf(x - 4.5f, 2.0f);
     }
     return 0.0f;
 }
 
-static void resize_width(const float *srcp, float *dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride, int src_w, int src_h, int dst_w, bool chroma, int subsampling_w, float start_w, float real_w, int chromaloc, float tale, int kernel) {
+static void resize_width_down(const float *srcp, float *dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride, int src_w, int src_h, int dst_w, bool chroma, int subsampling_w, float start_w, float real_w, int chromaloc, float tale, int kernel) {
     // Для люмы и RGB сдвиги считаются напрямую, а для хромы - с учётом сабсэмплинга и выравнивания
     if (chroma) {
         start_w /= 1 << subsampling_w;
@@ -165,7 +141,7 @@ static void resize_width(const float *srcp, float *dstp, ptrdiff_t src_stride, p
     float scale = dst_w / real_w;
     float **weights = (float **)malloc(sizeof(float *) * dst_w);
     int min_w = (int)floorf(start_w);
-    int max_w = (int)ceilf(real_w + start_w);
+    int max_w = (int)ceilf(real_w + start_w) - 1;
     
     if (kernel == 1) {
         for (int x = 0; x < dst_w; x++) {
@@ -173,8 +149,13 @@ static void resize_width(const float *srcp, float *dstp, ptrdiff_t src_stride, p
             int low = MAX((int)floorf(center - tale / scale), min_w);
             int high = MIN((int)ceilf(center + tale / scale), max_w);
             weights[x] = (float *)malloc(sizeof(float) * (high - low + 1));
+            float norm = 0.0f;
             for (int i = low; i <= high; i++) {
                 weights[x][i - low] = magic_kernel((i + 0.5f - start_w) * scale - 0.5f - x);
+                norm += weights[x][i - low];
+            }
+            for (int i = low; i <= high; i++) {
+                weights[x][i - low] /= norm;
             }
         }
     }
@@ -184,8 +165,13 @@ static void resize_width(const float *srcp, float *dstp, ptrdiff_t src_stride, p
             int low = MAX((int)floorf(center - tale / scale), min_w);
             int high = MIN((int)ceilf(center + tale / scale), max_w);
             weights[x] = (float *)malloc(sizeof(float) * (high - low + 1));
+            float norm = 0.0f;
             for (int i = low; i <= high; i++) {
                 weights[x][i - low] = magic_kernel_2013((i + 0.5f - start_w) * scale - 0.5f - x);
+                norm += weights[x][i - low];
+            }
+            for (int i = low; i <= high; i++) {
+                weights[x][i - low] /= norm;
             }
         }
     }
@@ -195,8 +181,13 @@ static void resize_width(const float *srcp, float *dstp, ptrdiff_t src_stride, p
             int low = MAX((int)floorf(center - tale / scale), min_w);
             int high = MIN((int)ceilf(center + tale / scale), max_w);
             weights[x] = (float *)malloc(sizeof(float) * (high - low + 1));
+            float norm = 0.0f;
             for (int i = low; i <= high; i++) {
                 weights[x][i - low] = magic_kernel_2021((i + 0.5f - start_w) * scale - 0.5f - x);
+                norm += weights[x][i - low];
+            }
+            for (int i = low; i <= high; i++) {
+                weights[x][i - low] /= norm;
             }
         }
     }
@@ -206,8 +197,13 @@ static void resize_width(const float *srcp, float *dstp, ptrdiff_t src_stride, p
             int low = MAX((int)floorf(center - tale / scale), min_w);
             int high = MIN((int)ceilf(center + tale / scale), max_w);
             weights[x] = (float *)malloc(sizeof(float) * (high - low + 1));
+            float norm = 0.0f;
             for (int i = low; i <= high; i++) {
                 weights[x][i - low] = area_kernel((i + 0.5f - start_w) * scale - 0.5f - x, scale);
+                norm += weights[x][i - low];
+            }
+            for (int i = low; i <= high; i++) {
+                weights[x][i - low] /= norm;
             }
         }
     }
@@ -217,13 +213,10 @@ static void resize_width(const float *srcp, float *dstp, ptrdiff_t src_stride, p
             float center = (x + 0.5f) / scale - 0.5f + start_w;
             int low = MAX((int)floorf(center - tale / scale), min_w);
             int high = MIN((int)ceilf(center + tale / scale), max_w);
-            float sum = 0.0f;
-            float norm = 0.0f;
+            dstp[x] = 0.0f;
             for (int i = low; i <= high; i++) {
-                sum += srcp[CLAMP(i, 0, src_w - 1)] * weights[x][i - low];
-                norm += weights[x][i - low];
+                dstp[x] += srcp[CLAMP(i, 0, src_w - 1)] * weights[x][i - low];
             }
-            dstp[x] = (norm > 0.0f) ? sum / norm : 0.0f;
         }
         dstp += dst_stride;
         srcp += src_stride;
@@ -234,7 +227,7 @@ static void resize_width(const float *srcp, float *dstp, ptrdiff_t src_stride, p
     free(weights);
 }
 
-static void resize_height(const float *srcp, float *dstp, ptrdiff_t dst_stride, int src_w, int src_h, int dst_h, bool chroma, int subsampling_h, float start_h, float real_h, int chromaloc, float tale, int kernel) {
+static void resize_height_down(const float *srcp, float *dstp, ptrdiff_t dst_stride, int src_w, int src_h, int dst_h, bool chroma, int subsampling_h, float start_h, float real_h, int chromaloc, float tale, int kernel) {
     // Для люмы и RGB сдвиги считаются напрямую, а для хромы - с учётом сабсэмплинга и выравнивания
     if (chroma) {
         start_h /= 1 << subsampling_h;
@@ -251,7 +244,7 @@ static void resize_height(const float *srcp, float *dstp, ptrdiff_t dst_stride, 
     float scale = dst_h / real_h;
     float **weights = (float **)malloc(sizeof(float *) * dst_h);
     int min_h = (int)floorf(start_h);
-    int max_h = (int)ceilf(real_h + start_h);
+    int max_h = (int)ceilf(real_h + start_h) - 1;
     
     if (kernel == 1) {
         for (int x = 0; x < dst_h; x++) {
@@ -259,8 +252,13 @@ static void resize_height(const float *srcp, float *dstp, ptrdiff_t dst_stride, 
             int low = MAX((int)floorf(center - tale / scale), min_h);
             int high = MIN((int)ceilf(center + tale / scale), max_h);
             weights[x] = (float *)malloc(sizeof(float) * (high - low + 1));
+            float norm = 0.0f;
             for (int i = low; i <= high; i++) {
                 weights[x][i - low] = magic_kernel((i + 0.5f - start_h) * scale - 0.5f - x);
+                norm += weights[x][i - low];
+            }
+            for (int i = low; i <= high; i++) {
+                weights[x][i - low] /= norm;
             }
         }
     }
@@ -270,8 +268,13 @@ static void resize_height(const float *srcp, float *dstp, ptrdiff_t dst_stride, 
             int low = MAX((int)floorf(center - tale / scale), min_h);
             int high = MIN((int)ceilf(center + tale / scale), max_h);
             weights[x] = (float *)malloc(sizeof(float) * (high - low + 1));
+            float norm = 0.0f;
             for (int i = low; i <= high; i++) {
                 weights[x][i - low] = magic_kernel_2013((i + 0.5f - start_h) * scale - 0.5f - x);
+                norm += weights[x][i - low];
+            }
+            for (int i = low; i <= high; i++) {
+                weights[x][i - low] /= norm;
             }
         }
     }
@@ -281,8 +284,13 @@ static void resize_height(const float *srcp, float *dstp, ptrdiff_t dst_stride, 
             int low = MAX((int)floorf(center - tale / scale), min_h);
             int high = MIN((int)ceilf(center + tale / scale), max_h);
             weights[x] = (float *)malloc(sizeof(float) * (high - low + 1));
+            float norm = 0.0f;
             for (int i = low; i <= high; i++) {
                 weights[x][i - low] = magic_kernel_2021((i + 0.5f - start_h) * scale - 0.5f - x);
+                norm += weights[x][i - low];
+            }
+            for (int i = low; i <= high; i++) {
+                weights[x][i - low] /= norm;
             }
         }
     }
@@ -292,8 +300,13 @@ static void resize_height(const float *srcp, float *dstp, ptrdiff_t dst_stride, 
             int low = MAX((int)floorf(center - tale / scale), min_h);
             int high = MIN((int)ceilf(center + tale / scale), max_h);
             weights[x] = (float *)malloc(sizeof(float) * (high - low + 1));
+            float norm = 0.0f;
             for (int i = low; i <= high; i++) {
                 weights[x][i - low] = area_kernel((i + 0.5f - start_h) * scale - 0.5f - x, scale);
+                norm += weights[x][i - low];
+            }
+            for (int i = low; i <= high; i++) {
+                weights[x][i - low] /= norm;
             }
         }
     }
@@ -303,13 +316,10 @@ static void resize_height(const float *srcp, float *dstp, ptrdiff_t dst_stride, 
             float center = (y + 0.5f) / scale - 0.5f + start_h;
             int low = MAX((int)floorf(center - tale / scale), min_h);
             int high = MIN((int)ceilf(center + tale / scale), max_h);
-            float sum = 0.0f;
-            float norm = 0.0f;
+            dstp[x] = 0.0f;
             for (int i = low; i <= high; i++) {
-                sum += srcp[CLAMP(i, 0, src_h - 1) * src_w + x] * weights[y][i - low];
-                norm += weights[y][i - low];
+                dstp[x] += srcp[CLAMP(i, 0, src_h - 1) * src_w + x] * weights[y][i - low];
             }
-            dstp[x] = (norm > 0.0f) ? sum / norm : 0.0f;
         }
         dstp += dst_stride;
     }
@@ -428,13 +438,13 @@ static const VSFrame *VS_CC ResizeGetFrame(int n, int activationReason, void *in
                 else {
                     yuv_to_linear(srcp, linp, src_stride, src_w, src_h, d->gamma);
                 }
-                resize_width(linp, tmpp, src_stride, dst_stride, src_w, src_h, dst_w, chroma, fi->subSamplingW, d->start_w, d->real_w, chromaloc, d->tale_w, d->kernel);
+                resize_width_down(linp, tmpp, src_stride, dst_stride, src_w, src_h, dst_w, chroma, fi->subSamplingW, d->start_w, d->real_w, chromaloc, d->tale_w, d->kernel);
             }
             else {
-                resize_width(srcp, tmpp, src_stride, dst_stride, src_w, src_h, dst_w, chroma, fi->subSamplingW, d->start_w, d->real_w, chromaloc, d->tale_w, d->kernel);
+                resize_width_down(srcp, tmpp, src_stride, dst_stride, src_w, src_h, dst_w, chroma, fi->subSamplingW, d->start_w, d->real_w, chromaloc, d->tale_w, d->kernel);
             }
             
-            resize_height(tmpp, dstp, dst_stride, dst_w, src_h, dst_h, chroma, fi->subSamplingH, d->start_h, d->real_h, chromaloc, d->tale_h, d->kernel);
+            resize_height_down(tmpp, dstp, dst_stride, dst_w, src_h, dst_h, chroma, fi->subSamplingH, d->start_h, d->real_h, chromaloc, d->tale_h, d->kernel);
             
             if (d->sharp != 1.0f) {
                 float * VS_RESTRICT shrp = (float *)vsapi->getWritePtr(shr, plane);
@@ -829,7 +839,7 @@ static void VS_CC GammaCorrCreate(const VSMap *in, VSMap *out, void *userData, V
 }
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
-    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(2, 0), VAPOURSYNTH_API_VERSION, 0, plugin);
+    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(3, 0), VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction("Resize",
                              "clip:vnode;"
                              "width:int;"

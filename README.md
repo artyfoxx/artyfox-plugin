@@ -2,7 +2,7 @@
 A disjointed set of filters for VapourSynth, I write everything that seems interesting.  
 The author is a lover of long sheets of code stuffed into a single file. Don't judge too harshly.  
 ## Resize
-`artyfox.Resize(clip clip, int width, int height[, float src_left = 0.0, float src_top = 0.0, float src_width = clip.width, float src_height = clip.height, string kernel = "area", float gamma = 2.4 or ≈2.2, float sharp = 1.0])`
+`artyfox.Resize(clip clip, int width, int height[, float src_left = 0.0, float src_top = 0.0, float src_width = clip.width, float src_height = clip.height, str kernel = "area", float gamma = 2.4 or ≈2.2, float sharp = 1.0])`
 
 Implementation of multiple resize functions using convolution method.  
 Area Resize based on the publications "Algorithm and program to downsizing the digital images" by S. Z. Sverdlov and "Pixel mixing" by Jason Summers.  
@@ -44,4 +44,4 @@ Gamma correction of color space.
 * `gamma`: Gamma correction value. The default values ​​are 2.4 for RGB and ≈2.2 (1 / 0.45) for YUV and GRAY. Two different formulas are used for RGB and YUV/GRAY. The formula for YUV/GRAY is suitable for SMPTE 170M, BT.601, BT.709, BT.2020 and is not suitable for SMPTE 240M, DCI-P3. The allowed range of values ​​is from 0.1 to 5.0
 * `planes`: List of planes to be gamma corrected. Default is all.
 ## To do
-Move weight normalization to precomputing, move the precomputing itself into a separate function, thereby eliminating duplicate code. Consider AVX2. And, of course, implement upscaling.
+Move the precomputing into a separate function, thereby eliminating duplicate code. Consider AVX2. And, of course, implement upscaling.
