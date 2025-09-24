@@ -15,6 +15,22 @@
             "cppStandard": "gnu++17",
             "intelliSenseMode": "windows-gcc-x64",
             "compilerPath": "C:/msys64/ucrt64/bin/gcc.exe"
+        },
+        {
+            "name": "Intel oneAPI",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "C:\\Program Files\\VapourSynth\\sdk\\include\\vapoursynth"
+            ],
+            "defines": [
+                "_DEBUG",
+                "UNICODE",
+                "_UNICODE"
+            ],
+            "cStandard": "c17",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "windows-clang-x64",
+            "compilerPath": "C:/Program Files (x86)/Intel/oneAPI/compiler/2025.2/bin/icx.exe"
         }
     ],
     "version": 4

@@ -8,6 +8,8 @@
 #define MAX(a, b) (a > b ? a : b)
 #define MIN(a, b) (a < b ? a : b)
 
+typedef float (*kernel_func)(float, float);
+
 typedef struct {
     VSNode *node;
     VSVideoInfo vi;
@@ -17,12 +19,19 @@ typedef struct {
     float start_h;
     float real_w;
     float real_h;
-    int kernel;
+    kernel_func kernel;
     float tale_w;
     float tale_h;
     float gamma;
     float sharp;
 } ResizeData;
+
+typedef struct {
+    VSNode *node;
+    VSVideoInfo vi;
+    float gamma;
+    bool process[3];
+} GammaData;
 
 static void rgb_to_linear(const float *srcp, float *dstp, ptrdiff_t stride, int src_w, int src_h, float gamma) {
     for (int y = 0; y < src_h; y++) {
@@ -60,301 +69,162 @@ static void yuv_to_linear(const float *srcp, float *dstp, ptrdiff_t stride, int 
     }
 }
 
-static inline float area_kernel(float x, float scale) {
-    if (scale > 1.0f) {
-        scale = 1.0f / scale;
+static inline float area_kernel(float x, float factor) {
+    if (factor > 1.0f) {
+        factor = 1.0f / factor;
     }
     if (x < 0.0f) {
         x = -x;
     }
-    if (x <= 0.5f - scale / 2.0f) {
+    if (x < 0.5f - factor / 2.0f) {
         return 1.0f;
     }
-    if (x <= 0.5f + scale / 2.0f) {
-        return 0.5f - (x - 0.5f) / scale;
+    if (x < 0.5f + factor / 2.0f) {
+        return 0.5f - (x - 0.5f) / factor;
     }
     return 0.0f;
 }
 
-static inline float magic_kernel(float x) {
+static inline float magic_kernel(float x, float factor) {
     if (x < 0.0f) {
         x = -x;
     }
-    if (x <= 0.5f) {
+    if (x < 0.5f) {
         return 0.75f - powf(x, 2.0f);
     }
-    if (x <= 1.5f) {
+    if (x < 1.5f) {
         return 0.5f * powf(x - 1.5f, 2.0f);
     }
     return 0.0f;
 }
 
-static inline float magic_kernel_2013(float x) {
+static inline float magic_kernel_2013(float x, float factor) {
     if (x < 0.0f) {
         x = -x;
     }
-    if (x <= 0.5f) {
+    if (x < 0.5f) {
         return 1.0625f - 1.75f * powf(x, 2.0f);
     }
-    if (x <= 1.5f) {
+    if (x < 1.5f) {
         return (1.0f - x) * (1.75f - x);
     }
-    if (x <= 2.5f) {
+    if (x < 2.5f) {
         return -0.125f * powf(x - 2.5f, 2.0f);
     }
     return 0.0f;
 }
 
-static inline float magic_kernel_2021(float x) {
+static inline float magic_kernel_2021(float x, float factor) {
     if (x < 0.0f) {
         x = -x;
     }
-    if (x <= 0.5f) {
+    if (x < 0.5f) {
         return 577.0f / 576.0f - 239.0f / 144.0f * powf(x, 2.0f);
     }
-    if (x <= 1.5f) {
+    if (x < 1.5f) {
         return 35.0f / 36.0f * (x - 1.0f) * (x - 239.0f / 140.0f);
     }
-    if (x <= 2.5f) {
+    if (x < 2.5f) {
         return 1.0f / 6.0f * (x - 2.0f) * (65.0f / 24.0f - x);
     }
-    if (x <= 3.5f) {
+    if (x < 3.5f) {
         return 1.0f / 36.0f * (x - 3.0f) * (x - 3.75f);
     }
-    if (x <= 4.5f) {
+    if (x < 4.5f) {
         return -1.0f / 288.0f * powf(x - 4.5f, 2.0f);
     }
     return 0.0f;
 }
 
-static void resize_width_down(
+static inline float bilinear_kernel(float x, float factor) {
+    if (x < 0.0f) {
+        x = -x;
+    }
+    if (x < 1.0f) {
+        return 1.0f - x;
+    }
+    return 0.0f;
+}
+
+static void resize_width(
     const float *srcp, float *dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride, int src_w, int src_h, int dst_w,
-    float start_w, float real_w, float tale, int kernel
+    float start_w, float real_w, float tale, kernel_func kernel
 ) {
-    float scale = dst_w / real_w;
+    float factor = dst_w / real_w;
+    float scale = (factor < 1.0f) ? factor : 1.0f;
     float **weights = (float **)malloc(sizeof(float *) * dst_w);
-    int *ranges = (int *)malloc(sizeof(int) * dst_w * 2);
+    int *low = (int *)malloc(sizeof(int) * dst_w);
+    int *high = (int *)malloc(sizeof(int) * dst_w);
     int min_w = (int)floorf(start_w);
     int max_w = (int)ceilf(real_w + start_w) - 1;
+    int border = src_w - 1;
     
-    if (kernel == 1) {
-        for (int x = 0; x < dst_w; x++) {
-            float center = (x + 0.5f) / scale - 0.5f + start_w;
-            ranges[x * 2] = MAX((int)floorf(center - tale / scale), min_w);
-            ranges[x * 2 + 1] = MIN((int)ceilf(center + tale / scale), max_w);
-            weights[x] = (float *)malloc(sizeof(float) * (ranges[x * 2 + 1] - ranges[x * 2] + 1));
-            float norm = 0.0f;
-            for (int i = ranges[x * 2]; i <= ranges[x * 2 + 1]; i++) {
-                weights[x][i - ranges[x * 2]] = magic_kernel((i + 0.5f - start_w) * scale - 0.5f - x);
-                norm += weights[x][i - ranges[x * 2]];
-            }
-            for (int i = ranges[x * 2]; i <= ranges[x * 2 + 1]; i++) {
-                weights[x][i - ranges[x * 2]] /= norm;
-            }
+    for (int x = 0; x < dst_w; x++) {
+        float center = (x + 0.5f) / factor - 0.5f + start_w;
+        low[x] = MAX((int)floorf(center - tale / scale), min_w);
+        high[x] = MIN((int)ceilf(center + tale / scale), max_w);
+        weights[x] = (float *)malloc(sizeof(float) * (high[x] - low[x] + 1));
+        float norm = 0.0f;
+        for (int i = low[x]; i <= high[x]; i++) {
+            weights[x][i - low[x]] = kernel((i - center) * scale, factor);
+            norm += weights[x][i - low[x]];
         }
-    }
-    else if (kernel == 2) {
-        for (int x = 0; x < dst_w; x++) {
-            float center = (x + 0.5f) / scale - 0.5f + start_w;
-            ranges[x * 2] = MAX((int)floorf(center - tale / scale), min_w);
-            ranges[x * 2 + 1] = MIN((int)ceilf(center + tale / scale), max_w);
-            weights[x] = (float *)malloc(sizeof(float) * (ranges[x * 2 + 1] - ranges[x * 2] + 1));
-            float norm = 0.0f;
-            for (int i = ranges[x * 2]; i <= ranges[x * 2 + 1]; i++) {
-                weights[x][i - ranges[x * 2]] = magic_kernel_2013((i + 0.5f - start_w) * scale - 0.5f - x);
-                norm += weights[x][i - ranges[x * 2]];
-            }
-            for (int i = ranges[x * 2]; i <= ranges[x * 2 + 1]; i++) {
-                weights[x][i - ranges[x * 2]] /= norm;
-            }
-        }
-    }
-    else if (kernel == 3) {
-        for (int x = 0; x < dst_w; x++) {
-            float center = (x + 0.5f) / scale - 0.5f + start_w;
-            ranges[x * 2] = MAX((int)floorf(center - tale / scale), min_w);
-            ranges[x * 2 + 1] = MIN((int)ceilf(center + tale / scale), max_w);
-            weights[x] = (float *)malloc(sizeof(float) * (ranges[x * 2 + 1] - ranges[x * 2] + 1));
-            float norm = 0.0f;
-            for (int i = ranges[x * 2]; i <= ranges[x * 2 + 1]; i++) {
-                weights[x][i - ranges[x * 2]] = magic_kernel_2021((i + 0.5f - start_w) * scale - 0.5f - x);
-                norm += weights[x][i - ranges[x * 2]];
-            }
-            for (int i = ranges[x * 2]; i <= ranges[x * 2 + 1]; i++) {
-                weights[x][i - ranges[x * 2]] /= norm;
-            }
-        }
-    }
-    else {
-        for (int x = 0; x < dst_w; x++) {
-            float center = (x + 0.5f) / scale - 0.5f + start_w;
-            ranges[x * 2] = MAX((int)floorf(center - tale / scale), min_w);
-            ranges[x * 2 + 1] = MIN((int)ceilf(center + tale / scale), max_w);
-            weights[x] = (float *)malloc(sizeof(float) * (ranges[x * 2 + 1] - ranges[x * 2] + 1));
-            float norm = 0.0f;
-            for (int i = ranges[x * 2]; i <= ranges[x * 2 + 1]; i++) {
-                weights[x][i - ranges[x * 2]] = area_kernel((i + 0.5f - start_w) * scale - 0.5f - x, scale);
-                norm += weights[x][i - ranges[x * 2]];
-            }
-            for (int i = ranges[x * 2]; i <= ranges[x * 2 + 1]; i++) {
-                weights[x][i - ranges[x * 2]] /= norm;
-            }
+        for (int i = low[x]; i <= high[x]; i++) {
+            weights[x][i - low[x]] /= norm;
         }
     }
     
     for (int y = 0; y < src_h; y++) {
         for (int x = 0; x < dst_w; x++) {
             dstp[x] = 0.0f;
-            for (int i = ranges[x * 2]; i <= ranges[x * 2 + 1]; i++) {
-                dstp[x] += srcp[CLAMP(i, 0, src_w - 1)] * weights[x][i - ranges[x * 2]];
+            for (int i = low[x]; i <= high[x]; i++) {
+                dstp[x] += srcp[CLAMP(i, 0, border)] * weights[x][i - low[x]];
             }
         }
         dstp += dst_stride;
         srcp += src_stride;
     }
+    
     for (int x = 0; x < dst_w; x++) {
         free(weights[x]);
     }
     free(weights);
-    free(ranges);
+    free(low);
+    free(high);
 }
 
-static void resize_height_down(
+static void resize_height(
     const float *srcp, float *dstp, ptrdiff_t dst_stride, int src_w, int src_h, int dst_h,
-    float start_h, float real_h, float tale, int kernel
+    float start_h, float real_h, float tale, kernel_func kernel
 ) {
-    float scale = dst_h / real_h;
+    float factor = dst_h / real_h;
+    float scale = (factor < 1.0f) ? factor : 1.0f;
     int min_h = (int)floorf(start_h);
     int max_h = (int)ceilf(real_h + start_h) - 1;
+    int border = src_h - 1;
     
-    if (kernel == 1) {
-        for (int y = 0; y < dst_h; y++) {
-            float center = (y + 0.5f) / scale - 0.5f + start_h;
-            int low = MAX((int)floorf(center - tale / scale), min_h);
-            int high = MIN((int)ceilf(center + tale / scale), max_h);
-            float *weights = (float *)malloc(sizeof(float) * (high - low + 1));
-            float norm = 0.0f;
-            for (int i = low; i <= high; i++) {
-                weights[i - low] = magic_kernel((i + 0.5f - start_h) * scale - 0.5f - y);
-                norm += weights[i - low];
-            }
-            for (int i = low; i <= high; i++) {
-                weights[i - low] /= norm;
-            }
-            for (int x = 0; x < src_w; x++) {
-                dstp[x] = 0.0f;
-                for (int i = low; i <= high; i++) {
-                    dstp[x] += srcp[CLAMP(i, 0, src_h - 1) * src_w + x] * weights[i - low];
-                }
-            }
-            dstp += dst_stride;
-            free(weights);
+    for (int y = 0; y < dst_h; y++) {
+        float center = (y + 0.5f) / factor - 0.5f + start_h;
+        int low = MAX((int)floorf(center - tale / scale), min_h);
+        int high = MIN((int)ceilf(center + tale / scale), max_h);
+        float *weights = (float *)malloc(sizeof(float) * (high - low + 1));
+        float norm = 0.0f;
+        for (int i = low; i <= high; i++) {
+            weights[i - low] = kernel((i - center) * scale, factor);
+            norm += weights[i - low];
         }
+        for (int i = low; i <= high; i++) {
+            weights[i - low] /= norm;
+        }
+        for (int x = 0; x < src_w; x++) {
+            dstp[x] = 0.0f;
+            for (int i = low; i <= high; i++) {
+                dstp[x] += srcp[CLAMP(i, 0, border) * src_w + x] * weights[i - low];
+            }
+        }
+        dstp += dst_stride;
+        free(weights);
     }
-    else if (kernel == 2) {
-        for (int y = 0; y < dst_h; y++) {
-            float center = (y + 0.5f) / scale - 0.5f + start_h;
-            int low = MAX((int)floorf(center - tale / scale), min_h);
-            int high = MIN((int)ceilf(center + tale / scale), max_h);
-            float *weights = (float *)malloc(sizeof(float) * (high - low + 1));
-            float norm = 0.0f;
-            for (int i = low; i <= high; i++) {
-                weights[i - low] = magic_kernel_2013((i + 0.5f - start_h) * scale - 0.5f - y);
-                norm += weights[i - low];
-            }
-            for (int i = low; i <= high; i++) {
-                weights[i - low] /= norm;
-            }
-            for (int x = 0; x < src_w; x++) {
-                dstp[x] = 0.0f;
-                for (int i = low; i <= high; i++) {
-                    dstp[x] += srcp[CLAMP(i, 0, src_h - 1) * src_w + x] * weights[i - low];
-                }
-            }
-            dstp += dst_stride;
-            free(weights);
-        }
-    }
-    else if (kernel == 3) {
-        for (int y = 0; y < dst_h; y++) {
-            float center = (y + 0.5f) / scale - 0.5f + start_h;
-            int low = MAX((int)floorf(center - tale / scale), min_h);
-            int high = MIN((int)ceilf(center + tale / scale), max_h);
-            float *weights = (float *)malloc(sizeof(float) * (high - low + 1));
-            float norm = 0.0f;
-            for (int i = low; i <= high; i++) {
-                weights[i - low] = magic_kernel_2021((i + 0.5f - start_h) * scale - 0.5f - y);
-                norm += weights[i - low];
-            }
-            for (int i = low; i <= high; i++) {
-                weights[i - low] /= norm;
-            }
-            for (int x = 0; x < src_w; x++) {
-                dstp[x] = 0.0f;
-                for (int i = low; i <= high; i++) {
-                    dstp[x] += srcp[CLAMP(i, 0, src_h - 1) * src_w + x] * weights[i - low];
-                }
-            }
-            dstp += dst_stride;
-            free(weights);
-        }
-    }
-    else {
-        for (int y = 0; y < dst_h; y++) {
-            float center = (y + 0.5f) / scale - 0.5f + start_h;
-            int low = MAX((int)floorf(center - tale / scale), min_h);
-            int high = MIN((int)ceilf(center + tale / scale), max_h);
-            float *weights = (float *)malloc(sizeof(float) * (high - low + 1));
-            float norm = 0.0f;
-            for (int i = low; i <= high; i++) {
-                weights[i - low] = area_kernel((i + 0.5f - start_h) * scale - 0.5f - y, scale);
-                norm += weights[i - low];
-            }
-            for (int i = low; i <= high; i++) {
-                weights[i - low] /= norm;
-            }
-            for (int x = 0; x < src_w; x++) {
-                dstp[x] = 0.0f;
-                for (int i = low; i <= high; i++) {
-                    dstp[x] += srcp[CLAMP(i, 0, src_h - 1) * src_w + x] * weights[i - low];
-                }
-            }
-            dstp += dst_stride;
-            free(weights);
-        }
-    }
-}
-
-static void resize_director(
-    const float *srcp, float *tmpp, float *dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride, int plane,
-    int src_w, int src_h, int dst_w, int dst_h, int chromaloc, const VSVideoFormat *fi, ResizeData *d
-) {
-    float start_w = d->start_w;
-    float start_h = d->start_h;
-    float real_w = d->real_w;
-    float real_h = d->real_h;
-    
-    // Для люмы и RGB сдвиги считаются напрямую, а для хромы - с учётом сабсэмплинга и выравнивания
-    if (plane != 0 && fi->colorFamily != cfRGB) {
-        start_w /= 1 << fi->subSamplingW;
-        real_w /= 1 << fi->subSamplingW;
-        start_h /= 1 << fi->subSamplingH;
-        real_h /= 1 << fi->subSamplingH;
-        // Находим значение коррекции для правильного выравнивания хромы по горизонтали
-        if (~chromaloc & 1) {// только для чётных
-            start_w += 0.5f / (1 << fi->subSamplingW) - 0.5f * real_w / (dst_w << fi->subSamplingW);// left allign
-        }
-        // Находим значение коррекции для правильного выравнивания хромы по вертикали
-        if (chromaloc & 2) {// 2 и 3
-            start_h += 0.5f / (1 << fi->subSamplingH) - 0.5f * real_h / (dst_h << fi->subSamplingH);// top allign
-        }
-        else if (chromaloc & 4) {// 4 и 5
-            start_h -= 0.5f / (1 << fi->subSamplingH) - 0.5f * real_h / (dst_h << fi->subSamplingH);// bottom allign
-        }
-    }
-    
-    resize_width_down(srcp, tmpp, src_stride, dst_stride, src_w, src_h, dst_w, start_w, real_w, d->tale_w, d->kernel);
-    resize_height_down(tmpp, dstp, dst_stride, dst_w, src_h, dst_h, start_h, real_h, d->tale_h, d->kernel);
 }
 
 static void linear_to_rgb(const float *srcp, float *dstp, ptrdiff_t stride, int src_w, int src_h, float gamma) {
@@ -394,24 +264,24 @@ static void linear_to_yuv(const float *srcp, float *dstp, ptrdiff_t stride, int 
 }
 
 static void sharp_width(const float *srcp, float *dstp, ptrdiff_t stride, int src_w, int src_h, float sharp) {
-    int max_w = src_w - 1;
+    int border = src_w - 1;
     for (int y = 0; y < src_h; y++) {
         for (int x = 0; x < src_w; x++) {
-            dstp[x] = srcp[x] * sharp + (1.0f - sharp) * (srcp[MAX(x - 1, 0)] + srcp[x] + srcp[MIN(x + 1, max_w)]) / 3.0f;
+            dstp[x] = srcp[x] * sharp + (1.0f - sharp) * (srcp[MAX(x - 1, 0)] + srcp[x] + srcp[MIN(x + 1, border)]) / 3.0f;
         }
         dstp += stride;
         srcp += stride;
     }
 }
 
-static void sharp_height(const float *srcp, float *dstp, int src_w, int src_h, float sharp) {
-    int max_h = src_h - 1;
-    for (int y = 0; y < src_w; y++) {
-        for (int x = 0; x < src_h; x++) {
-            dstp[x * src_w] = srcp[x * src_w] * sharp + (1.0f - sharp) * (srcp[MAX(x - 1, 0) * src_w] + srcp[x * src_w] + srcp[MIN(x + 1, max_h) * src_w]) / 3.0f;
+static void sharp_height(const float *srcp, float *dstp, ptrdiff_t stride, int src_w, int src_h, float sharp) {
+    int border = src_h - 1;
+    for (int y = 0; y < src_h; y++) {
+        for (int x = 0; x < src_w; x++) {
+            dstp[x] = srcp[x] * sharp + (1.0f - sharp) * (srcp[(y != 0) ? (x - src_w) : x] + srcp[x] + srcp[(y != border) ? (x + src_w) : x]) / 3.0f;
         }
-        dstp++;
-        srcp++;
+        dstp += stride;
+        srcp += stride;
     }
 }
 
@@ -457,6 +327,30 @@ static const VSFrame *VS_CC ResizeGetFrame(int n, int activationReason, void *in
             int dst_w = vsapi->getFrameWidth(dst, plane);
             int dst_h = vsapi->getFrameHeight(dst, plane);
             
+            float start_w = d->start_w;
+            float start_h = d->start_h;
+            float real_w = d->real_w;
+            float real_h = d->real_h;
+            
+            // Для люмы и RGB сдвиги считаются напрямую, а для хромы - с учётом сабсэмплинга и выравнивания
+            if (plane && fi->colorFamily != cfRGB) {
+                start_w /= 1 << fi->subSamplingW;
+                real_w /= 1 << fi->subSamplingW;
+                start_h /= 1 << fi->subSamplingH;
+                real_h /= 1 << fi->subSamplingH;
+                // Находим значение коррекции для правильного выравнивания хромы по горизонтали
+                if (~chromaloc & 1) {// только для чётных
+                    start_w += 0.5f / (1 << fi->subSamplingW) - 0.5f * real_w / (dst_w << fi->subSamplingW);// left allign
+                }
+                // Находим значение коррекции для правильного выравнивания хромы по вертикали
+                if (chromaloc & 2) {// 2 и 3
+                    start_h += 0.5f / (1 << fi->subSamplingH) - 0.5f * real_h / (dst_h << fi->subSamplingH);// top allign
+                }
+                else if (chromaloc & 4) {// 4 и 5
+                    start_h -= 0.5f / (1 << fi->subSamplingH) - 0.5f * real_h / (dst_h << fi->subSamplingH);// bottom allign
+                }
+            }
+            
             if (d->gamma != 1.0f) {
                 float * VS_RESTRICT linp = (float *)vsapi->getWritePtr(lin, plane);
                 if (fi->colorFamily == cfRGB) {
@@ -465,16 +359,18 @@ static const VSFrame *VS_CC ResizeGetFrame(int n, int activationReason, void *in
                 else {
                     yuv_to_linear(srcp, linp, src_stride, src_w, src_h, d->gamma);
                 }
-                resize_director(linp, tmpp, dstp, src_stride, dst_stride, plane, src_w, src_h, dst_w, dst_h, chromaloc, fi, d);
+                resize_width(linp, tmpp, src_stride, dst_stride, src_w, src_h, dst_w, start_w, real_w, d->tale_w, d->kernel);
             }
             else {
-                resize_director(srcp, tmpp, dstp, src_stride, dst_stride, plane, src_w, src_h, dst_w, dst_h, chromaloc, fi, d);
+                resize_width(srcp, tmpp, src_stride, dst_stride, src_w, src_h, dst_w, start_w, real_w, d->tale_w, d->kernel);
             }
+            
+            resize_height(tmpp, dstp, dst_stride, dst_w, src_h, dst_h, start_h, real_h, d->tale_h, d->kernel);
             
             if (d->sharp != 1.0f) {
                 float * VS_RESTRICT shrp = (float *)vsapi->getWritePtr(shr, plane);
                 sharp_width(dstp, shrp, dst_stride, dst_w, dst_h, d->sharp);
-                sharp_height(shrp, dstp, dst_w, dst_h, d->sharp);
+                sharp_height(shrp, dstp, dst_stride, dst_w, dst_h, d->sharp);
             }
             
             if (d->gamma != 1.0f) {
@@ -523,8 +419,8 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData, VSCo
     d.dst_width = vsapi->mapGetIntSaturated(in, "width", 0, NULL);
     d.dst_height = vsapi->mapGetIntSaturated(in, "height", 0, NULL);
     
-    if (d.dst_width <= 1 << d.vi.format.subSamplingW || d.dst_width > d.vi.width) {
-        vsapi->mapSetError(out, "Resize: width any of the planes must be greater than 1 and less than or equal to clip width");
+    if (d.dst_width <= 1 << d.vi.format.subSamplingW || d.dst_width > 32767) {
+        vsapi->mapSetError(out, "Resize: width any of the planes must be greater than 1 and less than or equal to 32767");
         vsapi->freeNode(d.node);
         return;
     }
@@ -535,8 +431,8 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData, VSCo
         return;
     }
     
-    if (d.dst_height <= 1 << d.vi.format.subSamplingH || d.dst_height > d.vi.height) {
-        vsapi->mapSetError(out, "Resize: height any of the planes must be greater than 1 and less than or equal to clip height");
+    if (d.dst_height <= 1 << d.vi.format.subSamplingH || d.dst_height > 32767) {
+        vsapi->mapSetError(out, "Resize: height any of the planes must be greater than 1 and less than or equal to 32767");
         vsapi->freeNode(d.node);
         return;
     }
@@ -568,12 +464,6 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData, VSCo
         d.real_w += d.vi.width - d.start_w;
     }
     
-    if (d.dst_width > d.real_w) {
-        vsapi->mapSetError(out, "Resize: width must be less than or equal to src_width");
-        vsapi->freeNode(d.node);
-        return;
-    }
-    
     d.real_h = vsapi->mapGetFloatSaturated(in, "src_height", 0, &err);
     if (err) {
         d.real_h = (float)d.vi.height;
@@ -583,32 +473,31 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData, VSCo
         d.real_h += d.vi.height - d.start_h;
     }
     
-    if (d.dst_height > d.real_h) {
-        vsapi->mapSetError(out, "Resize: height must be less than or equal to src_height");
-        vsapi->freeNode(d.node);
-        return;
-    }
-    
     const char *kernel = vsapi->mapGetData(in, "kernel", 0, &err);
     if (err || !strcmp(kernel, "area")) {
-        d.kernel = 0;
+        d.kernel = area_kernel;
         d.tale_w = 0.5f + (d.dst_width / d.real_w) / 2.0f;
         d.tale_h = 0.5f + (d.dst_height / d.real_h) / 2.0f;
     }
     else if (!strcmp(kernel, "magic")) {
-        d.kernel = 1;
+        d.kernel = magic_kernel;
         d.tale_w = 1.5f;
         d.tale_h = 1.5f;
     }
     else if (!strcmp(kernel, "magic13")) {
-        d.kernel = 2;
+        d.kernel = magic_kernel_2013;
         d.tale_w = 2.5f;
         d.tale_h = 2.5f;
     }
     else if (!strcmp(kernel, "magic21")) {
-        d.kernel = 3;
+        d.kernel = magic_kernel_2021;
         d.tale_w = 4.5f;
         d.tale_h = 4.5f;
+    }
+    else if (!strcmp(kernel, "bilinear")) {
+        d.kernel = bilinear_kernel;
+        d.tale_w = 1.0f;
+        d.tale_h = 1.0f;
     }
     else {
         vsapi->mapSetError(out, "Resize: invalid kernel specified");
@@ -647,13 +536,6 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData, VSCo
     VSFilterDependency deps[] = {{d.node, rpStrictSpatial}};
     vsapi->createVideoFilter(out, "Resize", &d.vi, ResizeGetFrame, ResizeFree, fmParallel, deps, 1, data, core);
 }
-
-typedef struct {
-    VSNode *node;
-    VSVideoInfo vi;
-    float gamma;
-    bool process[3];
-} GammaData;
 
 static const VSFrame *VS_CC LinearizeGetFrame(int n, int activationReason, void *instanceData, void **frameData, VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
     GammaData *d = (GammaData *)instanceData;
@@ -864,7 +746,7 @@ static void VS_CC GammaCorrCreate(const VSMap *in, VSMap *out, void *userData, V
 }
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
-    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(4, 0), VAPOURSYNTH_API_VERSION, 0, plugin);
+    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(5, 0), VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction("Resize",
                              "clip:vnode;"
                              "width:int;"

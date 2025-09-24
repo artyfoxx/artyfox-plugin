@@ -10,8 +10,6 @@
                 "-ffast-math",
                 "-Wall",
                 "-Wextra",
-                // "-fdiagnostics-color=always",
-                // "-g",
                 "-I\"C:\\Program Files\\VapourSynth\\sdk\\include\\vapoursynth\"",
                 "${file}",
                 "-o",
@@ -23,11 +21,48 @@
             "problemMatcher": [
                 "$gcc"
             ],
+            "group": "build",
+            "detail": "Задача создана отладчиком."
+        },
+        {
+            "type": "cppbuild",
+            "label": "C/C++: icx.exe сборка активного файла",
+            "command": "C:/Program Files (x86)/Intel/oneAPI/compiler/2025.2/bin/icx.exe",
+            "args": [
+                "-LD",
+                "-O2",
+                "-ffast-math",
+                "-Wall",
+                "-Wextra",
+                "-I\"C:\\Program Files\\VapourSynth\\sdk\\include\\vapoursynth\"",
+                "${file}",
+                "-o",
+                "${fileDirname}\\${fileBasenameNoExtension}.dll",
+                "-link",
+                "-LIBPATH:\"C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2025.2\\lib\"",
+                "-NOIMPLIB",
+                "-NOEXP"
+            ],
+            "options": {
+                "cwd": "C:/Program Files (x86)/Intel/oneAPI/compiler/2025.2/bin"
+            },
+            "problemMatcher": {
+                "owner": "cpp",
+                "fileLocation": ["absolute"],
+                "pattern": {
+                    "regexp": "^(.*)\\((\\d+),(\\d+)\\): (warning|error): (.*)$",
+                    "file": 1,
+                    "line": 2,
+                    "column": 3,
+                    "severity": 4,
+                    "message": 5
+                }
+            },
             "group": {
                 "kind": "build",
                 "isDefault": true
             },
-            "detail": "Задача создана отладчиком."
+            "detail": "компилятор: C:/Program Files (x86)/Intel/oneAPI/compiler/2025.2/bin/icx.exe"
         }
     ],
     "version": "2.0.0"
