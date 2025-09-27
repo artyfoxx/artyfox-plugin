@@ -2,7 +2,7 @@
 A disjointed set of filters for VapourSynth, I write everything that seems interesting.  
 The author is a lover of long sheets of code stuffed into a single file. Don't judge too harshly.  
 ## Resize
-`artyfox.Resize(clip clip, int width, int height[, float src_left = 0.0, float src_top = 0.0, float src_width = clip.width, float src_height = clip.height, str kernel = "area", float gamma = 2.4 or ≈2.2, float sharp = 1.0])`
+`artyfox.Resize(clip clip, int width, int height[, float src_left = 0.0, float src_top = 0.0, float src_width = clip.width, float src_height = clip.height, str kernel = "area", float b = 1/3, float c = 1/3, int taps = 3, float gamma = 2.4 or ≈2.2, float sharp = 1.0])`
 
 Implementation of multiple resize functions using convolution method.  
 Area Resize based on the publications "Algorithm and program to downsizing the digital images" by S. Z. Sverdlov and "Pixel mixing" by Jason Summers.  
@@ -30,6 +30,9 @@ Magic Kernel is based on the publication "The magic kernel" by John Costella.
   * `spline64`: Cubic spline with 8 sample points.
   * `spline100`: Cubic spline with 10 sample points.
   * `spline144`: Cubic spline with 12 sample points.
+* `b`: The `b` parameter in the `bicubic` kernel. Defaults to 1/3.
+* `c`: The `c` parameter in the `bicubic` kernel. Defaults to 1/3.
+* `taps`: Window radius value for `blackman`, `lanczos`, and `nuttall` kernels. Default is 3.
 * `gamma`: The inverse and forward gamma correction value. Correction is performed before and after resizing, in order to produce the resize itself in a linear color space. The default values ​​are 2.4 for RGB and ≈2.2 (1 / 0.45) for YUV and GRAY. Two different formulas are used for RGB and YUV/GRAY. The formula for YUV/GRAY is suitable for SMPTE 170M, BT.601, BT.709, BT.2020 and is not suitable for SMPTE 240M, DCI-P3.  
 `gamma = 1` - completely disables correction, resizing occurs directly, in a logarithmic color space.  
 The allowed range of values ​​is from 0.1 to 5.0
