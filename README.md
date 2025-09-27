@@ -16,16 +16,26 @@ Magic Kernel is based on the publication "The magic kernel" by John Costella.
 * `src_height`: The height of the region to be resized relative to `src_top`. Defaults to the height of the source clip.
 * `kernel`: Selecting a kernel for convolution. Possible values:
   * `area`: Area Resize, used by default.
-  * `bilinear`: Bilinear kernel, added as a reference.
+  * `bicubic`: Bicubic interpolation.
+  * `bilinear`: Bilinear interpolation.
+  * `blackman`: Blackman windowed sinc.
+  * `lanczos`: Lanczos windowed sinc.
   * `magic`: Magic Kernel.
   * `magic13`: Magic Kernel Sharp 2013.
   * `magic21`: Magic Kernel Sharp 2021.
+  * `nuttall`: Nuttall windowed sinc.
+  * `point`: Nearest neighbour interpolation.
+  * `spline16`: Cubic spline with 4 sample points.
+  * `spline36`: Cubic spline with 6 sample points.
+  * `spline64`: Cubic spline with 8 sample points.
+  * `spline100`: Cubic spline with 10 sample points.
+  * `spline144`: Cubic spline with 12 sample points.
 * `gamma`: The inverse and forward gamma correction value. Correction is performed before and after resizing, in order to produce the resize itself in a linear color space. The default values ​​are 2.4 for RGB and ≈2.2 (1 / 0.45) for YUV and GRAY. Two different formulas are used for RGB and YUV/GRAY. The formula for YUV/GRAY is suitable for SMPTE 170M, BT.601, BT.709, BT.2020 and is not suitable for SMPTE 240M, DCI-P3.  
 `gamma = 1` - completely disables correction, resizing occurs directly, in a logarithmic color space.  
 The allowed range of values ​​is from 0.1 to 5.0
 * `sharp`: Optional post sharp. It is performed after resizing, but before gamma correction. By default, 1.0 (sharp is disabled). Values ​​​​less than 1.0 - blur, more - sharp. The allowed range of values ​​is from 0.1 to 5.0
 
-Chroma alignment in YUV is performed based on the `"_ChromaLocation"` property. If the property is missing or has an incorrect value, then alignment is performed along the left edge, as in MPEG2.  
+Chroma alignment in YUV with subsampling is performed based on the `"_ChromaLocation"` property. If the property is missing or has an incorrect value, then alignment is performed along the left edge, as in MPEG2.  
 Resize and alignment by fields are not supported.
 
 ## Linearize
@@ -44,5 +54,6 @@ Gamma correction of color space.
 * `gamma`: Gamma correction value. The default values ​​are 2.4 for RGB and ≈2.2 (1 / 0.45) for YUV and GRAY. Two different formulas are used for RGB and YUV/GRAY. The formula for YUV/GRAY is suitable for SMPTE 170M, BT.601, BT.709, BT.2020 and is not suitable for SMPTE 240M, DCI-P3. The allowed range of values ​​is from 0.1 to 5.0
 * `planes`: List of planes to be gamma corrected. Default is all.
 ## To do
-Add all popular convolution kernels.
+Transfer intermediate calculations to double.
+Maybe add a couple more interesting convolution kernels.
 Consider AVX2.

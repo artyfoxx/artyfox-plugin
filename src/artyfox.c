@@ -4,11 +4,18 @@
 #include "VapourSynth4.h"
 #include "VSHelper4.h"
 
-#define CLAMP(x, min, max) (x > max ? max : (x < min ? min : x)) 
-#define MAX(a, b) (a > b ? a : b)
-#define MIN(a, b) (a < b ? a : b)
+#define CLAMP(x, min, max) ((x) > (max) ? (max) : ((x) < (min) ? (min) : (x))) 
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define PI_FLOAT 3.1415927f
 
-typedef float (*kernel_func)(float, float);
+typedef float (*kernel_func)(float x, void *ctx);
+
+typedef struct {
+    kernel_func f;
+    float tale;
+    void *ctx;
+} kernel_t;
 
 typedef struct {
     VSNode *node;
@@ -19,19 +26,13 @@ typedef struct {
     float start_h;
     float real_w;
     float real_h;
-    kernel_func kernel;
-    float tale_w;
-    float tale_h;
+    kernel_t kernel_w;
+    kernel_t kernel_h;
     float gamma;
     float sharp;
+    bool process_w;
+    bool process_h;
 } ResizeData;
-
-typedef struct {
-    VSNode *node;
-    VSVideoInfo vi;
-    float gamma;
-    bool process[3];
-} GammaData;
 
 static void rgb_to_linear(const float *srcp, float *dstp, ptrdiff_t stride, int src_w, int src_h, float gamma) {
     for (int y = 0; y < src_h; y++) {
@@ -69,23 +70,26 @@ static void yuv_to_linear(const float *srcp, float *dstp, ptrdiff_t stride, int 
     }
 }
 
-static inline float area_kernel(float x, float factor) {
-    if (factor > 1.0f) {
-        factor = 1.0f / factor;
-    }
+typedef struct {
+    float scale;
+} area_ctx;
+
+static float area_kernel(float x, void *ctx) {
+    area_ctx *ar = (area_ctx *)ctx;
     if (x < 0.0f) {
         x = -x;
     }
-    if (x < 0.5f - factor / 2.0f) {
+    if (x < 0.5f - ar->scale / 2.0f) {
         return 1.0f;
     }
-    if (x < 0.5f + factor / 2.0f) {
-        return 0.5f - (x - 0.5f) / factor;
+    if (x < 0.5f + ar->scale / 2.0f) {
+        return 0.5f - (x - 0.5f) / ar->scale;
     }
     return 0.0f;
 }
 
-static inline float magic_kernel(float x, float factor) {
+static float magic_kernel(float x, void *ctx) {
+    (void)ctx;
     if (x < 0.0f) {
         x = -x;
     }
@@ -98,7 +102,8 @@ static inline float magic_kernel(float x, float factor) {
     return 0.0f;
 }
 
-static inline float magic_kernel_2013(float x, float factor) {
+static float magic_kernel_2013(float x, void *ctx) {
+    (void)ctx;
     if (x < 0.0f) {
         x = -x;
     }
@@ -114,7 +119,8 @@ static inline float magic_kernel_2013(float x, float factor) {
     return 0.0f;
 }
 
-static inline float magic_kernel_2021(float x, float factor) {
+static float magic_kernel_2021(float x, void *ctx) {
+    (void)ctx;
     if (x < 0.0f) {
         x = -x;
     }
@@ -136,7 +142,8 @@ static inline float magic_kernel_2021(float x, float factor) {
     return 0.0f;
 }
 
-static inline float bilinear_kernel(float x, float factor) {
+static float bilinear_kernel(float x, void *ctx) {
+    (void)ctx;
     if (x < 0.0f) {
         x = -x;
     }
@@ -146,9 +153,209 @@ static inline float bilinear_kernel(float x, float factor) {
     return 0.0f;
 }
 
+typedef struct {
+    float b, c;
+} bicubic_ctx;
+
+static float bicubic_kernel(float x, void *ctx) {
+    bicubic_ctx *bc = (bicubic_ctx *)ctx;
+    if (x < 0.0f) {
+        x = -x;
+    }
+    if (x < 1.0f) {
+        return (
+            ((12.0f - 9.0f * bc->b - 6.0f * bc->c) * x +
+            (-18.0f + 12.0f * bc->b + 6.0f * bc->c)) * x * x +
+            (6.0f - 2.0f * bc->b)
+        ) / 6.0f;
+    }
+    if (x < 2.0f) {
+        return (
+            (((-bc->b - 6.0f * bc->c) * x +
+            (6.0f * bc->b + 30.0f * bc->c)) * x +
+            (-12.0f * bc->b - 48.0f * bc->c)) * x +
+            (8.0f * bc->b + 24.0f * bc->c)
+        ) / 6.0f;
+    }
+    return 0.0f;
+}
+
+static inline float sinc_function(float x) {
+    if (x == 0.0f) {
+        return 1.0f;
+    }
+    x *= PI_FLOAT;
+    return sinf(x) / (x);
+}
+
+typedef struct {
+    int taps;
+} lanczos_ctx;
+
+static float lanczos_kernel(float x, void *ctx) {
+    lanczos_ctx *lc = (lanczos_ctx *)ctx;
+    if (x < 0.0f) {
+        x = -x;
+    }
+    if (x < lc->taps) {
+        return sinc_function(x) * sinc_function(x / lc->taps);
+    }
+    return 0.0f;
+}
+
+static float spline16_kernel(float x, void *ctx) {
+    (void)ctx;
+    if (x < 0.0f) {
+        x = -x;
+    }
+    if (x < 1.0f) {
+        return ((x - 1.8f) * x - 0.2f) * x + 1.0f;
+    }
+    if (x < 2.0f) {
+        x -= 1.0f;
+        return ((-1.0f / 3.0f * x + 0.8f) * x - 7.0f / 15.0f) * x;
+    }
+    return 0.0f;
+}
+
+static float spline36_kernel(float x, void *ctx) {
+    (void)ctx;
+    if (x < 0.0f) {
+        x = -x;
+    }
+    if (x < 1.0f) {
+        return ((13.0f / 11.0f * x - 453.0f / 209.0f) * x - 3.0f / 209.0f) * x + 1.0f;
+    }
+    if (x < 2.0f) {
+        x -= 1.0f;
+        return ((-6.0f / 11.0f * x + 270.0f / 209.0f) * x - 156.0f / 209.0f) * x;
+    }
+    if (x < 3.0f) {
+        x -= 2.0f;
+        return ((1.0f / 11.0f * x - 45.0f / 209.0f) * x + 26.0f / 209.0f) * x;
+    }
+    return 0.0f;
+}
+
+static float spline64_kernel(float x, void *ctx) {
+    (void)ctx;
+    if (x < 0.0f) {
+        x = -x;
+    }
+    if (x < 1.0f) {
+        return ((49.0f / 41.0f * x - 6387.0f / 2911.0f) * x - 3.0f / 2911.0f) * x + 1.0f;
+    }
+    if (x < 2.0f) {
+        x -= 1.0f;
+        return ((-24.0f / 41.0f * x + 4032.0f / 2911.0f) * x - 2328.0f / 2911.0f) * x;
+    }
+    if (x < 3.0f) {
+        x -= 2.0f;
+        return ((6.0f / 41.0f * x - 1008.0f / 2911.0f) * x + 582.0f / 2911.0f) * x;
+    }
+    if (x < 4.0f) {
+        x -= 3.0f;
+        return ((-1.0f / 41.0f * x + 168.0f / 2911.0f) * x - 97.0f / 2911.0f) * x;
+    }
+    return 0.0f;
+}
+
+static float spline100_kernel(float x, void *ctx) {
+    (void)ctx;
+    if (x < 0.0f) {
+        x = -x;
+    }
+    if (x < 1.0f) {
+        return ((61.0f / 51.0f * x - 9893.0f / 4505.0f) * x - 1.0f / 13515.0f) * x + 1.0f;
+    }
+    if (x < 2.0f) {
+        x -= 1.0f;
+        return ((-10.0f / 17.0f * x +  1254.0f / 901.0f) * x - 724.0f / 901.0f) * x;
+    }
+    if (x < 3.0f) {
+        x -= 2.0f;
+        return ((8.0f / 51.0f * x - 1672.0f / 4505.0f) * x + 2896.0f / 13515.0f) * x;
+    }
+    if (x < 4.0f) {
+        x -= 3.0f;
+        return ((-2.0f / 51.0f * x +  418.0f / 4505.0f) * x -  724.0f / 13515.0f) * x;
+    }
+    if (x < 5.0f) {
+        x -= 4.0f;
+        return ((1.0f / 153.0f * x - 209.0f / 13515.0f) * x +  362.0f / 40545.0f) * x;
+    }
+    return 0.0f;
+}
+
+static float spline144_kernel(float x, void *ctx) {
+    (void)ctx;
+    if (x < 0.0f) {
+        x = -x;
+    }
+    if (x < 1.0f) {
+        return ((683.0f / 571.0f * x - 1240203.0f / 564719.0f) * x - 3.0f / 564719.0f) * x + 1.0f;
+    }
+    if (x < 2.0f) {
+        x -= 1.0f;
+        return ((-336.0f / 571.0f * x + 786240.0f / 564719.0f) * x - 453936.0f / 564719.0f) * x;
+    }
+    if (x < 3.0f) {
+        x -= 2.0f;
+        return ((90.0f / 571.0f * x - 210600.0f / 564719.0f) * x + 121590.0f / 564719.0f) * x;
+    }
+    if (x < 4.0f) {
+        x -= 3.0f;
+        return ((-24.0f / 571.0f * x + 56160.0f / 564719.0f) * x - 32424.0f / 564719.0f) * x;
+    }
+    if (x < 5.0f) {
+        x -= 4.0f;
+        return ((6.0f / 571.0f * x - 14040.0f / 564719.0f) * x + 8106.0f / 564719.0f) * x;
+    }
+    if (x < 6.0f) {
+        x -= 5.0f;
+        return ((-1.0f / 571.0f * x + 2340.0f / 564719.0f) * x - 1351.0f / 564719.0f) * x;
+    }
+    return 0.0f;
+}
+
+static float point_kernel(float x, void *ctx) {
+    (void)ctx;
+    if (x < 0.0f) {
+        x = -x;
+    }
+    if (x < 0.5f) {
+        return 1.0f;
+    }
+    return 0.0f;
+}
+
+static float blackman_kernel(float x, void *ctx) {
+    lanczos_ctx *lc = (lanczos_ctx *)ctx;
+    if (x < 0.0f) {
+        x = -x;
+    }
+    if (x < lc->taps) {
+        float nx = x * PI_FLOAT / lc->taps;
+        return sinc_function(x) * (0.42f + 0.5f * cosf(nx) + 0.08f * cosf(nx * 2.0f));
+    }
+    return 0.0f;
+}
+
+static float nuttall_kernel(float x, void *ctx) {
+    lanczos_ctx *lc = (lanczos_ctx *)ctx;
+    if (x < 0.0f) {
+        x = -x;
+    }
+    if (x < lc->taps) {
+        float nx = x * PI_FLOAT / lc->taps;
+        return sinc_function(x) * (0.355768f + 0.487396f * cosf(nx) + 0.144232f * cosf(nx * 2.0f) + 0.012604f * cosf(nx * 3.0f));
+    }
+    return 0.0f;
+}
+
 static void resize_width(
     const float *srcp, float *dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride, int src_w, int src_h, int dst_w,
-    float start_w, float real_w, float tale, kernel_func kernel
+    float start_w, float real_w, kernel_t kernel
 ) {
     float factor = dst_w / real_w;
     float scale = (factor < 1.0f) ? factor : 1.0f;
@@ -158,15 +365,16 @@ static void resize_width(
     int min_w = (int)floorf(start_w);
     int max_w = (int)ceilf(real_w + start_w) - 1;
     int border = src_w - 1;
+    float tale = kernel.tale / scale;
     
     for (int x = 0; x < dst_w; x++) {
         float center = (x + 0.5f) / factor - 0.5f + start_w;
-        low[x] = MAX((int)floorf(center - tale / scale), min_w);
-        high[x] = MIN((int)ceilf(center + tale / scale), max_w);
+        low[x] = MAX((int)floorf(center - tale), min_w);
+        high[x] = MIN((int)ceilf(center + tale), max_w);
         weights[x] = (float *)malloc(sizeof(float) * (high[x] - low[x] + 1));
         float norm = 0.0f;
         for (int i = low[x]; i <= high[x]; i++) {
-            weights[x][i - low[x]] = kernel((i - center) * scale, factor);
+            weights[x][i - low[x]] = kernel.f((i - center) * scale, kernel.ctx);
             norm += weights[x][i - low[x]];
         }
         for (int i = low[x]; i <= high[x]; i++) {
@@ -195,22 +403,23 @@ static void resize_width(
 
 static void resize_height(
     const float *srcp, float *dstp, ptrdiff_t dst_stride, int src_w, int src_h, int dst_h,
-    float start_h, float real_h, float tale, kernel_func kernel
+    float start_h, float real_h, kernel_t kernel
 ) {
     float factor = dst_h / real_h;
     float scale = (factor < 1.0f) ? factor : 1.0f;
     int min_h = (int)floorf(start_h);
     int max_h = (int)ceilf(real_h + start_h) - 1;
     int border = src_h - 1;
+    float tale = kernel.tale / scale;
     
     for (int y = 0; y < dst_h; y++) {
         float center = (y + 0.5f) / factor - 0.5f + start_h;
-        int low = MAX((int)floorf(center - tale / scale), min_h);
-        int high = MIN((int)ceilf(center + tale / scale), max_h);
+        int low = MAX((int)floorf(center - tale), min_h);
+        int high = MIN((int)ceilf(center + tale), max_h);
         float *weights = (float *)malloc(sizeof(float) * (high - low + 1));
         float norm = 0.0f;
         for (int i = low; i <= high; i++) {
-            weights[i - low] = kernel((i - center) * scale, factor);
+            weights[i - low] = kernel.f((i - center) * scale, kernel.ctx);
             norm += weights[i - low];
         }
         for (int i = low; i <= high; i++) {
@@ -278,14 +487,17 @@ static void sharp_height(const float *srcp, float *dstp, ptrdiff_t stride, int s
     int border = src_h - 1;
     for (int y = 0; y < src_h; y++) {
         for (int x = 0; x < src_w; x++) {
-            dstp[x] = srcp[x] * sharp + (1.0f - sharp) * (srcp[(y != 0) ? (x - src_w) : x] + srcp[x] + srcp[(y != border) ? (x + src_w) : x]) / 3.0f;
+            dstp[x] = srcp[x] * sharp + (1.0f - sharp) * (srcp[(y > 0) ? (x - src_w) : x] + srcp[x] + srcp[(y < border) ? (x + src_w) : x]) / 3.0f;
         }
         dstp += stride;
         srcp += stride;
     }
 }
 
-static const VSFrame *VS_CC ResizeGetFrame(int n, int activationReason, void *instanceData, void **frameData, VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
+static const VSFrame *VS_CC ResizeGetFrame(
+    int n, int activationReason, void *instanceData, void **frameData,
+    VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi
+) {
     ResizeData *d = (ResizeData *)instanceData;
     
     if (activationReason == arInitial) {
@@ -307,7 +519,11 @@ static const VSFrame *VS_CC ResizeGetFrame(int n, int activationReason, void *in
             lin = vsapi->newVideoFrame(fi, d->vi.width, d->vi.height, NULL, core);
         }
         
-        VSFrame *tmp = vsapi->newVideoFrame(fi, d->dst_width, d->vi.height, NULL, core);
+        VSFrame *tmp = NULL;
+        if (d->process_w && d->process_h) {
+            tmp = vsapi->newVideoFrame(fi, d->dst_width, d->vi.height, NULL, core);
+        }
+        
         VSFrame *dst = vsapi->newVideoFrame(fi, d->dst_width, d->dst_height, src, core);
         
         VSFrame *shr = NULL;
@@ -317,9 +533,8 @@ static const VSFrame *VS_CC ResizeGetFrame(int n, int activationReason, void *in
         
         for (int plane = 0; plane < fi->numPlanes; plane++) {
             const float * VS_RESTRICT srcp = (const float *)vsapi->getReadPtr(src, plane);
-            ptrdiff_t src_stride = vsapi->getStride(src, plane) / sizeof(float);
-            float * VS_RESTRICT tmpp = (float *)vsapi->getWritePtr(tmp, plane);
             float * VS_RESTRICT dstp = (float *)vsapi->getWritePtr(dst, plane);
+            ptrdiff_t src_stride = vsapi->getStride(src, plane) / sizeof(float);
             ptrdiff_t dst_stride = vsapi->getStride(dst, plane) / sizeof(float);
             
             int src_w = vsapi->getFrameWidth(src, plane);
@@ -332,8 +547,8 @@ static const VSFrame *VS_CC ResizeGetFrame(int n, int activationReason, void *in
             float real_w = d->real_w;
             float real_h = d->real_h;
             
-            // Для люмы и RGB сдвиги считаются напрямую, а для хромы - с учётом сабсэмплинга и выравнивания
-            if (plane && fi->colorFamily != cfRGB) {
+            // Для люмы и RGB/YUV444 сдвиги считаются напрямую, а для хромы - с учётом сабсэмплинга и выравнивания
+            if (plane && (fi->subSamplingW | fi->subSamplingH)) {
                 start_w /= 1 << fi->subSamplingW;
                 real_w /= 1 << fi->subSamplingW;
                 start_h /= 1 << fi->subSamplingH;
@@ -359,13 +574,35 @@ static const VSFrame *VS_CC ResizeGetFrame(int n, int activationReason, void *in
                 else {
                     yuv_to_linear(srcp, linp, src_stride, src_w, src_h, d->gamma);
                 }
-                resize_width(linp, tmpp, src_stride, dst_stride, src_w, src_h, dst_w, start_w, real_w, d->tale_w, d->kernel);
+                if (d->process_w && d->process_h) {
+                    float * VS_RESTRICT tmpp = (float *)vsapi->getWritePtr(tmp, plane);
+                    resize_width(linp, tmpp, src_stride, dst_stride, src_w, src_h, dst_w, start_w, real_w, d->kernel_w);
+                    resize_height(tmpp, dstp, dst_stride, dst_w, src_h, dst_h, start_h, real_h, d->kernel_h);
+                }
+                else if (d->process_w) {
+                    resize_width(linp, dstp, src_stride, dst_stride, src_w, src_h, dst_w, start_w, real_w, d->kernel_w);
+                }
+                else if (d->process_h) {
+                    resize_height(linp, dstp, dst_stride, dst_w, src_h, dst_h, start_h, real_h, d->kernel_h);
+                }
+                else {
+                    memcpy(dstp, linp, sizeof(float) * src_w * src_h);
+                }
+            }
+            else if (d->process_w && d->process_h) {
+                float * VS_RESTRICT tmpp = (float *)vsapi->getWritePtr(tmp, plane);
+                resize_width(srcp, tmpp, src_stride, dst_stride, src_w, src_h, dst_w, start_w, real_w, d->kernel_w);
+                resize_height(tmpp, dstp, dst_stride, dst_w, src_h, dst_h, start_h, real_h, d->kernel_h);
+            }
+            else if (d->process_w) {
+                resize_width(srcp, dstp, src_stride, dst_stride, src_w, src_h, dst_w, start_w, real_w, d->kernel_w);
+            }
+            else if (d->process_h) {
+                resize_height(srcp, dstp, dst_stride, dst_w, src_h, dst_h, start_h, real_h, d->kernel_h);
             }
             else {
-                resize_width(srcp, tmpp, src_stride, dst_stride, src_w, src_h, dst_w, start_w, real_w, d->tale_w, d->kernel);
+                memcpy(dstp, srcp, sizeof(float) * src_w * src_h);
             }
-            
-            resize_height(tmpp, dstp, dst_stride, dst_w, src_h, dst_h, start_h, real_h, d->tale_h, d->kernel);
             
             if (d->sharp != 1.0f) {
                 float * VS_RESTRICT shrp = (float *)vsapi->getWritePtr(shr, plane);
@@ -396,6 +633,15 @@ static const VSFrame *VS_CC ResizeGetFrame(int n, int activationReason, void *in
 static void VS_CC ResizeFree(void *instanceData, VSCore *core, const VSAPI *vsapi) {
     ResizeData *d = (ResizeData *)instanceData;
     vsapi->freeNode(d->node);
+    
+    if (d->kernel_w.ctx == d->kernel_h.ctx) {
+        free(d->kernel_w.ctx);
+    }
+    else {
+        free(d->kernel_w.ctx);
+        free(d->kernel_h.ctx);
+    }
+    
     free(d);
 }
 
@@ -475,29 +721,96 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData, VSCo
     
     const char *kernel = vsapi->mapGetData(in, "kernel", 0, &err);
     if (err || !strcmp(kernel, "area")) {
-        d.kernel = area_kernel;
-        d.tale_w = 0.5f + (d.dst_width / d.real_w) / 2.0f;
-        d.tale_h = 0.5f + (d.dst_height / d.real_h) / 2.0f;
+        area_ctx *ar_w = (area_ctx *)malloc(sizeof(*ar_w));
+        area_ctx *ar_h = (area_ctx *)malloc(sizeof(*ar_h));
+        ar_w->scale = (d.dst_width < d.real_w) ? (d.dst_width / d.real_w) : (d.real_w / d.dst_width);
+        ar_h->scale = (d.dst_height < d.real_h) ? (d.dst_height / d.real_h) : (d.real_h / d.dst_height);
+        d.kernel_w = (kernel_t){area_kernel, 0.5f + ar_w->scale / 2.0f, ar_w};
+        d.kernel_h = (kernel_t){area_kernel, 0.5f + ar_h->scale / 2.0f, ar_h};
     }
     else if (!strcmp(kernel, "magic")) {
-        d.kernel = magic_kernel;
-        d.tale_w = 1.5f;
-        d.tale_h = 1.5f;
+        d.kernel_w = d.kernel_h = (kernel_t){magic_kernel, 1.5f, NULL};
     }
     else if (!strcmp(kernel, "magic13")) {
-        d.kernel = magic_kernel_2013;
-        d.tale_w = 2.5f;
-        d.tale_h = 2.5f;
+        d.kernel_w = d.kernel_h = (kernel_t){magic_kernel_2013, 2.5f, NULL};
     }
     else if (!strcmp(kernel, "magic21")) {
-        d.kernel = magic_kernel_2021;
-        d.tale_w = 4.5f;
-        d.tale_h = 4.5f;
+        d.kernel_w = d.kernel_h = (kernel_t){magic_kernel_2021, 4.5f, NULL};
     }
     else if (!strcmp(kernel, "bilinear")) {
-        d.kernel = bilinear_kernel;
-        d.tale_w = 1.0f;
-        d.tale_h = 1.0f;
+        d.kernel_w = d.kernel_h = (kernel_t){bilinear_kernel, 1.0f, NULL};
+    }
+    else if (!strcmp(kernel, "bicubic")) {
+        bicubic_ctx *bc = (bicubic_ctx *)malloc(sizeof(*bc));
+        bc->b = vsapi->mapGetFloatSaturated(in, "b", 0, &err);
+        if (err) {
+            bc->b = 1.0f / 3.0f;
+        }
+        bc->c = vsapi->mapGetFloatSaturated(in, "c", 0, &err);
+        if (err) {
+            bc->c = 1.0f / 3.0f;
+        }
+        d.kernel_w = d.kernel_h = (kernel_t){bicubic_kernel, 2.0f, bc};
+    }
+    else if (!strcmp(kernel, "lanczos")) {
+        lanczos_ctx *lc = (lanczos_ctx *)malloc(sizeof(*lc));
+        lc->taps = vsapi->mapGetIntSaturated(in, "taps", 0, &err);
+        if (err) {
+            lc->taps = 3;
+        }
+        if (lc->taps < 1 || lc->taps > 128) {
+            vsapi->mapSetError(out, "Resize: taps must be between 1 and 128");
+            vsapi->freeNode(d.node);
+            free(lc);
+            return;
+        }
+        d.kernel_w = d.kernel_h = (kernel_t){lanczos_kernel, (float)lc->taps, lc};
+    }
+    else if (!strcmp(kernel, "spline16")) {
+        d.kernel_w = d.kernel_h = (kernel_t){spline16_kernel, 2.0f, NULL};
+    }
+    else if (!strcmp(kernel, "spline36")) {
+        d.kernel_w = d.kernel_h = (kernel_t){spline36_kernel, 3.0f, NULL};
+    }
+    else if (!strcmp(kernel, "spline64")) {
+        d.kernel_w = d.kernel_h = (kernel_t){spline64_kernel, 4.0f, NULL};
+    }
+    else if (!strcmp(kernel, "spline100")) {
+        d.kernel_w = d.kernel_h = (kernel_t){spline100_kernel, 5.0f, NULL};
+    }
+    else if (!strcmp(kernel, "spline144")) {
+        d.kernel_w = d.kernel_h = (kernel_t){spline144_kernel, 6.0f, NULL};
+    }
+    else if (!strcmp(kernel, "point")) {
+        d.kernel_w = d.kernel_h = (kernel_t){point_kernel, 0.5f, NULL};
+    }
+    else if (!strcmp(kernel, "blackman")) {
+        lanczos_ctx *lc = (lanczos_ctx *)malloc(sizeof(*lc));
+        lc->taps = vsapi->mapGetIntSaturated(in, "taps", 0, &err);
+        if (err) {
+            lc->taps = 3;
+        }
+        if (lc->taps < 1 || lc->taps > 128) {
+            vsapi->mapSetError(out, "Resize: taps must be between 1 and 128");
+            vsapi->freeNode(d.node);
+            free(lc);
+            return;
+        }
+        d.kernel_w = d.kernel_h = (kernel_t){blackman_kernel, (float)lc->taps, lc};
+    }
+    else if (!strcmp(kernel, "nuttall")) {
+        lanczos_ctx *lc = (lanczos_ctx *)malloc(sizeof(*lc));
+        lc->taps = vsapi->mapGetIntSaturated(in, "taps", 0, &err);
+        if (err) {
+            lc->taps = 3;
+        }
+        if (lc->taps < 1 || lc->taps > 128) {
+            vsapi->mapSetError(out, "Resize: taps must be between 1 and 128");
+            vsapi->freeNode(d.node);
+            free(lc);
+            return;
+        }
+        d.kernel_w = d.kernel_h = (kernel_t){nuttall_kernel, (float)lc->taps, lc};
     }
     else {
         vsapi->mapSetError(out, "Resize: invalid kernel specified");
@@ -527,6 +840,9 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData, VSCo
         return;
     }
     
+    d.process_w = (d.dst_width == d.vi.width && d.real_w == d.vi.width && d.start_w == 0.0f) ? false : true;
+    d.process_h = (d.dst_height == d.vi.height && d.real_h == d.vi.height && d.start_h == 0.0f) ? false : true;
+    
     ResizeData *data = (ResizeData *)malloc(sizeof d);
     *data = d;
     
@@ -537,7 +853,17 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData, VSCo
     vsapi->createVideoFilter(out, "Resize", &d.vi, ResizeGetFrame, ResizeFree, fmParallel, deps, 1, data, core);
 }
 
-static const VSFrame *VS_CC LinearizeGetFrame(int n, int activationReason, void *instanceData, void **frameData, VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
+typedef struct {
+    VSNode *node;
+    VSVideoInfo vi;
+    float gamma;
+    bool process[3];
+} GammaData;
+
+static const VSFrame *VS_CC LinearizeGetFrame(
+    int n, int activationReason, void *instanceData, void **frameData,
+    VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi
+) {
     GammaData *d = (GammaData *)instanceData;
     
     if (activationReason == arInitial) {
@@ -641,7 +967,10 @@ static void VS_CC LinearizeCreate(const VSMap *in, VSMap *out, void *userData, V
     vsapi->createVideoFilter(out, "Linearize", &d.vi, LinearizeGetFrame, LinearizeFree, fmParallel, deps, 1, data, core);
 }
 
-static const VSFrame *VS_CC GammaCorrGetFrame(int n, int activationReason, void *instanceData, void **frameData, VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
+static const VSFrame *VS_CC GammaCorrGetFrame(
+    int n, int activationReason, void *instanceData, void **frameData,
+    VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi
+) {
     GammaData *d = (GammaData *)instanceData;
     
     if (activationReason == arInitial) {
@@ -746,7 +1075,7 @@ static void VS_CC GammaCorrCreate(const VSMap *in, VSMap *out, void *userData, V
 }
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
-    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(5, 0), VAPOURSYNTH_API_VERSION, 0, plugin);
+    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(6, 0), VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction("Resize",
                              "clip:vnode;"
                              "width:int;"
@@ -756,6 +1085,9 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
                              "src_width:float:opt;"
                              "src_height:float:opt;"
                              "kernel:data:opt;"
+                             "b:float:opt;"
+                             "c:float:opt;"
+                             "taps:int:opt;"
                              "gamma:float:opt;"
                              "sharp:float:opt;",
                              "clip:vnode;",
