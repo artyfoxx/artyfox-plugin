@@ -31,6 +31,8 @@
             "args": [
                 "-LD",
                 "-O2",
+                "-mavx2",
+                "-mfma",
                 "-ffast-math",
                 "-Wall",
                 "-Wextra",

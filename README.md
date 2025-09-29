@@ -1,6 +1,7 @@
 # artyfox-plugin
 A disjointed set of filters for VapourSynth, I write everything that seems interesting.  
 The author is a lover of long sheets of code stuffed into a single file. Don't judge too harshly.  
+Only for processors with AVX2 and FMA support!
 ## Resize
 `artyfox.Resize(clip clip, int width, int height[, float src_left = 0.0, float src_top = 0.0, float src_width = clip.width, float src_height = clip.height, str kernel = "area", float b = 1/3, float c = 1/3, int taps = 3, float gamma = 2.4 or ≈2.2, float sharp = 1.0])`
 
@@ -57,6 +58,4 @@ Gamma correction of color space.
 * `gamma`: Gamma correction value. The default values ​​are 2.4 for RGB and ≈2.2 (1 / 0.45) for YUV and GRAY. Two different formulas are used for RGB and YUV/GRAY. The formula for YUV/GRAY is suitable for SMPTE 170M, BT.601, BT.709, BT.2020 and is not suitable for SMPTE 240M, DCI-P3. The allowed range of values ​​is from 0.1 to 5.0
 * `planes`: List of planes to be gamma corrected. Default is all.
 ## To do
-Transfer intermediate calculations to double.
 Maybe add a couple more interesting convolution kernels.
-Consider AVX2.
