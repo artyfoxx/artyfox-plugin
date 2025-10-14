@@ -30,7 +30,12 @@
             "cStandard": "c17",
             "cppStandard": "c++17",
             "intelliSenseMode": "windows-clang-x64",
-            "compilerPath": "C:/Program Files (x86)/Intel/oneAPI/compiler/2025.2/bin/icx.exe"
+            "compilerPath": "C:/Program Files (x86)/Intel/oneAPI/compiler/2025.2/bin/icx.exe",
+            "compilerArgs": [
+                "-mavx2",
+                "-mfma",
+                "-ffast-math"
+            ]
         }
     ],
     "version": 4
