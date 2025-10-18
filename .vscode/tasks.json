@@ -22,49 +22,41 @@
                 "$gcc"
             ],
             "group": "build",
-            "detail": "Задача создана отладчиком."
+            "detail": "Собрать GCC"
         },
         {
             "type": "cppbuild",
-            "label": "C/C++: icx.exe сборка активного файла",
-            "command": "C:/Program Files (x86)/Intel/oneAPI/compiler/2025.2/bin/icx.exe",
+            "label": "C/C++: clang.exe сборка активного файла",
+            "command": "C:/msys64/ucrt64/bin/clang.exe",
             "args": [
-                "-LD",
+                "-shared",
                 "-O2",
                 "-mavx2",
                 "-mfma",
                 "-ffast-math",
+                "-flto",
+                "-fuse-ld=lld",
                 "-Wall",
                 "-Wextra",
                 "-I\"C:\\Program Files\\VapourSynth\\sdk\\include\\vapoursynth\"",
+                "-I\"C:\\msys64\\home\\artyfox\\install\\include\"",
                 "${file}",
                 "-o",
                 "${fileDirname}\\${fileBasenameNoExtension}.dll",
-                "-link",
-                "-LIBPATH:\"C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2025.2\\lib\"",
-                "-NOIMPLIB",
-                "-NOEXP"
+                "-L\"C:\\msys64\\home\\artyfox\\install\\lib\"",
+                "-lsleef"
             ],
             "options": {
-                "cwd": "C:/Program Files (x86)/Intel/oneAPI/compiler/2025.2/bin"
+                "cwd": "C:/msys64/ucrt64/bin"
             },
-            "problemMatcher": {
-                "owner": "cpp",
-                "fileLocation": ["absolute"],
-                "pattern": {
-                    "regexp": "^(.*)\\((\\d+),(\\d+)\\): (warning|error): (.*)$",
-                    "file": 1,
-                    "line": 2,
-                    "column": 3,
-                    "severity": 4,
-                    "message": 5
-                }
-            },
+            "problemMatcher": [
+                "$gcc"
+            ],
             "group": {
                 "kind": "build",
                 "isDefault": true
             },
-            "detail": "компилятор: C:/Program Files (x86)/Intel/oneAPI/compiler/2025.2/bin/icx.exe"
+            "detail": "Собрать Clang"
         }
     ],
     "version": "2.0.0"

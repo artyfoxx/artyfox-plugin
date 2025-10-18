@@ -17,10 +17,11 @@
             "compilerPath": "C:/msys64/ucrt64/bin/gcc.exe"
         },
         {
-            "name": "Intel oneAPI",
+            "name": "Clang",
             "includePath": [
                 "${workspaceFolder}/**",
-                "C:\\Program Files\\VapourSynth\\sdk\\include\\vapoursynth"
+                "C:\\Program Files\\VapourSynth\\sdk\\include\\vapoursynth",
+                "C:\\msys64\\home\\artyfox\\install\\include"
             ],
             "defines": [
                 "_DEBUG",
@@ -30,7 +31,7 @@
             "cStandard": "c17",
             "cppStandard": "c++17",
             "intelliSenseMode": "windows-clang-x64",
-            "compilerPath": "C:/Program Files (x86)/Intel/oneAPI/compiler/2025.2/bin/icx.exe",
+            "compilerPath": "C:/msys64/ucrt64/bin/clang.exe",
             "compilerArgs": [
                 "-mavx2",
                 "-mfma",

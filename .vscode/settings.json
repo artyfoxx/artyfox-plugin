@@ -1,7 +1,8 @@
 {
-    "C_Cpp.default.compilerPath": "c:/Program Files (x86)/Intel/oneAPI/compiler/2025.2/bin/icx.exe",
+    "C_Cpp.default.compilerPath": "C:/msys64/ucrt64/bin/clang.exe",
     "files.associations": {
         "*.vpy": "python",
-        "math.h": "c"
+        "math.h": "c",
+        "sleef.h": "c"
     }
 }
