@@ -66,6 +66,19 @@ Converting the bit depth of a clip.
 * `clip`: Source clip to be converted to bit depth. Must be RGB, YUV or GRAY. 8-16-bit integer or 32-bit float sample type.
 * `bits`: The bit depth of the target clip. It can be from 8 to 16 or 32. When converting from integer to float or vice versa, a color range conversion may also occur, since in the 32-bit float format, the concept of a limited range does not exist. The range is converted according to the frame's `"_ColorRange"` property. If this property does not exist or has an invalid value, the range is considered full for RGB and limited for YUV and GRAY. Conversion between integers occurs without regard to range. Downconversion of bit depth occurs with arithmetic rounding and saturation.
 
-## Third-Party Components
-This plugin uses mathematical functions from the [SLEEF library](https://sleef.org/), which is distributed under the Boost Software License 1.0.  
-A copy of the Boost Software License can be found at: https://www.boost.org/LICENSE_1_0.txt
+## License
+
+This project is licensed under the MIT License — see the LICENSE file for details.
+
+### Note on Intel SVML
+This project may be built using the Intel Compiler (ICX/ICC), which can internally
+use functions from the Intel Short Vector Math Library (SVML) to implement standard
+vector math intrinsics such as `_mm256_pow_ps`, `_mm256_exp_ps`, `_mm256_log_ps`, etc.
+
+No SVML source code or binaries are distributed with this project.
+Any SVML routines that may be embedded in the compiled binary are used solely as
+part of the normal compilation and optimization process provided by the Intel Compiler,
+and remain subject to Intel's compiler runtime license.
+
+The original source code of this project is entirely independent and released
+under the terms of the MIT License.
