@@ -2350,7 +2350,7 @@ static void VS_CC BitDepthCreate(const VSMap *in, VSMap *out, void *userData, VS
     
     d.vi.format.bitsPerSample = bits;
     d.vi.format.bytesPerSample = (bits + 7) / 8;
-    d.vi.format.sampleType = (bits == 32 ? stFloat : stInteger);
+    d.vi.format.sampleType = (bits == 32) ? stFloat : stInteger;
     
     BitDepthData *data = (BitDepthData *)malloc(sizeof d);
     *data = d;
@@ -2360,7 +2360,7 @@ static void VS_CC BitDepthCreate(const VSMap *in, VSMap *out, void *userData, VS
 }
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
-    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(9, 0), VAPOURSYNTH_API_VERSION, 0, plugin);
+    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(10, 0), VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction("Resize",
                              "clip:vnode;"
                              "width:int;"
