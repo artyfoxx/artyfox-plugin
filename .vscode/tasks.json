@@ -27,7 +27,7 @@
 		{
             "type": "cppbuild",
             "label": "C/C++: icx.exe сборка активного файла",
-            "command": "C:/Program Files (x86)/Intel/oneAPI/compiler/2025.2/bin/icx.exe",
+            "command": "C:/Program Files (x86)/Intel/oneAPI/compiler/2025.3/bin/icx.exe",
             "args": [
                 "-LD",
                 "-O2",
@@ -40,16 +40,21 @@
                 "-Wall",
                 "-Wextra",
                 "-I\"C:\\Program Files\\VapourSynth\\sdk\\include\\vapoursynth\"",
+                "-I\"C:\\Program Files (x86)\\Intel\\oneAPI\\mkl\\2025.3\\include\"",
                 "${file}",
                 "-o",
                 "${fileDirname}\\${fileBasenameNoExtension}.dll",
                 "-link",
-                "-LIBPATH:\"C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2025.2\\lib\"",
+                "-LIBPATH:\"C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2025.3\\lib\"",
+                "-LIBPATH:\"C:\\Program Files (x86)\\Intel\\oneAPI\\mkl\\2025.3\\lib\"",
+                "mkl_sequential.lib",
+                "mkl_intel_lp64.lib",
+                "mkl_core.lib",
                 "-NOIMPLIB",
                 "-NOEXP"
             ],
             "options": {
-                "cwd": "C:/Program Files (x86)/Intel/oneAPI/compiler/2025.2/bin"
+                "cwd": "C:/Program Files (x86)/Intel/oneAPI/compiler/2025.3/bin"
             },
             "problemMatcher": {
                 "owner": "cpp",

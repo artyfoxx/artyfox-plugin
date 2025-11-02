@@ -1,8 +1,8 @@
 # artyfox-plugin
 A disjointed set of filters for VapourSynth, I write everything that seems interesting.  
-By default it is compiled with AVX2 and FMA support, but you can also build a vanilla C version if you wish.
+By default it is compiled with AVX2 and FMA support, but you can also build a scalar version if you wish.
 ## Resize
-`artyfox.Resize(clip clip, int width, int height[, float src_left = 0.0, float src_top = 0.0, float src_width = clip.width, float src_height = clip.height, str kernel = "area", float b = 1/3, float c = 1/3, int taps = 3, float gamma = 2.4 or ≈2.2, float sharp = 1.0])`
+`artyfox.Resize(clip clip, int width, int height[, float src_left=0.0, float src_top=0.0, float src_width=clip.width, float src_height=clip.height, str kernel="area", float b=1/3, float c=1/3, int taps=3, float gamma=2.4 or ≈2.2, float sharp=1.0])`
 
 Implementation of multiple resize functions using convolution method in a linear color space.  
 Area Resize based on the publications "Algorithm and program to downsizing the digital images" by S. Z. Sverdlov and "Pixel mixing" by Jason Summers.  
@@ -34,17 +34,41 @@ Magic Kernel is based on the publication "The magic kernel" by John Costella.
   * `spline144`: Cubic spline with 12 sample points.
 * `b`: The `b` parameter in the `bicubic` kernel. Defaults to 1/3.
 * `c`: The `c` parameter in the `bicubic` kernel. Defaults to 1/3.
-* `taps`: Window radius value for `blackman`, `gauss`, `kaiser`, `lanczos` and `nuttall` kernels. Default is 3 (besides `gauss`, there are 4).
+* `taps`: Window radius value for `blackman`, `gauss`, `kaiser`, `lanczos` and `nuttall` kernels. Default is 3.
 * `gamma`: The inverse and forward gamma correction value. Correction is performed before and after resizing, in order to produce the resize itself in a linear color space. The default values ​​are 2.4 for RGB and ≈2.2 (1 / 0.45) for YUV and GRAY. Two different formulas are used for RGB and YUV/GRAY. The formula for YUV/GRAY is suitable for SMPTE 170M, BT.601, BT.709, BT.2020 and is not suitable for SMPTE 240M, DCI-P3.  
-`gamma = 1` - completely disables correction, resizing occurs directly, in a logarithmic color space.  
+`gamma=1` - completely disables correction, resizing occurs directly, in a logarithmic color space.  
 The allowed range of values ​​is from 0.1 to 5.0
 * `sharp`: Optional post sharp. It is performed after resizing, but before gamma correction. By default, 1.0 (sharp is disabled). Values ​​​​less than 1.0 - blur, more - sharp. The allowed range of values ​​is from 0.1 to 5.0
 
 Chroma alignment in YUV with subsampling is performed based on the `"_ChromaLocation"` property. If the property is missing or has an incorrect value, then alignment is performed along the left edge, as in MPEG2.  
 Resize and alignment by fields are not supported.
 
+## Descale
+`artyfox.Descale(clip clip, int width, int height[, float src_left=0.0, float src_top=0.0, float src_width=width, float src_height=height, str kernel="area", float b=1/3, float c=1/3, int taps=3, float lambda=1e-3])`
+
+Descaling via Tikhonov regularization and Cholesky decomposition. This is still just an early prototype on dense matrices, so the fps is a bit disappointing.
+* `clip`: Source clip to descale. Must be RGB, YUV or GRAY. 32-bit float sample type only.
+* `width`: Target width. Must be integer and match the source clip's subsampling.
+* `height`: Target height. Must be integer and match the source clip's subsampling.
+* `src_left`: The `x` coordinate of the point where the destination region after descaling starts. Defaults to 0.0
+* `src_top`: The `y` coordinate of the point where the destination region after descaling starts. Defaults to 0.0
+* `src_width`: The width of the destination region after descaling relative to `src_left`. Defaults to `width`.
+* `src_height`: The height of the destination region after descaling relative to `src_top`. Defaults to `height`.
+* `kernel`: Selecting a kernel for convolution. See `Resize` for possible values.
+* `b`: The `b` parameter in the `bicubic` kernel. Defaults to 1/3.
+* `c`: The `c` parameter in the `bicubic` kernel. Defaults to 1/3.
+* `taps`: Window radius value for `blackman`, `gauss`, `kaiser`, `lanczos` and `nuttall` kernels. Default is 3.
+* `lambda`: Regularization parameter. Ensures positive definiteness and stability of the solution to the system of equations. Small values ​​can lead to increased noise, quantization artifacts, and ringing. Excessively large values ​​produce a smooth image, suppressing fine details. Default is 1e-3. Valid range: 0 < `lambda` < 1. Since `lambda` is a Python keyword, you may [append an underscore to the argument’s name when invoking the filter](https://www.vapoursynth.com/doc/pythonreference.html#python-keywords-as-filter-arguments).
+
+## RelativeError
+`artyfox.RelativeError(clip clip0, clip clip1)`
+
+Calculates the relative error of the two input clips and stores it as the "RelativeError" property of the first clip.
+* `clip0`: Original clip. Must be GRAY. 32-bit float sample type only.
+* `clip1`: Restored clip. Must be GRAY. 32-bit float sample type only. The width, height and number of frames must match the original clip.
+
 ## Linearize
-`artyfox.Linearize(clip clip[, float gamma = 2.4 or ≈2.2, int[] planes=[0, 1, 2]])`
+`artyfox.Linearize(clip clip[, float gamma=2.4 or ≈2.2, int[] planes=[0, 1, 2]])`
 
 Inverse gamma correction (linearization) of the color space.
 * `clip`: Source clip to linearize. Must be RGB, YUV or GRAY. 32-bit float sample type only. The range must be converted to full.
@@ -52,7 +76,7 @@ Inverse gamma correction (linearization) of the color space.
 * `planes`: List of planes to linearize. Default is all.
 
 ## GammaCorr
-`artyfox.GammaCorr(clip clip[, float gamma = 2.4 or ≈2.2, int[] planes=[0, 1, 2]])`
+`artyfox.GammaCorr(clip clip[, float gamma=2.4 or ≈2.2, int[] planes=[0, 1, 2]])`
 
 Gamma correction of color space.
 * `clip`: Source clip for gamma correction. Must be RGB, YUV or GRAY. 32-bit float sample type only. The range must be converted to full.
@@ -60,25 +84,32 @@ Gamma correction of color space.
 * `planes`: List of planes to be gamma corrected. Default is all.
 
 ## BitDepth
-`artyfox.BitDepth(clip clip, int bits)`
+`artyfox.BitDepth(clip clip, int bits[, bool direct=False])`
 
 Converting the bit depth of a clip.
 * `clip`: Source clip to be converted to bit depth. Must be RGB, YUV or GRAY. 8-16-bit integer or 32-bit float sample type.
-* `bits`: The bit depth of the target clip. It can be from 8 to 16 or 32. When converting from integer to float or vice versa, a color range conversion may also occur, since in the 32-bit float format, the concept of a limited range does not exist. The range is converted according to the frame's `"_ColorRange"` property. If this property does not exist or has an invalid value, the range is considered full for RGB and limited for YUV and GRAY. Conversion between integers occurs without regard to range. Downconversion of bit depth occurs with arithmetic rounding and saturation.
+* `bits`: The bit depth of the target clip. It can be from `8` to `16` or `32`. When converting from integer to float or vice versa, a color range conversion may also occur, since in the 32-bit float format, the concept of a limited range does not exist. The range is converted according to the frame's `"_ColorRange"` property. If this property does not exist or has an invalid value, the range is considered full for RGB and limited for YUV and GRAY. Conversion between integers occurs without regard to range. Downconversion of bit depth occurs with arithmetic rounding and saturation.
+* `direct`: If `True`, conversion from integer to float or vice versa always uses the full range and ignores the `"_ColorRange"` property. Defaults to `False`.
 
 ## License
 
 This project is licensed under the MIT License — see the LICENSE file for details.
 
-### Note on Intel SVML
-This project may be built using the Intel Compiler (ICX/ICC), which can internally
-use functions from the Intel Short Vector Math Library (SVML) to implement standard
-vector math intrinsics such as `_mm256_pow_ps`, `_mm256_exp_ps`, `_mm256_log_ps`, etc.
+### Note on Intel SVML and Intel MKL
+This project may be built using Intel software components such as:
 
-No SVML source code or binaries are distributed with this project.
-Any SVML routines that may be embedded in the compiled binary are used solely as
-part of the normal compilation and optimization process provided by the Intel Compiler,
-and remain subject to Intel's compiler runtime license.
+- **Intel Short Vector Math Library (SVML)** — used indirectly when compiling
+  with the Intel Compiler (ICX/ICC) to implement certain vector math intrinsics
+  such as `_mm256_pow_ps`, `_mm256_exp_ps`, `_mm256_log_ps`, etc.
+- **Intel Math Kernel Library (Intel MKL)** — optionally linked at build time to
+  provide optimized numerical routines such as matrix multiplication,
+  convolution, and related operations.
+
+No SVML or MKL source code or binaries are distributed with this project.
+Any SVML or MKL routines that may be embedded or dynamically linked into
+the compiled binary are used solely as part of the normal compilation and
+linking process provided by Intel’s compiler and libraries, and remain subject
+to Intel’s respective runtime and redistribution licenses.
 
 The original source code of this project is entirely independent and released
 under the terms of the MIT License.

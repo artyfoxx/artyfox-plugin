@@ -1,16 +1,18 @@
+#include <stdio.h>
 #include <stdbool.h>
 #include <stdlib.h>
-#ifdef __AVX2__
+#if defined(__AVX2__) && defined(__FMA__)
 #include <immintrin.h>
 #endif
 #include <math.h>
+#include <mkl.h>
 #include "VapourSynth4.h"
 #include "VSHelper4.h"
 
 #define CLAMP(x, min, max) ((x) > (max) ? (max) : ((x) < (min) ? (min) : (x))) 
 #define M_PI 3.14159265358979323846
 
-#ifdef __AVX2__
+#if defined(__AVX2__) && defined(__FMA__)
 #define _MM256_TRANSPOSE8_PS(row0, row1, row2, row3, row4, row5, row6, row7) \
 do { \
     __m256 __t0 = _mm256_unpacklo_ps((row0), (row2)); \
@@ -398,7 +400,7 @@ static void rgb_to_linear(
     
     int32_t mask_arr[8] = {0};
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
-    __m256i tale_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
     
     __m256 v_0_04045 = _mm256_set1_ps(0.04045f);
     __m256 v_0_055 = _mm256_set1_ps(0.055f);
@@ -418,7 +420,7 @@ static void rgb_to_linear(
             _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
         }
         if (tail) {
-            __m256 pix = _mm256_maskload_ps(srcp + x, tale_mask);
+            __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
             __m256 pix_abs = _mm256_and_ps(pix, v_abs);
             __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_0_04045, _CMP_GT_OQ);
             __m256 branch_0 = _mm256_pow_ps(_mm256_div_ps(_mm256_add_ps(pix_abs, v_0_055), v_1_055), v_gamma);
@@ -440,7 +442,7 @@ static void yuv_to_linear(
     
     int32_t mask_arr[8] = {0};
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
-    __m256i tale_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
     
     __m256 v_0_081 = _mm256_set1_ps(0.081f);
     __m256 v_0_099 = _mm256_set1_ps(0.099f);
@@ -460,7 +462,7 @@ static void yuv_to_linear(
             _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
         }
         if (tail) {
-            __m256 pix = _mm256_maskload_ps(srcp + x, tale_mask);
+            __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
             __m256 pix_abs = _mm256_and_ps(pix, v_abs);
             __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_0_081, _CMP_GE_OQ);
             __m256 branch_0 = _mm256_pow_ps(_mm256_div_ps(_mm256_add_ps(pix_abs, v_0_099), v_1_099), v_gamma);
@@ -482,7 +484,7 @@ static void linear_to_rgb(
     
     int32_t mask_arr[8] = {0};
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
-    __m256i tale_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
     
     __m256 v_0_0031308 = _mm256_set1_ps(0.0031308f);
     __m256 v_0_055 = _mm256_set1_ps(0.055f);
@@ -502,7 +504,7 @@ static void linear_to_rgb(
             _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
         }
         if (tail) {
-            __m256 pix = _mm256_maskload_ps(srcp + x, tale_mask);
+            __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
             __m256 pix_abs = _mm256_and_ps(pix, v_abs);
             __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_0_0031308, _CMP_GT_OQ);
             __m256 branch_0 = _mm256_fmsub_ps(_mm256_pow_ps(pix_abs, v_gamma), v_1_055, v_0_055);
@@ -524,7 +526,7 @@ static void linear_to_yuv(
     
     int32_t mask_arr[8] = {0};
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
-    __m256i tale_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
     
     __m256 v_0_018 = _mm256_set1_ps(0.018f);
     __m256 v_0_099 = _mm256_set1_ps(0.099f);
@@ -544,7 +546,7 @@ static void linear_to_yuv(
             _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
         }
         if (tail) {
-            __m256 pix = _mm256_maskload_ps(srcp + x, tale_mask);
+            __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
             __m256 pix_abs = _mm256_and_ps(pix, v_abs);
             __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_0_018, _CMP_GE_OQ);
             __m256 branch_0 = _mm256_fmsub_ps(_mm256_pow_ps(pix_abs, v_gamma), v_1_099, v_0_099);
@@ -568,7 +570,7 @@ static void uint8_to_uint16(
     
     int8_t mask_arr[16] = {0};
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
-    __m128i tale_mask = _mm_loadu_si128((__m128i *)mask_arr);
+    __m128i tail_mask = _mm_loadu_si128((__m128i *)mask_arr);
     
     for (int y = 0; y < src_h; y++) {
         int x = 0;
@@ -578,7 +580,7 @@ static void uint8_to_uint16(
             _mm256_stream_si256((__m256i *)(dstp + x), branch);
         }
         if (tail) {
-            __m256i pix = _mm256_cvtepu8_epi16(_mm_and_si128(_mm_load_si128((__m128i *)(srcp + x)), tale_mask));
+            __m256i pix = _mm256_cvtepu8_epi16(_mm_and_si128(_mm_load_si128((__m128i *)(srcp + x)), tail_mask));
             __m256i branch = _mm256_slli_epi16(pix, count);
             _mm256_stream_si256((__m256i *)(dstp + x), branch);
         }
@@ -597,7 +599,7 @@ static void uint8_to_float(
     
     int8_t mask_arr[16] = {0};
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
-    __m128i tale_mask = _mm_loadu_si128((__m128i *)mask_arr);
+    __m128i tail_mask = _mm_loadu_si128((__m128i *)mask_arr);
     
     __m256 v_low, v_high;
     if (range) {
@@ -621,7 +623,7 @@ static void uint8_to_float(
             _mm256_stream_ps(dstp + x + 8, branch_1);
         }
         if (tail > 8) {
-            __m128i pix = _mm_and_si128(_mm_load_si128((__m128i *)(srcp + x)), tale_mask);
+            __m128i pix = _mm_and_si128(_mm_load_si128((__m128i *)(srcp + x)), tail_mask);
             __m256 pix_0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(pix));
             __m256 pix_1 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_shuffle_epi32(pix, _MM_SHUFFLE(1, 0, 3, 2))));
             __m256 branch_0 = _mm256_div_ps(_mm256_sub_ps(pix_0, v_low), v_high);
@@ -630,7 +632,7 @@ static void uint8_to_float(
             _mm256_stream_ps(dstp + x + 8, branch_1);
         }
         else if (tail) {
-            __m128i pix = _mm_and_si128(_mm_load_si128((__m128i *)(srcp + x)), tale_mask);
+            __m128i pix = _mm_and_si128(_mm_load_si128((__m128i *)(srcp + x)), tail_mask);
             __m256 pix_0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(pix));
             __m256 branch_0 = _mm256_div_ps(_mm256_sub_ps(pix_0, v_low), v_high);
             _mm256_stream_ps(dstp + x, branch_0);
@@ -650,7 +652,7 @@ static void uint16_to_uint8(
     
     int16_t mask_arr[16] = {0};
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
-    __m256i tale_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
     
     __m256 v_div = _mm256_set1_ps((float)(1 << (bits - 8)));
     __m256 v_half = _mm256_set1_ps(0.5f);
@@ -668,7 +670,7 @@ static void uint16_to_uint8(
             _mm_stream_si128((__m128i *)(dstp + x), _mm_packus_epi16(pix_u_0, pix_u_1));
         }
         if (tail) {
-            __m256i pix = _mm256_and_si256(_mm256_load_si256((__m256i *)(srcp + x)), tale_mask);
+            __m256i pix = _mm256_and_si256(_mm256_load_si256((__m256i *)(srcp + x)), tail_mask);
             __m256 pix_f_0 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 0)));
             __m256 pix_f_1 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 1)));
             __m256i pix_i_0 = _mm256_cvttps_epi32(_mm256_add_ps(_mm256_div_ps(pix_f_0, v_div), v_half));
@@ -692,7 +694,7 @@ static void uint16_to_uint16(
     
     int16_t mask_arr[16] = {0};
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
-    __m256i tale_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
     
     if (src_bits < dst_bits) {
         int count = dst_bits - src_bits;
@@ -704,7 +706,7 @@ static void uint16_to_uint16(
                 _mm256_stream_si256((__m256i *)(dstp + x), branch);
             }
             if (tail) {
-                __m256i pix = _mm256_and_si256(_mm256_load_si256((__m256i *)(srcp + x)), tale_mask);
+                __m256i pix = _mm256_and_si256(_mm256_load_si256((__m256i *)(srcp + x)), tail_mask);
                 __m256i branch = _mm256_slli_epi16(pix, count);
                 _mm256_stream_si256((__m256i *)(dstp + x), branch);
             }
@@ -727,7 +729,7 @@ static void uint16_to_uint16(
                 _mm256_stream_si256((__m256i *)(dstp + x), branch);
             }
             if (tail) {
-                __m256i pix = _mm256_and_si256(_mm256_load_si256((__m256i *)(srcp + x)), tale_mask);
+                __m256i pix = _mm256_and_si256(_mm256_load_si256((__m256i *)(srcp + x)), tail_mask);
                 __m256 pix_f_0 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 0)));
                 __m256 pix_f_1 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 1)));
                 __m256i pix_i_0 = _mm256_cvttps_epi32(_mm256_add_ps(_mm256_div_ps(pix_f_0, v_div), v_half));
@@ -751,7 +753,7 @@ static void uint16_to_float(
     
     int16_t mask_arr[8] = {0};
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
-    __m128i tale_mask = _mm_loadu_si128((__m128i *)mask_arr);
+    __m128i tail_mask = _mm_loadu_si128((__m128i *)mask_arr);
     
     __m256 v_low, v_high;
     if (range) {
@@ -772,7 +774,7 @@ static void uint16_to_float(
             _mm256_stream_ps(dstp + x, branch);
         }
         if (tail) {
-            __m128i pix = _mm_and_si128(_mm_load_si128((__m128i *)(srcp + x)), tale_mask);
+            __m128i pix = _mm_and_si128(_mm_load_si128((__m128i *)(srcp + x)), tail_mask);
             __m256 pix_f = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(pix));
             __m256 branch = _mm256_div_ps(_mm256_sub_ps(pix_f, v_low), v_high);
             _mm256_stream_ps(dstp + x, branch);
@@ -792,8 +794,8 @@ static void float_to_uint8(
     
     int32_t mask_arr[16] = {0};
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
-    __m256i tale_mask_0 = _mm256_loadu_si256((__m256i *)mask_arr);
-    __m256i tale_mask_1 = _mm256_loadu_si256((__m256i *)(mask_arr + 8));
+    __m256i tail_mask_0 = _mm256_loadu_si256((__m256i *)mask_arr);
+    __m256i tail_mask_1 = _mm256_loadu_si256((__m256i *)(mask_arr + 8));
     
     __m256 v_low, v_high;
     if (range) {
@@ -818,7 +820,7 @@ static void float_to_uint8(
         }
         if (tail > 8) {
             __m256 pix_f_0 = _mm256_load_ps(srcp + x);
-            __m256 pix_f_1 = _mm256_maskload_ps(srcp + x + 8, tale_mask_1);
+            __m256 pix_f_1 = _mm256_maskload_ps(srcp + x + 8, tail_mask_1);
             __m256i pix_i_0 = _mm256_cvttps_epi32(_mm256_fmadd_ps(pix_f_0, v_high, v_low));
             __m256i pix_i_1 = _mm256_cvttps_epi32(_mm256_fmadd_ps(pix_f_1, v_high, v_low));
             __m128i pix_u_0 = _mm_packus_epi32(_mm256_extracti128_si256(pix_i_0, 0), _mm256_extracti128_si256(pix_i_0, 1));
@@ -826,7 +828,7 @@ static void float_to_uint8(
             _mm_stream_si128((__m128i *)(dstp + x), _mm_packus_epi16(pix_u_0, pix_u_1));
         }
         else if (tail) {
-            __m256 pix_f_0 = _mm256_maskload_ps(srcp + x, tale_mask_0);
+            __m256 pix_f_0 = _mm256_maskload_ps(srcp + x, tail_mask_0);
             __m256i pix_i_0 = _mm256_cvttps_epi32(_mm256_fmadd_ps(pix_f_0, v_high, v_low));
             __m128i pix_u_0 = _mm_packus_epi32(_mm256_extracti128_si256(pix_i_0, 0), _mm256_extracti128_si256(pix_i_0, 1));
             _mm_stream_si128((__m128i *)(dstp + x), _mm_packus_epi16(pix_u_0, _mm_setzero_si128()));
@@ -846,7 +848,7 @@ static void float_to_uint16(
     
     int32_t mask_arr[8] = {0};
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
-    __m256i tale_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
     
     __m256 v_low, v_high;
     if (range) {
@@ -867,13 +869,71 @@ static void float_to_uint16(
             _mm_stream_si128((__m128i *)(dstp + x), pix_u);
         }
         if (tail) {
-            __m256 pix_f = _mm256_maskload_ps(srcp + x, tale_mask);
+            __m256 pix_f = _mm256_maskload_ps(srcp + x, tail_mask);
             __m256i pix_i = _mm256_cvttps_epi32(_mm256_fmadd_ps(pix_f, v_high, v_low));
             __m128i pix_u = _mm_packus_epi32(_mm256_extracti128_si256(pix_i, 0), _mm256_extracti128_si256(pix_i, 1));
             _mm_stream_si128((__m128i *)(dstp + x), pix_u);
         }
         srcp += src_stride;
         dstp += dst_stride;
+    }
+    _mm_sfence();
+}
+
+static void float_to_double(
+    const float *restrict srcp, double *restrict dstp, int src_w, int src_h, ptrdiff_t stride
+) {
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    __m256i store_mask_0 = _mm256_cvtepi32_epi64(_mm256_extracti128_si256(tail_mask, 0));
+    __m256i store_mask_1 = _mm256_cvtepi32_epi64(_mm256_extracti128_si256(tail_mask, 1));
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m256 pix = _mm256_load_ps(srcp + x);
+            _mm256_storeu_pd(dstp + x, _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)));
+            _mm256_storeu_pd(dstp + x + 4, _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)));
+        }
+        if (tail) {
+            __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
+            _mm256_maskstore_pd(dstp + x, store_mask_0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)));
+            _mm256_maskstore_pd(dstp + x + 4, store_mask_1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)));
+        }
+        srcp += stride;
+        dstp += src_w;
+    }
+}
+
+static void double_to_float(
+    const double *restrict srcp, float *restrict dstp, int src_w, int src_h, ptrdiff_t stride
+) {
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    int64_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1LL;
+    __m256i tail_mask_0 = _mm256_loadu_si256((__m256i *)mask_arr);
+    __m256i tail_mask_1 = _mm256_loadu_si256((__m256i *)(mask_arr + 4));
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m128 pix_0 = _mm256_cvtpd_ps(_mm256_loadu_pd(srcp + x));
+            __m128 pix_1 = _mm256_cvtpd_ps(_mm256_loadu_pd(srcp + x + 4));
+            _mm256_stream_ps(dstp + x, _mm256_setr_m128(pix_0, pix_1));
+        }
+        if (tail) {
+            __m128 pix_0 = _mm256_cvtpd_ps(_mm256_maskload_pd(srcp + x, tail_mask_0));
+            __m128 pix_1 = _mm256_cvtpd_ps(_mm256_maskload_pd(srcp + x + 4, tail_mask_1));
+            _mm256_stream_ps(dstp + x, _mm256_setr_m128(pix_0, pix_1));
+        }
+        srcp += src_w;
+        dstp += stride;
     }
     _mm_sfence();
 }
@@ -887,8 +947,8 @@ static void sharp_width(
     
     int32_t mask_arr[9] = {0};
     for (int i = 0; i < tail + 1; i++) mask_arr[i] = -1;
-    __m256i tale_mask_0 = _mm256_loadu_si256((__m256i *)mask_arr);
-    __m256i tale_mask_1 = _mm256_loadu_si256((__m256i *)(mask_arr + 1));
+    __m256i tail_mask_0 = _mm256_loadu_si256((__m256i *)mask_arr);
+    __m256i tail_mask_1 = _mm256_loadu_si256((__m256i *)(mask_arr + 1));
     
     __m256 v_sharp = _mm256_set1_ps(sharp);
     __m256 v_mul = _mm256_set1_ps((1.0f - sharp) / 3.0f);
@@ -912,8 +972,8 @@ static void sharp_width(
             v_avg = _mm256_mul_ps(_mm256_add_ps(_mm256_add_ps(v_0, v_1), v_2), v_mul);
             _mm256_stream_ps(dstp + x, _mm256_fmadd_ps(v_1, v_sharp, v_avg));
         }
-        v_0 = _mm256_maskload_ps(srcp + x - 1, tale_mask_0);
-        v_1 = _mm256_maskload_ps(srcp + x, tale_mask_1);
+        v_0 = _mm256_maskload_ps(srcp + x - 1, tail_mask_0);
+        v_1 = _mm256_maskload_ps(srcp + x, tail_mask_1);
         v_2 = _mm256_permutevar8x32_ps(v_1, right_idx);
         v_avg = _mm256_mul_ps(_mm256_add_ps(_mm256_add_ps(v_0, v_1), v_2), v_mul);
         _mm256_stream_ps(dstp + x, _mm256_fmadd_ps(v_1, v_sharp, v_avg));
@@ -933,7 +993,7 @@ static void sharp_height(
     
     int32_t mask_arr[8] = {0};
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
-    __m256i tale_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
     
     __m256 v_sharp = _mm256_set1_ps(sharp);
     __m256 v_mul = _mm256_set1_ps((1.0f - sharp) / 3.0f);
@@ -946,8 +1006,8 @@ static void sharp_height(
         _mm256_store_ps(dstp + x, _mm256_fmadd_ps(v_1, v_sharp, v_avg));
     }
     if (tail) {
-        __m256 v_1 = _mm256_maskload_ps(srcp + x, tale_mask);
-        __m256 v_2 = _mm256_maskload_ps(srcp + x + stride, tale_mask);
+        __m256 v_1 = _mm256_maskload_ps(srcp + x, tail_mask);
+        __m256 v_2 = _mm256_maskload_ps(srcp + x + stride, tail_mask);
         __m256 v_avg = _mm256_mul_ps(_mm256_add_ps(_mm256_add_ps(v_1, v_1), v_2), v_mul);
         _mm256_store_ps(dstp + x, _mm256_fmadd_ps(v_1, v_sharp, v_avg));
     }
@@ -964,9 +1024,9 @@ static void sharp_height(
             _mm256_store_ps(dstp + x, _mm256_fmadd_ps(v_1, v_sharp, v_avg));
         }
         if (tail) {
-            __m256 v_0 = _mm256_maskload_ps(srcp + x - stride, tale_mask);
-            __m256 v_1 = _mm256_maskload_ps(srcp + x, tale_mask);
-            __m256 v_2 = _mm256_maskload_ps(srcp + x + stride, tale_mask);
+            __m256 v_0 = _mm256_maskload_ps(srcp + x - stride, tail_mask);
+            __m256 v_1 = _mm256_maskload_ps(srcp + x, tail_mask);
+            __m256 v_2 = _mm256_maskload_ps(srcp + x + stride, tail_mask);
             __m256 v_avg = _mm256_mul_ps(_mm256_add_ps(_mm256_add_ps(v_0, v_1), v_2), v_mul);
             _mm256_store_ps(dstp + x, _mm256_fmadd_ps(v_1, v_sharp, v_avg));
         }
@@ -982,8 +1042,8 @@ static void sharp_height(
         _mm256_store_ps(dstp + x, _mm256_fmadd_ps(v_1, v_sharp, v_avg));
     }
     if (tail) {
-        __m256 v_0 = _mm256_maskload_ps(srcp + x - stride, tale_mask);
-        __m256 v_1 = _mm256_maskload_ps(srcp + x, tale_mask);
+        __m256 v_0 = _mm256_maskload_ps(srcp + x - stride, tail_mask);
+        __m256 v_1 = _mm256_maskload_ps(srcp + x, tail_mask);
         __m256 v_avg = _mm256_mul_ps(_mm256_add_ps(_mm256_add_ps(v_0, v_1), v_1), v_mul);
         _mm256_store_ps(dstp + x, _mm256_fmadd_ps(v_1, v_sharp, v_avg));
     }
@@ -1146,7 +1206,7 @@ static void resize_height(
     
     int32_t mask_arr[8] = {0};
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
-    __m256i tale_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
     
     double factor = dst_h / real_h;
     double scale = (factor < 1.0) ? factor : 1.0;
@@ -1188,7 +1248,7 @@ static void resize_height(
             __m256d v_acc_0 = _mm256_setzero_pd();
             __m256d v_acc_1 = _mm256_setzero_pd();
             for (int i = 0; i < length; i++) {
-                __m256 pix = _mm256_maskload_ps(srcp + counts[i] + x, tale_mask);
+                __m256 pix = _mm256_maskload_ps(srcp + counts[i] + x, tail_mask);
                 __m256d v_weight = _mm256_set1_pd(weights[i]);
                 v_acc_0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), v_weight, v_acc_0);
                 v_acc_1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), v_weight, v_acc_1);
@@ -1421,6 +1481,30 @@ static void float_to_uint16(
         }
         srcp += src_stride;
         dstp += dst_stride;
+    }
+}
+
+static void float_to_double(
+    const float *restrict srcp, double *restrict dstp, int src_w, int src_h, ptrdiff_t stride
+) {
+    for (int y = 0; y < src_h; y++) {
+        for (int x = 0; x < src_w; x++) {
+            dstp[x] = (double)srcp[x];
+        }
+        srcp += stride;
+        dstp += src_w;
+    }
+}
+
+static void double_to_float(
+    const double *restrict srcp, float *restrict dstp, int src_w, int src_h, ptrdiff_t stride
+) {
+    for (int y = 0; y < src_h; y++) {
+        for (int x = 0; x < src_w; x++) {
+            dstp[x] = (float)srcp[x];
+        }
+        srcp += src_w;
+        dstp += stride;
     }
 }
 
@@ -1677,7 +1761,7 @@ static const VSFrame *VS_CC ResizeGetFrame(
                 resize_height(srcp, dstp, dst_stride, dst_w, src_h, dst_h, start_h, real_h, d->kernel_h);
             }
             else {
-                memcpy(dstp, srcp, sizeof(float) * src_stride * src_h);
+                vsh_bitblt(dstp, sizeof(float) * dst_stride, srcp, sizeof(float) * src_stride, sizeof(float) * src_w, src_h);
             }
             
             if (d->sharp != 1.0f) {
@@ -1759,25 +1843,25 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData, VSCo
     d.dst_height = vsapi->mapGetIntSaturated(in, "height", 0, NULL);
     
     if (d.dst_width <= 1 << d.vi.format.subSamplingW || d.dst_width > 65535) {
-        vsapi->mapSetError(out, "Resize: width any of the planes must be greater than 1 and less than or equal to 65535");
+        vsapi->mapSetError(out, "Resize: \"width\" any of the planes must be greater than 1 and less than or equal to 65535");
         vsapi->freeNode(d.node);
         return;
     }
     
     if (d.dst_width % (1 << d.vi.format.subSamplingW)) {
-        vsapi->mapSetError(out, "Resize: width must be a multiple of the subsampling");
+        vsapi->mapSetError(out, "Resize: \"width\" must be a multiple of the subsampling");
         vsapi->freeNode(d.node);
         return;
     }
     
     if (d.dst_height <= 1 << d.vi.format.subSamplingH || d.dst_height > 65535) {
-        vsapi->mapSetError(out, "Resize: height any of the planes must be greater than 1 and less than or equal to 65535");
+        vsapi->mapSetError(out, "Resize: \"height\" any of the planes must be greater than 1 and less than or equal to 65535");
         vsapi->freeNode(d.node);
         return;
     }
     
     if (d.dst_height % (1 << d.vi.format.subSamplingH)) {
-        vsapi->mapSetError(out, "Resize: height must be a multiple of the subsampling");
+        vsapi->mapSetError(out, "Resize: \"height\" must be a multiple of the subsampling");
         vsapi->freeNode(d.node);
         return;
     }
@@ -1790,7 +1874,7 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData, VSCo
     }
     
     if (d.start_w <= -d.vi.width || d.start_w >= d.vi.width) {
-        vsapi->mapSetError(out, "Resize: \"src_left\" must be between -clip.width and clip.width");
+        vsapi->mapSetError(out, "Resize: \"src_left\" must be between \"-clip.width\" and \"clip.width\"");
         vsapi->freeNode(d.node);
         return;
     }
@@ -1801,7 +1885,7 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData, VSCo
     }
     
     if (d.start_h <= -d.vi.height || d.start_h >= d.vi.height) {
-        vsapi->mapSetError(out, "Resize: \"src_top\" must be between -clip.height and clip.height");
+        vsapi->mapSetError(out, "Resize: \"src_top\" must be between \"-clip.height\" and \"clip.height\"");
         vsapi->freeNode(d.node);
         return;
     }
@@ -1811,8 +1895,8 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData, VSCo
         d.real_w = (double)d.vi.width;
     }
     
-    if (d.real_w <= -d.vi.width || d.real_w >= d.vi.width * 2) {
-        vsapi->mapSetError(out, "Resize: \"src_width\" must be between -clip.width and clip.width * 2");
+    if (d.real_w <= -d.vi.width + d.start_w || d.real_w >= d.vi.width * 2 - d.start_w) {
+        vsapi->mapSetError(out, "Resize: \"src_width\" must be between \"-clip.width + src_left\" and \"clip.width * 2 - src_left\"");
         vsapi->freeNode(d.node);
         return;
     }
@@ -1826,8 +1910,8 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData, VSCo
         d.real_h = (double)d.vi.height;
     }
     
-    if (d.real_h <= -d.vi.height || d.real_h >= d.vi.height * 2) {
-        vsapi->mapSetError(out, "Resize: \"src_height\" must be between -clip.height and clip.height * 2");
+    if (d.real_h <= -d.vi.height + d.start_h || d.real_h >= d.vi.height * 2 - d.start_h) {
+        vsapi->mapSetError(out, "Resize: \"src_height\" must be between \"-clip.height + src_top\" and \"clip.height * 2 - src_top\"");
         vsapi->freeNode(d.node);
         return;
     }
@@ -1986,7 +2070,7 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData, VSCo
         gauss_ctx *gs = (gauss_ctx *)malloc(sizeof(*gs));
         gs->taps = vsapi->mapGetIntSaturated(in, "taps", 0, &err);
         if (err) {
-            gs->taps = 4;
+            gs->taps = 3;
         }
         if (gs->taps < 1 || gs->taps > 128) {
             vsapi->mapSetError(out, "Resize: taps must be between 1 and 128");
@@ -2033,6 +2117,564 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData, VSCo
 typedef struct {
     VSNode *node;
     VSVideoInfo vi;
+    int dst_width, dst_height;
+    double start_w, start_h, real_w, real_h, lambda;
+    kernel_t kernel_w, kernel_h;
+    bool process_w, process_h;
+} DescaleData;
+
+static void descale_width(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride,
+    int src_w, int src_h, int dst_w, double start_w, double real_w, double lambda, kernel_t kernel
+) {
+    double factor = src_w / real_w;
+    int min_w = (int)floor(start_w);
+    int max_w = (int)ceil(real_w + start_w) - 1;
+    int border = dst_w - 1;
+    double *weights = (double *)mkl_malloc(sizeof(double) * src_w * dst_w, 64);
+    memset(weights, 0, sizeof(double) * src_w * dst_w);
+    
+    for (int x = 0; x < src_w; x++) {
+        double center = (x + 0.5) / factor - 0.5 + start_w;
+        int low = VSMAX((int)floor(center - kernel.radius), min_w);
+        int high = VSMIN((int)ceil(center + kernel.radius), max_w);
+        double norm = 0.0;
+        for (int i = low; i <= high; i++) {
+            double temp = kernel.f(i - center, kernel.ctx);
+            weights[x * dst_w + CLAMP(i, 0, border)] += temp;
+            norm += temp;
+        }
+        for (int i = VSMAX(low, 0); i <= VSMIN(high, border); i++) {
+            weights[x * dst_w + i] /= norm;
+        }
+    }
+    
+    double *matrix = (double *)mkl_malloc(sizeof(double) * dst_w * dst_w, 64);
+    cblas_dgemm(CblasRowMajor, CblasTrans, CblasNoTrans, dst_w, dst_w, src_w, 1.0, weights, dst_w, weights, dst_w, 0.0, matrix, dst_w);
+    for (int i = 0; i < dst_w; i++) matrix[i * dst_w + i] += lambda;
+    
+    double *src_buf = (double *)mkl_malloc(sizeof(double) * src_w * src_h, 64);
+    float_to_double(srcp, src_buf, src_w, src_h, src_stride);
+    
+    double *dst_buf = (double *)mkl_malloc(sizeof(double) * dst_w * src_h, 64);
+    cblas_dgemm(CblasRowMajor, CblasTrans, CblasTrans, dst_w, src_h, src_w, 1.0, weights, dst_w, src_buf, src_w, 0.0, dst_buf, src_h);
+    LAPACKE_dposv(LAPACK_ROW_MAJOR, 'L', dst_w, src_h, matrix, dst_w, dst_buf, src_h);
+    
+    mkl_dimatcopy('R', 'T', dst_w, src_h, 1.0, dst_buf, src_h, dst_w);
+    double_to_float(dst_buf, dstp, dst_w, src_h, dst_stride);
+    
+    mkl_free(dst_buf);
+    mkl_free(src_buf);
+    mkl_free(matrix);
+    mkl_free(weights);
+}
+
+static void descale_height(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t dst_stride,
+    int src_w, int src_h, int dst_h, double start_h, double real_h, double lambda, kernel_t kernel
+) {
+    double factor = src_h / real_h;
+    int min_h = (int)floor(start_h);
+    int max_h = (int)ceil(real_h + start_h) - 1;
+    int border = dst_h - 1;
+    double *weights = (double *)mkl_malloc(sizeof(double) * src_h * dst_h, 64);
+    memset(weights, 0, sizeof(double) * src_h * dst_h);
+    
+    for (int y = 0; y < src_h; y++) {
+        double center = (y + 0.5) / factor - 0.5 + start_h;
+        int low = VSMAX((int)floor(center - kernel.radius), min_h);
+        int high = VSMIN((int)ceil(center + kernel.radius), max_h);
+        double norm = 0.0;
+        for (int i = low; i <= high; i++) {
+            double temp = kernel.f(i - center, kernel.ctx);
+            weights[y * dst_h + CLAMP(i, 0, border)] += temp;
+            norm += temp;
+        }
+        for (int i = VSMAX(low, 0); i <= VSMIN(high, border); i++) {
+            weights[y * dst_h + i] /= norm;
+        }
+    }
+    
+    double *matrix = (double *)mkl_malloc(sizeof(double) * dst_h * dst_h, 64);
+    cblas_dgemm(CblasRowMajor, CblasTrans, CblasNoTrans, dst_h, dst_h, src_h, 1.0, weights, dst_h, weights, dst_h, 0.0, matrix, dst_h);
+    for (int i = 0; i < dst_h; i++) matrix[i * dst_h + i] += lambda;
+    
+    double *src_buf = (double *)mkl_malloc(sizeof(double) * src_w * src_h, 64);
+    float_to_double(srcp, src_buf, src_w, src_h, dst_stride);
+    
+    double *dst_buf = (double *)mkl_malloc(sizeof(double) * src_w * dst_h, 64);
+    cblas_dgemm(CblasRowMajor, CblasTrans, CblasNoTrans, dst_h, src_w, src_h, 1.0, weights, dst_h, src_buf, src_w, 0.0, dst_buf, src_w);
+    LAPACKE_dposv(LAPACK_ROW_MAJOR, 'L', dst_h, src_w, matrix, dst_h, dst_buf, src_w);
+    
+    double_to_float(dst_buf, dstp, src_w, dst_h, dst_stride);
+    
+    mkl_free(dst_buf);
+    mkl_free(src_buf);
+    mkl_free(matrix);
+    mkl_free(weights);
+}
+
+static const VSFrame *VS_CC DescaleGetFrame(
+    int n, int activationReason, void *instanceData, void **frameData,
+    VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi
+) {
+    (void)frameData;
+    DescaleData *d = (DescaleData *)instanceData;
+    
+    if (activationReason == arInitial) {
+        vsapi->requestFrameFilter(n, d->node, frameCtx);
+    }
+    else if (activationReason == arAllFramesReady) {
+        const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
+        const VSVideoFormat *fi = vsapi->getVideoFrameFormat(src);
+        const VSMap *props = vsapi->getFramePropertiesRO(src);
+        
+        int err;
+        int chromaloc = vsapi->mapGetIntSaturated(props, "_ChromaLocation", 0, &err);
+        if (err || chromaloc < 0 || chromaloc > 5) {
+            chromaloc = 0;
+        }
+        
+        VSFrame *tmp = NULL;
+        if (d->process_w && d->process_h) {
+            tmp = vsapi->newVideoFrame(fi, d->dst_width, d->vi.height, NULL, core);
+        }
+        
+        VSFrame *dst = vsapi->newVideoFrame(fi, d->dst_width, d->dst_height, src, core);
+        
+        for (int plane = 0; plane < fi->numPlanes; plane++) {
+            const float *restrict srcp = (const float *)vsapi->getReadPtr(src, plane);
+            ptrdiff_t src_stride = vsapi->getStride(src, plane) / sizeof(float);
+            
+            float *restrict dstp = (float *)vsapi->getWritePtr(dst, plane);
+            ptrdiff_t dst_stride = vsapi->getStride(dst, plane) / sizeof(float);
+            
+            int src_w = vsapi->getFrameWidth(src, plane);
+            int src_h = vsapi->getFrameHeight(src, plane);
+            int dst_w = vsapi->getFrameWidth(dst, plane);
+            int dst_h = vsapi->getFrameHeight(dst, plane);
+            
+            double start_w = d->start_w;
+            double start_h = d->start_h;
+            double real_w = d->real_w;
+            double real_h = d->real_h;
+            
+            if (plane && (fi->colorFamily == cfYUV)) {
+                if (fi->subSamplingW) {
+                    start_w /= 1 << fi->subSamplingW;
+                    real_w /= 1 << fi->subSamplingW;
+                    if (~chromaloc & 1) {// left allign
+                        double offset = ((1 << fi->subSamplingW) - 1) / 2.0;
+                        start_w += offset / (1 << fi->subSamplingW) - offset * real_w / (src_w << fi->subSamplingW);
+                    }
+                }
+                if (fi->subSamplingH) {
+                    start_h /= 1 << fi->subSamplingH;
+                    real_h /= 1 << fi->subSamplingH;
+                    if (chromaloc & 2) {// top allign
+                        double offset = ((1 << fi->subSamplingH) - 1) / 2.0;
+                        start_h += offset / (1 << fi->subSamplingH) - offset * real_h / (src_h << fi->subSamplingH);
+                    }
+                    else if (chromaloc & 4) {// bottom allign
+                        double offset = ((1 << fi->subSamplingH) - 1) / 2.0;
+                        start_h -= offset / (1 << fi->subSamplingH) - offset * real_h / (src_h << fi->subSamplingH);
+                    }
+                }
+            }
+            
+            if (d->process_w && d->process_h) {
+                float *restrict tmpp = (float *)vsapi->getWritePtr(tmp, plane);
+                descale_width(srcp, tmpp, src_stride, dst_stride, src_w, src_h, dst_w, start_w, real_w, d->lambda, d->kernel_w);
+                descale_height(tmpp, dstp, dst_stride, dst_w, src_h, dst_h, start_h, real_h, d->lambda, d->kernel_h);
+            }
+            else if (d->process_w) {
+                descale_width(srcp, dstp, src_stride, dst_stride, src_w, src_h, dst_w, start_w, real_w, d->lambda, d->kernel_w);
+            }
+            else if (d->process_h) {
+                descale_height(srcp, dstp, dst_stride, dst_w, src_h, dst_h, start_h, real_h, d->lambda, d->kernel_h);
+            }
+            else {
+                vsh_bitblt(dstp, sizeof(float) * dst_stride, srcp, sizeof(float) * src_stride, sizeof(float) * src_w, src_h);
+            }
+        }
+        
+        vsapi->freeFrame(tmp);
+        vsapi->freeFrame(src);
+        
+        return dst;
+    }
+    return NULL;
+}
+
+static void VS_CC DescaleFree(void *instanceData, VSCore *core, const VSAPI *vsapi) {
+    (void)core;
+    DescaleData *d = (DescaleData *)instanceData;
+    vsapi->freeNode(d->node);
+    
+    if (d->kernel_w.ctx == d->kernel_h.ctx) {
+        free(d->kernel_w.ctx);
+    }
+    else {
+        free(d->kernel_w.ctx);
+        free(d->kernel_h.ctx);
+    }
+    
+    free(d);
+}
+
+static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core, const VSAPI *vsapi) {
+    (void)userData;
+    DescaleData d;
+    d.node = vsapi->mapGetNode(in, "clip", 0, NULL);
+    d.vi = *vsapi->getVideoInfo(d.node);
+    
+    if (!vsh_isConstantVideoFormat(&d.vi) || d.vi.format.sampleType != stFloat || d.vi.format.bitsPerSample != 32) {
+        vsapi->mapSetError(out, "Resize: only constant format 32bit float input supported");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    d.dst_width = vsapi->mapGetIntSaturated(in, "width", 0, NULL);
+    d.dst_height = vsapi->mapGetIntSaturated(in, "height", 0, NULL);
+    
+    if (d.dst_width <= 1 << d.vi.format.subSamplingW || d.dst_width > d.vi.width) {
+        vsapi->mapSetError(out, "Resize: \"width\" any of the planes must be greater than 1 and less than or equal to source width");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    if (d.dst_width % (1 << d.vi.format.subSamplingW)) {
+        vsapi->mapSetError(out, "Resize: \"width\" must be a multiple of the subsampling");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    if (d.dst_height <= 1 << d.vi.format.subSamplingH || d.dst_height > d.vi.height) {
+        vsapi->mapSetError(out, "Resize: \"height\" any of the planes must be greater than 1 and less than or equal to source height");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    if (d.dst_height % (1 << d.vi.format.subSamplingH)) {
+        vsapi->mapSetError(out, "Resize: \"height\" must be a multiple of the subsampling");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    int err;
+    
+    d.start_w = vsapi->mapGetFloat(in, "src_left", 0, &err);
+    if (err) {
+        d.start_w = 0.0;
+    }
+    
+    if (d.start_w <= -d.dst_width || d.start_w >= d.dst_width) {
+        vsapi->mapSetError(out, "Resize: \"src_left\" must be between \"-width\" and \"width\"");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    d.start_h = vsapi->mapGetFloat(in, "src_top", 0, &err);
+    if (err) {
+        d.start_h = 0.0;
+    }
+    
+    if (d.start_h <= -d.dst_height || d.start_h >= d.dst_height) {
+        vsapi->mapSetError(out, "Resize: \"src_top\" must be between \"-height\" and \"height\"");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    d.real_w = vsapi->mapGetFloat(in, "src_width", 0, &err);
+    if (err) {
+        d.real_w = (double)d.dst_width;
+    }
+    
+    if (d.real_w <= -d.dst_width + d.start_w || d.real_w >= d.dst_width * 2 - d.start_w) {
+        vsapi->mapSetError(out, "Resize: \"src_width\" must be between \"-width + src_left\" and \"width * 2 - src_left\"");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    if (d.real_w <= 0.0) {
+        d.real_w += d.dst_width - d.start_w;
+    }
+    
+    d.real_h = vsapi->mapGetFloat(in, "src_height", 0, &err);
+    if (err) {
+        d.real_h = (double)d.dst_height;
+    }
+    
+    if (d.real_h <= -d.dst_height + d.start_h || d.real_h >= d.dst_height * 2 - d.start_h) {
+        vsapi->mapSetError(out, "Resize: \"src_height\" must be between \"-height + src_top\" and \"height * 2 - src_top\"");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    if (d.real_h <= 0.0) {
+        d.real_h += d.dst_height - d.start_h;
+    }
+    
+    d.lambda = vsapi->mapGetFloat(in, "lambda", 0, &err);
+    if (err) {
+        d.lambda = 1e-3;
+    }
+    
+    if (d.lambda <= 0.0 || d.lambda >= 1.0) {
+        vsapi->mapSetError(out, "Resize: \"lambda\" must be between 0 and 1");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    const char *kernel = vsapi->mapGetData(in, "kernel", 0, &err);
+    if (err || !strcmp(kernel, "area")) {
+        area_ctx *ar_w = (area_ctx *)malloc(sizeof(*ar_w));
+        area_ctx *ar_h = (area_ctx *)malloc(sizeof(*ar_h));
+        ar_w->scale = d.real_w / d.vi.width;
+        ar_h->scale = d.real_h / d.vi.height;
+        d.kernel_w = (kernel_t){area_kernel, 0.5 + ar_w->scale / 2.0, ar_w};
+        d.kernel_h = (kernel_t){area_kernel, 0.5 + ar_h->scale / 2.0, ar_h};
+    }
+    else if (!strcmp(kernel, "magic")) {
+        d.kernel_w = d.kernel_h = (kernel_t){magic_kernel, 1.5, NULL};
+    }
+    else if (!strcmp(kernel, "magic13")) {
+        d.kernel_w = d.kernel_h = (kernel_t){magic_kernel_2013, 2.5, NULL};
+    }
+    else if (!strcmp(kernel, "magic21")) {
+        d.kernel_w = d.kernel_h = (kernel_t){magic_kernel_2021, 4.5, NULL};
+    }
+    else if (!strcmp(kernel, "bilinear")) {
+        d.kernel_w = d.kernel_h = (kernel_t){bilinear_kernel, 1.0, NULL};
+    }
+    else if (!strcmp(kernel, "bicubic")) {
+        bicubic_ctx *bc = (bicubic_ctx *)malloc(sizeof(*bc));
+        bc->b = vsapi->mapGetFloat(in, "b", 0, &err);
+        if (err) {
+            bc->b = 1.0 / 3.0;
+        }
+        bc->c = vsapi->mapGetFloat(in, "c", 0, &err);
+        if (err) {
+            bc->c = 1.0 / 3.0;
+        }
+        d.kernel_w = d.kernel_h = (kernel_t){bicubic_kernel, 2.0, bc};
+    }
+    else if (!strcmp(kernel, "lanczos")) {
+        sinc_ctx *sn = (sinc_ctx *)malloc(sizeof(*sn));
+        sn->taps = vsapi->mapGetIntSaturated(in, "taps", 0, &err);
+        if (err) {
+            sn->taps = 3;
+        }
+        if (sn->taps < 1 || sn->taps > 128) {
+            vsapi->mapSetError(out, "Resize: taps must be between 1 and 128");
+            vsapi->freeNode(d.node);
+            free(sn);
+            return;
+        }
+        d.kernel_w = d.kernel_h = (kernel_t){lanczos_kernel, (double)sn->taps, sn};
+    }
+    else if (!strcmp(kernel, "spline16")) {
+        d.kernel_w = d.kernel_h = (kernel_t){spline16_kernel, 2.0, NULL};
+    }
+    else if (!strcmp(kernel, "spline36")) {
+        d.kernel_w = d.kernel_h = (kernel_t){spline36_kernel, 3.0, NULL};
+    }
+    else if (!strcmp(kernel, "spline64")) {
+        d.kernel_w = d.kernel_h = (kernel_t){spline64_kernel, 4.0, NULL};
+    }
+    else if (!strcmp(kernel, "spline100")) {
+        d.kernel_w = d.kernel_h = (kernel_t){spline100_kernel, 5.0, NULL};
+    }
+    else if (!strcmp(kernel, "spline144")) {
+        d.kernel_w = d.kernel_h = (kernel_t){spline144_kernel, 6.0, NULL};
+    }
+    else if (!strcmp(kernel, "point")) {
+        d.kernel_w = d.kernel_h = (kernel_t){point_kernel, 0.5, NULL};
+    }
+    else if (!strcmp(kernel, "blackman")) {
+        sinc_ctx *sn = (sinc_ctx *)malloc(sizeof(*sn));
+        sn->taps = vsapi->mapGetIntSaturated(in, "taps", 0, &err);
+        if (err) {
+            sn->taps = 3;
+        }
+        if (sn->taps < 1 || sn->taps > 128) {
+            vsapi->mapSetError(out, "Resize: taps must be between 1 and 128");
+            vsapi->freeNode(d.node);
+            free(sn);
+            return;
+        }
+        d.kernel_w = d.kernel_h = (kernel_t){blackman_kernel, (double)sn->taps, sn};
+    }
+    else if (!strcmp(kernel, "nuttall")) {
+        sinc_ctx *sn = (sinc_ctx *)malloc(sizeof(*sn));
+        sn->taps = vsapi->mapGetIntSaturated(in, "taps", 0, &err);
+        if (err) {
+            sn->taps = 3;
+        }
+        if (sn->taps < 1 || sn->taps > 128) {
+            vsapi->mapSetError(out, "Resize: taps must be between 1 and 128");
+            vsapi->freeNode(d.node);
+            free(sn);
+            return;
+        }
+        d.kernel_w = d.kernel_h = (kernel_t){nuttall_kernel, (double)sn->taps, sn};
+    }
+    else if (!strcmp(kernel, "kaiser")) {
+        kaiser_ctx *ks = (kaiser_ctx *)malloc(sizeof(*ks));
+        ks->taps = vsapi->mapGetIntSaturated(in, "taps", 0, &err);
+        if (err) {
+            ks->taps = 3;
+        }
+        if (ks->taps < 1 || ks->taps > 128) {
+            vsapi->mapSetError(out, "Resize: taps must be between 1 and 128");
+            vsapi->freeNode(d.node);
+            free(ks);
+            return;
+        }
+        ks->beta = vsapi->mapGetFloat(in, "b", 0, &err);
+        if (err) {
+           ks->beta = 4.0;
+        }
+        if (ks->beta <= 0.0 || ks->beta > 32.0) {
+            vsapi->mapSetError(out, "Resize: beta must be between 0 and 32");
+            vsapi->freeNode(d.node);
+            free(ks);
+            return;
+        }
+        ks->i0_beta = bessel_i0(ks->beta);
+        d.kernel_w = d.kernel_h = (kernel_t){kaiser_kernel, (double)ks->taps, ks};
+    }
+    else if (!strcmp(kernel, "gauss")) {
+        gauss_ctx *gs = (gauss_ctx *)malloc(sizeof(*gs));
+        gs->taps = vsapi->mapGetIntSaturated(in, "taps", 0, &err);
+        if (err) {
+            gs->taps = 3;
+        }
+        if (gs->taps < 1 || gs->taps > 128) {
+            vsapi->mapSetError(out, "Resize: taps must be between 1 and 128");
+            vsapi->freeNode(d.node);
+            free(gs);
+            return;
+        }
+        gs->p = vsapi->mapGetFloat(in, "b", 0, &err);
+        if (err) {
+           gs->p = 30.0;
+        }
+        if (gs->p < 1.0 || gs->p > 100.0) {
+            vsapi->mapSetError(out, "Resize: p must be between 1 and 100");
+            vsapi->freeNode(d.node);
+            free(gs);
+            return;
+        }
+        gs->p /= 10.0;
+        d.kernel_w = d.kernel_h = (kernel_t){gauss_kernel, (double)gs->taps, gs};
+    }
+    else {
+        vsapi->mapSetError(out, "Resize: invalid kernel specified");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    d.process_w = (d.dst_width == d.vi.width && d.real_w == d.dst_width && d.start_w == 0.0) ? false : true;
+    d.process_h = (d.dst_height == d.vi.height && d.real_h == d.dst_height && d.start_h == 0.0) ? false : true;
+    
+    DescaleData *data = (DescaleData *)malloc(sizeof d);
+    *data = d;
+    
+    d.vi.width = d.dst_width;
+    d.vi.height = d.dst_height;
+    
+    VSFilterDependency deps[] = {{d.node, rpStrictSpatial}};
+    vsapi->createVideoFilter(out, "Descale", &d.vi, DescaleGetFrame, DescaleFree, fmParallel, deps, 1, data, core);
+}
+
+typedef struct {
+    VSNode *node0;
+    VSNode *node1;
+} RelativeErrorData;
+
+static const VSFrame *VS_CC RelativeErrorGetFrame(
+    int n, int activationReason, void *instanceData, void **frameData,
+    VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi
+) {
+    (void)frameData;
+    RelativeErrorData *d = (RelativeErrorData *)instanceData;
+    
+    if (activationReason == arInitial) {
+        vsapi->requestFrameFilter(n, d->node0, frameCtx);
+        vsapi->requestFrameFilter(n, d->node1, frameCtx);
+    }
+    else if (activationReason == arAllFramesReady) {
+        const VSFrame *src0 = vsapi->getFrameFilter(n, d->node0, frameCtx);
+        const VSFrame *src1 = vsapi->getFrameFilter(n, d->node1, frameCtx);
+        VSFrame *dst = vsapi->copyFrame(src0, core);
+        
+        const float *restrict srcp0 = (const float *)vsapi->getReadPtr(src0, 0);
+        const float *restrict srcp1 = (const float *)vsapi->getReadPtr(src1, 0);
+        ptrdiff_t src_stride = vsapi->getStride(src0, 0) / sizeof(float);
+        int src_w = vsapi->getFrameWidth(src0, 0);
+        int src_h = vsapi->getFrameHeight(src0, 0);
+        int size = src_w * src_h;
+        
+        double *src_buf0 = (double *)mkl_malloc(sizeof(double) * size, 64);
+        double *src_buf1 = (double *)mkl_malloc(sizeof(double) * size, 64);
+        float_to_double(srcp0, src_buf0, src_w, src_h, src_stride);
+        float_to_double(srcp1, src_buf1, src_w, src_h, src_stride);
+        cblas_daxpy(size, -1.0, src_buf0, 1, src_buf1, 1);
+        double err = cblas_dnrm2(size, src_buf1, 1) / fmax(cblas_dnrm2(size, src_buf0, 1), 1e-16);
+        
+        VSMap *props = vsapi->getFramePropertiesRW(dst);
+        vsapi->mapSetFloat(props, "RelativeError", err, maReplace);
+        
+        mkl_free(src_buf0);
+        mkl_free(src_buf1);
+        vsapi->freeFrame(src0);
+        vsapi->freeFrame(src1);
+        return dst;
+    }
+    return NULL;
+}
+
+static void VS_CC RelativeErrorFree(void *instanceData, VSCore *core, const VSAPI *vsapi) {
+    (void)core;
+    RelativeErrorData *d = (RelativeErrorData *)instanceData;
+    vsapi->freeNode(d->node0);
+    vsapi->freeNode(d->node1);
+    free(d);
+}
+
+static void VS_CC RelativeErrorCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core, const VSAPI *vsapi) {
+    (void)userData;
+    RelativeErrorData d;
+    d.node0 = vsapi->mapGetNode(in, "clip0", 0, NULL);
+    d.node1 = vsapi->mapGetNode(in, "clip1", 0, NULL);
+    VSVideoInfo vi0 = *vsapi->getVideoInfo(d.node0);
+    VSVideoInfo vi1 = *vsapi->getVideoInfo(d.node1);
+    
+    if (!vsh_isConstantVideoFormat(&vi0) || !vsh_isSameVideoPresetFormat(pfGrayS, &vi0.format, core, vsapi)) {
+        vsapi->mapSetError(out, "RelativeError: only GRAY constant format 32bit float input supported");
+        vsapi->freeNode(d.node0);
+        vsapi->freeNode(d.node1);
+        return;
+    }
+    
+    if (!vsh_isSameVideoInfo(&vi0, &vi1) || vi0.numFrames != vi1.numFrames) {
+        vsapi->mapSetError(out, "RelativeError: clips must have the same format and number of frames");
+        vsapi->freeNode(d.node0);
+        vsapi->freeNode(d.node1);
+        return;
+    }
+    
+    RelativeErrorData *data = (RelativeErrorData *)malloc(sizeof d);
+    *data = d;
+    
+    VSFilterDependency deps[] = {{d.node0, rpStrictSpatial}, {d.node1, rpStrictSpatial}};
+    vsapi->createVideoFilter(out, "RelativeError", &vi0, RelativeErrorGetFrame, RelativeErrorFree, fmParallel, deps, 2, data, core);
+}
+
+typedef struct {
+    VSNode *node;
+    VSVideoInfo vi;
     float gamma;
     bool process[3];
 } GammaData;
@@ -2069,7 +2711,7 @@ static const VSFrame *VS_CC LinearizeGetFrame(
                 }
             }
             else {
-                memcpy(dstp, srcp, sizeof(float) * src_stride * src_h);
+                vsh_bitblt(dstp, sizeof(float) * src_stride, srcp, sizeof(float) * src_stride, sizeof(float) * src_w, src_h);
             }
         }
         vsapi->freeFrame(src);
@@ -2173,7 +2815,7 @@ static const VSFrame *VS_CC GammaCorrGetFrame(
                 }
             }
             else {
-                memcpy(dstp, srcp, sizeof(float) * src_stride * src_h);
+                vsh_bitblt(dstp, sizeof(float) * src_stride, srcp, sizeof(float) * src_stride, sizeof(float) * src_w, src_h);
             }
         }
         vsapi->freeFrame(src);
@@ -2248,6 +2890,7 @@ static void VS_CC GammaCorrCreate(const VSMap *in, VSMap *out, void *userData, V
 typedef struct {
     VSNode *node;
     VSVideoInfo vi;
+    bool direct;
 } BitDepthData;
 
 static const VSFrame *VS_CC BitDepthGetFrame(
@@ -2269,7 +2912,11 @@ static const VSFrame *VS_CC BitDepthGetFrame(
         
         int err;
         int range = vsapi->mapGetIntSaturated(props, "_ColorRange", 0, &err);
-        if (err || range < 0 || range > 1) {
+        
+        if (d->direct) {
+            range = 0;
+        }
+        else if (err || range < 0 || range > 1) {
             range = (fi->colorFamily == cfRGB) ? 0 : 1;
         }
         
@@ -2348,6 +2995,13 @@ static void VS_CC BitDepthCreate(const VSMap *in, VSMap *out, void *userData, VS
         return;
     }
     
+    int err;
+    d.direct = !!vsapi->mapGetIntSaturated(in, "direct", 0, &err);
+    
+    if (err) {
+        d.direct = false;
+    }
+    
     d.vi.format.bitsPerSample = bits;
     d.vi.format.bytesPerSample = (bits + 7) / 8;
     d.vi.format.sampleType = (bits == 32) ? stFloat : stInteger;
@@ -2360,7 +3014,7 @@ static void VS_CC BitDepthCreate(const VSMap *in, VSMap *out, void *userData, VS
 }
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
-    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(10, 0), VAPOURSYNTH_API_VERSION, 0, plugin);
+    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(11, 0), VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction("Resize",
                              "clip:vnode;"
                              "width:int;"
@@ -2377,6 +3031,30 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
                              "sharp:float:opt;",
                              "clip:vnode;",
                              ResizeCreate,
+                             NULL,
+                             plugin);
+    vspapi->registerFunction("Descale",
+                             "clip:vnode;"
+                             "width:int;"
+                             "height:int;"
+                             "src_left:float:opt;"
+                             "src_top:float:opt;"
+                             "src_width:float:opt;"
+                             "src_height:float:opt;"
+                             "kernel:data:opt;"
+                             "b:float:opt;"
+                             "c:float:opt;"
+                             "taps:int:opt;"
+                             "lambda:float:opt;",
+                             "clip:vnode;",
+                             DescaleCreate,
+                             NULL,
+                             plugin);
+    vspapi->registerFunction("RelativeError",
+                             "clip0:vnode;"
+                             "clip1:vnode;",
+                             "clip:vnode;",
+                             RelativeErrorCreate,
                              NULL,
                              plugin);
     vspapi->registerFunction("Linearize",
@@ -2397,7 +3075,8 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
                              plugin);
     vspapi->registerFunction("BitDepth",
                              "clip:vnode;"
-                             "bits:int;",
+                             "bits:int;"
+                             "direct:int:opt;",
                              "clip:vnode;",
                              BitDepthCreate,
                              NULL,
