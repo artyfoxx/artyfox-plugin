@@ -2157,10 +2157,9 @@ static void descale_width(
     float_to_double(srcp, src_buf, src_w, src_h, src_stride);
     
     double *dst_buf = (double *)mkl_malloc(sizeof(double) * dst_w * src_h, 64);
-    cblas_dgemm(CblasRowMajor, CblasTrans, CblasTrans, dst_w, src_h, src_w, 1.0, weights, dst_w, src_buf, src_w, 0.0, dst_buf, src_h);
-    LAPACKE_dposv(LAPACK_ROW_MAJOR, 'L', dst_w, src_h, matrix, dst_w, dst_buf, src_h);
+    cblas_dgemm(CblasColMajor, CblasNoTrans, CblasNoTrans, dst_w, src_h, src_w, 1.0, weights, dst_w, src_buf, src_w, 0.0, dst_buf, dst_w);
+    LAPACKE_dposv(LAPACK_COL_MAJOR, 'L', dst_w, src_h, matrix, dst_w, dst_buf, dst_w);
     
-    mkl_dimatcopy('R', 'T', dst_w, src_h, 1.0, dst_buf, src_h, dst_w);
     double_to_float(dst_buf, dstp, dst_w, src_h, dst_stride);
     
     mkl_free(dst_buf);
