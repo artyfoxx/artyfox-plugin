@@ -499,7 +499,7 @@ static void linear_to_rgb(
             __m256 pix_abs = _mm256_and_ps(pix, v_abs);
             __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_0_0031308, _CMP_GT_OQ);
             __m256 branch_0 = _mm256_fmsub_ps(_mm256_pow_ps(pix_abs, v_gamma), v_1_055, v_0_055);
-            __m256 branch_1 = _mm256_mul_ps(pix, v_12_92);
+            __m256 branch_1 = _mm256_mul_ps(pix_abs, v_12_92);
             __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
             _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
         }
@@ -508,7 +508,7 @@ static void linear_to_rgb(
             __m256 pix_abs = _mm256_and_ps(pix, v_abs);
             __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_0_0031308, _CMP_GT_OQ);
             __m256 branch_0 = _mm256_fmsub_ps(_mm256_pow_ps(pix_abs, v_gamma), v_1_055, v_0_055);
-            __m256 branch_1 = _mm256_mul_ps(pix, v_12_92);
+            __m256 branch_1 = _mm256_mul_ps(pix_abs, v_12_92);
             __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
             _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
         }
@@ -541,7 +541,7 @@ static void linear_to_yuv(
             __m256 pix_abs = _mm256_and_ps(pix, v_abs);
             __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_0_018, _CMP_GE_OQ);
             __m256 branch_0 = _mm256_fmsub_ps(_mm256_pow_ps(pix_abs, v_gamma), v_1_099, v_0_099);
-            __m256 branch_1 = _mm256_mul_ps(pix, v_4_5);
+            __m256 branch_1 = _mm256_mul_ps(pix_abs, v_4_5);
             __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
             _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
         }
@@ -550,7 +550,7 @@ static void linear_to_yuv(
             __m256 pix_abs = _mm256_and_ps(pix, v_abs);
             __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_0_018, _CMP_GE_OQ);
             __m256 branch_0 = _mm256_fmsub_ps(_mm256_pow_ps(pix_abs, v_gamma), v_1_099, v_0_099);
-            __m256 branch_1 = _mm256_mul_ps(pix, v_4_5);
+            __m256 branch_1 = _mm256_mul_ps(pix_abs, v_4_5);
             __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
             _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
         }
@@ -2150,7 +2150,7 @@ static void descale_width(
     }
     
     double *matrix = (double *)mkl_malloc(sizeof(double) * dst_w * dst_w, 64);
-    cblas_dgemm(CblasRowMajor, CblasTrans, CblasNoTrans, dst_w, dst_w, src_w, 1.0, weights, dst_w, weights, dst_w, 0.0, matrix, dst_w);
+    cblas_dsyrk(CblasRowMajor, CblasUpper, CblasTrans, dst_w, src_w, 1.0, weights, dst_w, 0.0, matrix, dst_w);
     for (int i = 0; i < dst_w; i++) matrix[i * dst_w + i] += lambda;
     
     double *src_buf = (double *)mkl_malloc(sizeof(double) * src_w * src_h, 64);
@@ -2195,7 +2195,7 @@ static void descale_height(
     }
     
     double *matrix = (double *)mkl_malloc(sizeof(double) * dst_h * dst_h, 64);
-    cblas_dgemm(CblasRowMajor, CblasTrans, CblasNoTrans, dst_h, dst_h, src_h, 1.0, weights, dst_h, weights, dst_h, 0.0, matrix, dst_h);
+    cblas_dsyrk(CblasRowMajor, CblasUpper, CblasTrans, dst_h, src_h, 1.0, weights, dst_h, 0.0, matrix, dst_h);
     for (int i = 0; i < dst_h; i++) matrix[i * dst_h + i] += lambda;
     
     double *src_buf = (double *)mkl_malloc(sizeof(double) * src_w * src_h, 64);
@@ -2203,7 +2203,7 @@ static void descale_height(
     
     double *dst_buf = (double *)mkl_malloc(sizeof(double) * src_w * dst_h, 64);
     cblas_dgemm(CblasRowMajor, CblasTrans, CblasNoTrans, dst_h, src_w, src_h, 1.0, weights, dst_h, src_buf, src_w, 0.0, dst_buf, src_w);
-    LAPACKE_dposv(LAPACK_ROW_MAJOR, 'L', dst_h, src_w, matrix, dst_h, dst_buf, src_w);
+    LAPACKE_dposv(LAPACK_ROW_MAJOR, 'U', dst_h, src_w, matrix, dst_h, dst_buf, src_w);
     
     double_to_float(dst_buf, dstp, src_w, dst_h, dst_stride);
     
@@ -3013,7 +3013,7 @@ static void VS_CC BitDepthCreate(const VSMap *in, VSMap *out, void *userData, VS
 }
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
-    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(11, 1), VAPOURSYNTH_API_VERSION, 0, plugin);
+    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(11, 2), VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction("Resize",
                              "clip:vnode;"
                              "width:int;"
