@@ -2144,7 +2144,7 @@ static void descale_width(
             weights[x * dst_w + CLAMP(i, 0, border)] += temp;
             norm += temp;
         }
-        for (int i = VSMAX(low, 0); i <= VSMIN(high, border); i++) {
+        for (int i = CLAMP(low, 0, border); i <= CLAMP(high, 0, border); i++) {
             weights[x * dst_w + i] /= norm;
         }
     }
@@ -2189,7 +2189,7 @@ static void descale_height(
             weights[y * dst_h + CLAMP(i, 0, border)] += temp;
             norm += temp;
         }
-        for (int i = VSMAX(low, 0); i <= VSMIN(high, border); i++) {
+        for (int i = CLAMP(low, 0, border); i <= CLAMP(high, 0, border); i++) {
             weights[y * dst_h + i] /= norm;
         }
     }
@@ -3013,7 +3013,7 @@ static void VS_CC BitDepthCreate(const VSMap *in, VSMap *out, void *userData, VS
 }
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
-    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(11, 2), VAPOURSYNTH_API_VERSION, 0, plugin);
+    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(11, 3), VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction("Resize",
                              "clip:vnode;"
                              "width:int;"
