@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdlib.h>
-#if defined(__AVX2__) && defined(__FMA__)
+#ifdef __AVX2__
 #include <immintrin.h>
 #endif
 #include <math.h>
@@ -9,10 +9,11 @@
 #include "VapourSynth4.h"
 #include "VSHelper4.h"
 
+#define UNUSED __attribute__((unused))
 #define CLAMP(x, min, max) ((x) > (max) ? (max) : ((x) < (min) ? (min) : (x))) 
 #define M_PI 3.14159265358979323846
 
-#if defined(__AVX2__) && defined(__FMA__)
+#ifdef __AVX2__
 #define _MM256_TRANSPOSE8_PS(row0, row1, row2, row3, row4, row5, row6, row7) \
 do { \
     __m256 __t0 = _mm256_unpacklo_ps((row0), (row2)); \
@@ -78,8 +79,7 @@ static double area_kernel(double x, void *ctx) {
     return 0.0;
 }
 
-static double magic_kernel(double x, void *ctx) {
-    (void)ctx;
+static double magic_kernel(double x, void *ctx UNUSED) {
     if (x < 0.0) {
         x = -x;
     }
@@ -93,8 +93,7 @@ static double magic_kernel(double x, void *ctx) {
     return 0.0;
 }
 
-static double magic_kernel_2013(double x, void *ctx) {
-    (void)ctx;
+static double magic_kernel_2013(double x, void *ctx UNUSED) {
     if (x < 0.0) {
         x = -x;
     }
@@ -111,8 +110,7 @@ static double magic_kernel_2013(double x, void *ctx) {
     return 0.0;
 }
 
-static double magic_kernel_2021(double x, void *ctx) {
-    (void)ctx;
+static double magic_kernel_2021(double x, void *ctx UNUSED) {
     if (x < 0.0) {
         x = -x;
     }
@@ -135,8 +133,7 @@ static double magic_kernel_2021(double x, void *ctx) {
     return 0.0;
 }
 
-static double bilinear_kernel(double x, void *ctx) {
-    (void)ctx;
+static double bilinear_kernel(double x, void *ctx UNUSED) {
     if (x < 0.0) {
         x = -x;
     }
@@ -196,8 +193,7 @@ static double lanczos_kernel(double x, void *ctx) {
     return 0.0;
 }
 
-static double spline16_kernel(double x, void *ctx) {
-    (void)ctx;
+static double spline16_kernel(double x, void *ctx UNUSED) {
     if (x < 0.0) {
         x = -x;
     }
@@ -211,8 +207,7 @@ static double spline16_kernel(double x, void *ctx) {
     return 0.0;
 }
 
-static double spline36_kernel(double x, void *ctx) {
-    (void)ctx;
+static double spline36_kernel(double x, void *ctx UNUSED) {
     if (x < 0.0) {
         x = -x;
     }
@@ -230,8 +225,7 @@ static double spline36_kernel(double x, void *ctx) {
     return 0.0;
 }
 
-static double spline64_kernel(double x, void *ctx) {
-    (void)ctx;
+static double spline64_kernel(double x, void *ctx UNUSED) {
     if (x < 0.0) {
         x = -x;
     }
@@ -253,8 +247,7 @@ static double spline64_kernel(double x, void *ctx) {
     return 0.0;
 }
 
-static double spline100_kernel(double x, void *ctx) {
-    (void)ctx;
+static double spline100_kernel(double x, void *ctx UNUSED) {
     if (x < 0.0) {
         x = -x;
     }
@@ -280,8 +273,7 @@ static double spline100_kernel(double x, void *ctx) {
     return 0.0;
 }
 
-static double spline144_kernel(double x, void *ctx) {
-    (void)ctx;
+static double spline144_kernel(double x, void *ctx UNUSED) {
     if (x < 0.0) {
         x = -x;
     }
@@ -311,8 +303,7 @@ static double spline144_kernel(double x, void *ctx) {
     return 0.0;
 }
 
-static double point_kernel(double x, void *ctx) {
-    (void)ctx;
+static double point_kernel(double x, void *ctx UNUSED) {
     if (x < 0.0) {
         x = -x;
     }
@@ -909,35 +900,6 @@ static void float_to_double(
     }
 }
 
-static void double_to_float(
-    const double *restrict srcp, float *restrict dstp, int src_w, int src_h, ptrdiff_t stride
-) {
-    int tail = src_w % 8;
-    int mod8_w = src_w - tail;
-    
-    int64_t mask_arr[8] = {0};
-    for (int i = 0; i < tail; i++) mask_arr[i] = -1LL;
-    __m256i tail_mask_0 = _mm256_loadu_si256((__m256i *)mask_arr);
-    __m256i tail_mask_1 = _mm256_loadu_si256((__m256i *)(mask_arr + 4));
-    
-    for (int y = 0; y < src_h; y++) {
-        int x = 0;
-        for (; x < mod8_w; x += 8) {
-            __m128 pix_0 = _mm256_cvtpd_ps(_mm256_loadu_pd(srcp + x));
-            __m128 pix_1 = _mm256_cvtpd_ps(_mm256_loadu_pd(srcp + x + 4));
-            _mm256_stream_ps(dstp + x, _mm256_setr_m128(pix_0, pix_1));
-        }
-        if (tail) {
-            __m128 pix_0 = _mm256_cvtpd_ps(_mm256_maskload_pd(srcp + x, tail_mask_0));
-            __m128 pix_1 = _mm256_cvtpd_ps(_mm256_maskload_pd(srcp + x + 4, tail_mask_1));
-            _mm256_stream_ps(dstp + x, _mm256_setr_m128(pix_0, pix_1));
-        }
-        srcp += src_w;
-        dstp += stride;
-    }
-    _mm_sfence();
-}
-
 static void sharp_width(
     const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h, float sharp
 ) {
@@ -1088,8 +1050,8 @@ static void resize_width(
     
     for (int y = 0; y < mod8_h; y += 8) {
         for (int x = 0; x < src_w; x += 8) {
-            __m256 line_0 = _mm256_load_ps(srcp + x);
-            __m256 line_1 = _mm256_load_ps(srcp + x + src_stride);
+            __m256 line_0 = _mm256_load_ps(srcp + x + src_stride * 0);
+            __m256 line_1 = _mm256_load_ps(srcp + x + src_stride * 1);
             __m256 line_2 = _mm256_load_ps(srcp + x + src_stride * 2);
             __m256 line_3 = _mm256_load_ps(srcp + x + src_stride * 3);
             __m256 line_4 = _mm256_load_ps(srcp + x + src_stride * 4);
@@ -1097,7 +1059,7 @@ static void resize_width(
             __m256 line_6 = _mm256_load_ps(srcp + x + src_stride * 6);
             __m256 line_7 = _mm256_load_ps(srcp + x + src_stride * 7);
             _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
-            _mm256_store_ps(src_buf + x * 8, line_0);
+            _mm256_store_ps(src_buf + x * 8 + 0, line_0);
             _mm256_store_ps(src_buf + x * 8 + 8, line_1);
             _mm256_store_ps(src_buf + x * 8 + 16, line_2);
             _mm256_store_ps(src_buf + x * 8 + 24, line_3);
@@ -1118,7 +1080,7 @@ static void resize_width(
             _mm256_store_ps(dst_buf + x * 8, _mm256_setr_m128(_mm256_cvtpd_ps(v_acc_0), _mm256_cvtpd_ps(v_acc_1)));
         }
         for (int x = 0; x < dst_w; x += 8) {
-            __m256 line_0 = _mm256_load_ps(dst_buf + x * 8);
+            __m256 line_0 = _mm256_load_ps(dst_buf + x * 8 + 0);
             __m256 line_1 = _mm256_load_ps(dst_buf + x * 8 + 8);
             __m256 line_2 = _mm256_load_ps(dst_buf + x * 8 + 16);
             __m256 line_3 = _mm256_load_ps(dst_buf + x * 8 + 24);
@@ -1127,8 +1089,8 @@ static void resize_width(
             __m256 line_6 = _mm256_load_ps(dst_buf + x * 8 + 48);
             __m256 line_7 = _mm256_load_ps(dst_buf + x * 8 + 56);
             _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
-            _mm256_stream_ps(dstp + x, line_0);
-            _mm256_stream_ps(dstp + x + dst_stride, line_1);
+            _mm256_stream_ps(dstp + x + dst_stride * 0, line_0);
+            _mm256_stream_ps(dstp + x + dst_stride * 1, line_1);
             _mm256_stream_ps(dstp + x + dst_stride * 2, line_2);
             _mm256_stream_ps(dstp + x + dst_stride * 3, line_3);
             _mm256_stream_ps(dstp + x + dst_stride * 4, line_4);
@@ -1141,8 +1103,8 @@ static void resize_width(
     }
     if (tail) {
         for (int x = 0; x < src_w; x += 8) {
-            __m256 line_0 = _mm256_load_ps(srcp + x);
-            __m256 line_1 = (tail > 1) ? _mm256_load_ps(srcp + x + src_stride) : _mm256_setzero_ps();
+            __m256 line_0 = _mm256_load_ps(srcp + x + src_stride * 0);
+            __m256 line_1 = (tail > 1) ? _mm256_load_ps(srcp + x + src_stride * 1) : _mm256_setzero_ps();
             __m256 line_2 = (tail > 2) ? _mm256_load_ps(srcp + x + src_stride * 2) : _mm256_setzero_ps();
             __m256 line_3 = (tail > 3) ? _mm256_load_ps(srcp + x + src_stride * 3) : _mm256_setzero_ps();
             __m256 line_4 = (tail > 4) ? _mm256_load_ps(srcp + x + src_stride * 4) : _mm256_setzero_ps();
@@ -1150,7 +1112,7 @@ static void resize_width(
             __m256 line_6 = (tail > 6) ? _mm256_load_ps(srcp + x + src_stride * 6) : _mm256_setzero_ps();
             __m256 line_7 = _mm256_setzero_ps();
             _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
-            _mm256_store_ps(src_buf + x * 8, line_0);
+            _mm256_store_ps(src_buf + x * 8 + 0, line_0);
             _mm256_store_ps(src_buf + x * 8 + 8, line_1);
             _mm256_store_ps(src_buf + x * 8 + 16, line_2);
             _mm256_store_ps(src_buf + x * 8 + 24, line_3);
@@ -1171,7 +1133,7 @@ static void resize_width(
             _mm256_store_ps(dst_buf + x * 8, _mm256_setr_m128(_mm256_cvtpd_ps(v_acc_0), _mm256_cvtpd_ps(v_acc_1)));
         }
         for (int x = 0; x < dst_w; x += 8) {
-            __m256 line_0 = _mm256_load_ps(dst_buf + x * 8);
+            __m256 line_0 = _mm256_load_ps(dst_buf + x * 8 + 0);
             __m256 line_1 = _mm256_load_ps(dst_buf + x * 8 + 8);
             __m256 line_2 = _mm256_load_ps(dst_buf + x * 8 + 16);
             __m256 line_3 = _mm256_load_ps(dst_buf + x * 8 + 24);
@@ -1180,8 +1142,8 @@ static void resize_width(
             __m256 line_6 = _mm256_load_ps(dst_buf + x * 8 + 48);
             __m256 line_7 = _mm256_load_ps(dst_buf + x * 8 + 56);
             _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
-            _mm256_stream_ps(dstp + x, line_0);
-            if (tail > 1) _mm256_stream_ps(dstp + x + dst_stride, line_1);
+            _mm256_stream_ps(dstp + x + dst_stride * 0, line_0);
+            if (tail > 1) _mm256_stream_ps(dstp + x + dst_stride * 1, line_1);
             if (tail > 2) _mm256_stream_ps(dstp + x + dst_stride * 2, line_2);
             if (tail > 3) _mm256_stream_ps(dstp + x + dst_stride * 3, line_3);
             if (tail > 4) _mm256_stream_ps(dstp + x + dst_stride * 4, line_4);
@@ -1189,12 +1151,12 @@ static void resize_width(
             if (tail > 6) _mm256_stream_ps(dstp + x + dst_stride * 6, line_6);
         }
     }
+    _mm_sfence();
     _mm_free(src_buf);
     _mm_free(dst_buf);
     free(counts);
     free(weights);
     free(lengths);
-    _mm_sfence();
 }
 
 static void resize_height(
@@ -1257,9 +1219,9 @@ static void resize_height(
         }
         dstp += dst_stride;
     }
+    _mm_sfence();
     free(counts);
     free(weights);
-    _mm_sfence();
 }
 
 #else
@@ -1496,18 +1458,6 @@ static void float_to_double(
     }
 }
 
-static void double_to_float(
-    const double *restrict srcp, float *restrict dstp, int src_w, int src_h, ptrdiff_t stride
-) {
-    for (int y = 0; y < src_h; y++) {
-        for (int x = 0; x < src_w; x++) {
-            dstp[x] = (float)srcp[x];
-        }
-        srcp += src_w;
-        dstp += stride;
-    }
-}
-
 static void sharp_width(
     const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h, float sharp
 ) {
@@ -1625,10 +1575,9 @@ static void resize_height(
 #endif
 
 static const VSFrame *VS_CC ResizeGetFrame(
-    int n, int activationReason, void *instanceData, void **frameData,
+    int n, int activationReason, void *instanceData, void **frameData UNUSED,
     VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi
 ) {
-    (void)frameData;
     ResizeData *d = (ResizeData *)instanceData;
     
     if (activationReason == arInitial) {
@@ -1807,8 +1756,7 @@ static const VSFrame *VS_CC ResizeGetFrame(
     return NULL;
 }
 
-static void VS_CC ResizeFree(void *instanceData, VSCore *core, const VSAPI *vsapi) {
-    (void)core;
+static void VS_CC ResizeFree(void *instanceData, VSCore *core UNUSED, const VSAPI *vsapi) {
     ResizeData *d = (ResizeData *)instanceData;
     vsapi->freeNode(d->node);
     
@@ -1823,8 +1771,7 @@ static void VS_CC ResizeFree(void *instanceData, VSCore *core, const VSAPI *vsap
     free(d);
 }
 
-static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core, const VSAPI *vsapi) {
-    (void)userData;
+static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData UNUSED, VSCore *core, const VSAPI *vsapi) {
     ResizeData d;
     d.node = vsapi->mapGetNode(in, "clip", 0, NULL);
     d.vi = *vsapi->getVideoInfo(d.node);
@@ -2131,8 +2078,12 @@ static void descale_width(
     int min_w = (int)floor(start_w);
     int max_w = (int)ceil(real_w + start_w) - 1;
     int border = dst_w - 1;
-    double *weights = (double *)mkl_malloc(sizeof(double) * src_w * dst_w, 64);
-    memset(weights, 0, sizeof(double) * src_w * dst_w);
+    int step = (int)ceil(kernel.radius * 2) + 2;
+    double  *values  = mkl_malloc(sizeof(double) * step * src_w, 64);
+    MKL_INT *col_idx = mkl_malloc(sizeof(MKL_INT) * step * src_w, 64);
+    MKL_INT *row_ptr = mkl_malloc(sizeof(MKL_INT) * (src_w + 1), 64);
+    row_ptr[0] = 0;
+    int nnz = 0;
     
     for (int x = 0; x < src_w; x++) {
         double center = (x + 0.5) / factor - 0.5 + start_w;
@@ -2140,44 +2091,182 @@ static void descale_width(
         int high = VSMIN((int)ceil(center + kernel.radius), max_w);
         double norm = 0.0;
         for (int i = low; i <= high; i++) {
-            double temp = kernel.f(i - center, kernel.ctx);
-            weights[x * dst_w + CLAMP(i, 0, border)] += temp;
-            norm += temp;
+            double temp_val = kernel.f(i - center, kernel.ctx);
+            if (temp_val == 0.0) continue;
+            norm += temp_val;
+            int temp_idx = CLAMP(i, 0, border);
+            if (row_ptr[x] != nnz && temp_idx == col_idx[nnz - 1]) {
+                values[nnz - 1] += temp_val;
+                continue;
+            }
+            values[nnz] = temp_val;
+            col_idx[nnz] = temp_idx;
+            nnz++;
         }
-        for (int i = CLAMP(low, 0, border); i <= CLAMP(high, 0, border); i++) {
-            weights[x * dst_w + i] /= norm;
+        for (int i = row_ptr[x]; i < nnz; i++) {
+            values[i] /= norm;
         }
+        row_ptr[x + 1] = nnz;
     }
     
-    double *matrix = (double *)mkl_malloc(sizeof(double) * dst_w * dst_w, 64);
-    cblas_dsyrk(CblasRowMajor, CblasUpper, CblasTrans, dst_w, src_w, 1.0, weights, dst_w, 0.0, matrix, dst_w);
-    for (int i = 0; i < dst_w; i++) matrix[i * dst_w + i] += lambda;
+    double  *reg_values  = mkl_malloc(sizeof(double) * dst_w, 64);
+    MKL_INT *reg_col_idx = mkl_malloc(sizeof(MKL_INT) * dst_w, 64);
+    MKL_INT *reg_row_ptr = mkl_malloc(sizeof(MKL_INT) * (dst_w + 1), 64);
+    reg_row_ptr[0] = 0;
     
-    double *src_buf = (double *)mkl_malloc(sizeof(double) * src_w * src_h, 64);
-    float_to_double(srcp, src_buf, src_w, src_h, src_stride);
+    for (int i = 0; i < dst_w; i++) {
+        reg_values[i] = lambda;
+        reg_col_idx[i] = i;
+        reg_row_ptr[i + 1] = i + 1;
+    }
     
-    double *dst_buf = (double *)mkl_malloc(sizeof(double) * dst_w * src_h, 64);
-    cblas_dgemm(CblasColMajor, CblasNoTrans, CblasNoTrans, dst_w, src_h, src_w, 1.0, weights, dst_w, src_buf, src_w, 0.0, dst_buf, dst_w);
-    LAPACKE_dposv(LAPACK_COL_MAJOR, 'L', dst_w, src_h, matrix, dst_w, dst_buf, dst_w);
+    sparse_matrix_t weights, matrix, reg, reg_matrix;
+    mkl_sparse_d_create_csr(&weights, SPARSE_INDEX_BASE_ZERO, src_w, dst_w, row_ptr, row_ptr + 1, col_idx, values);
+    mkl_sparse_syrk(SPARSE_OPERATION_TRANSPOSE, weights, &matrix);
+    mkl_sparse_d_create_csr(
+        &reg, SPARSE_INDEX_BASE_ZERO, dst_w, dst_w, reg_row_ptr, reg_row_ptr + 1, reg_col_idx, reg_values
+    );
+    mkl_sparse_d_add(SPARSE_OPERATION_NON_TRANSPOSE, matrix, 1.0, reg, &reg_matrix);
     
-    double_to_float(dst_buf, dstp, dst_w, src_h, dst_stride);
+    double *src_buf = (double *)mkl_malloc(sizeof(double) * src_w, 64);
+    double *tmp_buf = (double *)mkl_malloc(sizeof(double) * dst_w, 64);
+    double *dst_buf = (double *)mkl_malloc(sizeof(double) * dst_w, 64);
     
+#ifdef __AVX2__
+    int tail_src = src_w % 8;
+    int mod8_w_src = src_w - tail_src;
+    
+    int32_t mask_arr_src[8] = {0};
+    for (int i = 0; i < tail_src; i++) mask_arr_src[i] = -1;
+    __m256i tail_mask_src = _mm256_loadu_si256((__m256i *)mask_arr_src);
+    __m256i tail_mask_src_0 = _mm256_cvtepi32_epi64(_mm256_extracti128_si256(tail_mask_src, 0));
+    __m256i tail_mask_src_1 = _mm256_cvtepi32_epi64(_mm256_extracti128_si256(tail_mask_src, 1));
+    
+    int tail_dst = dst_w % 8;
+    int mod8_w_dst = dst_w - tail_dst;
+    
+    int64_t mask_arr_dst[8] = {0};
+    for (int i = 0; i < tail_dst; i++) mask_arr_dst[i] = -1LL;
+    __m256i tail_mask_dst_0 = _mm256_loadu_si256((__m256i *)mask_arr_dst);
+    __m256i tail_mask_dst_1 = _mm256_loadu_si256((__m256i *)(mask_arr_dst + 4));
+#endif
+    
+    struct matrix_descr descr;
+    descr.type = SPARSE_MATRIX_TYPE_GENERAL;
+    mkl_sparse_set_mv_hint(weights, SPARSE_OPERATION_TRANSPOSE, descr, src_h);
+    mkl_sparse_optimize(weights);
+    
+    sparse_index_base_t indexing;
+    MKL_INT *rows_startC, *rows_endC, *colsC;
+    double *valsC;
+    MKL_INT nrows, ncols;
+    mkl_sparse_d_export_csr(reg_matrix, &indexing, &nrows, &ncols, &rows_startC, &rows_endC, &colsC, &valsC);
+    
+    void *pt[64] = {0};
+    MKL_INT iparm[64] = {0};
+    MKL_INT maxfct = 1, mnum = 1, phase, error = 0, msglvl = 0, mtype = 2;
+    iparm[0] = 1;
+    iparm[1] = 2;
+    iparm[7] = 2;
+    iparm[9] = 8;
+    iparm[20] = 1;
+    iparm[24] = 1;
+    iparm[34] = 1;
+    MKL_INT n = nrows, nrhs = 1;
+    
+    phase = 12;
+    PARDISO(
+        pt, &maxfct, &mnum, &mtype, &phase,
+        &n, valsC, rows_startC, colsC,
+        NULL, &nrhs, iparm, &msglvl, tmp_buf, dst_buf, &error
+    );
+    
+    phase = 33;
+    
+    for (int y = 0; y < src_h; y++) {
+#ifdef __AVX2__
+        int x = 0;
+        for (; x < mod8_w_src; x += 8) {
+            __m256 pix = _mm256_load_ps(srcp + x);
+            _mm256_store_pd(src_buf + x, _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)));
+            _mm256_store_pd(src_buf + x + 4, _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)));
+        }
+        if (tail_src) {
+            __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask_src);
+            _mm256_maskstore_pd(src_buf + x, tail_mask_src_0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)));
+            _mm256_maskstore_pd(src_buf + x + 4, tail_mask_src_1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)));
+        }
+#else
+        for (int x = 0; x < src_w; x++) {
+            src_buf[x] = (double)srcp[x];
+        }
+#endif
+        mkl_sparse_d_mv(SPARSE_OPERATION_TRANSPOSE, 1.0, weights, descr, src_buf, 0.0, tmp_buf);
+        PARDISO(
+            pt, &maxfct, &mnum, &mtype, &phase,
+            &n, valsC, rows_startC, colsC,
+            NULL, &nrhs, iparm, &msglvl, tmp_buf, dst_buf, &error
+        );
+#ifdef __AVX2__
+        x = 0;
+        for (; x < mod8_w_dst; x += 8) {
+            __m128 pix_0 = _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x));
+            __m128 pix_1 = _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x + 4));
+            _mm256_stream_ps(dstp + x, _mm256_setr_m128(pix_0, pix_1));
+        }
+        if (tail_dst) {
+            __m128 pix_0 = _mm256_cvtpd_ps(_mm256_maskload_pd(dst_buf + x, tail_mask_dst_0));
+            __m128 pix_1 = _mm256_cvtpd_ps(_mm256_maskload_pd(dst_buf + x + 4, tail_mask_dst_1));
+            _mm256_stream_ps(dstp + x, _mm256_setr_m128(pix_0, pix_1));
+        }
+#else
+        for (int x = 0; x < dst_w; x++) {
+            dstp[x] = (float)dst_buf[x];
+        }
+#endif
+        srcp += src_stride;
+        dstp += dst_stride;
+    }
+#ifdef __AVX2__
+    _mm_sfence();
+#endif
+    
+    phase = -1;
+    PARDISO(
+        pt, &maxfct, &mnum, &mtype, &phase,
+        &n, valsC, rows_startC, colsC,
+        NULL, &nrhs, iparm, &msglvl, tmp_buf, dst_buf, &error
+    );
+    
+    mkl_sparse_destroy(reg_matrix);
+    mkl_sparse_destroy(reg);
+    mkl_sparse_destroy(matrix);
+    mkl_sparse_destroy(weights);
     mkl_free(dst_buf);
+    mkl_free(tmp_buf);
     mkl_free(src_buf);
-    mkl_free(matrix);
-    mkl_free(weights);
+    mkl_free(reg_row_ptr);
+    mkl_free(reg_col_idx);
+    mkl_free(reg_values);
+    mkl_free(values);
+    mkl_free(row_ptr);
+    mkl_free(col_idx);
 }
 
 static void descale_height(
-    const float *restrict srcp, float *restrict dstp, ptrdiff_t dst_stride,
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride,
     int src_w, int src_h, int dst_h, double start_h, double real_h, double lambda, kernel_t kernel
 ) {
     double factor = src_h / real_h;
     int min_h = (int)floor(start_h);
     int max_h = (int)ceil(real_h + start_h) - 1;
     int border = dst_h - 1;
-    double *weights = (double *)mkl_malloc(sizeof(double) * src_h * dst_h, 64);
-    memset(weights, 0, sizeof(double) * src_h * dst_h);
+    int step = (int)ceil(kernel.radius * 2) + 2;
+    double  *values  = mkl_malloc(sizeof(double) * step * src_h, 64);
+    MKL_INT *col_idx = mkl_malloc(sizeof(MKL_INT) * step * src_h, 64);
+    MKL_INT *row_ptr = mkl_malloc(sizeof(MKL_INT) * (src_h + 1), 64);
+    row_ptr[0] = 0;
+    int nnz = 0;
     
     for (int y = 0; y < src_h; y++) {
         double center = (y + 0.5) / factor - 0.5 + start_h;
@@ -2185,39 +2274,386 @@ static void descale_height(
         int high = VSMIN((int)ceil(center + kernel.radius), max_h);
         double norm = 0.0;
         for (int i = low; i <= high; i++) {
-            double temp = kernel.f(i - center, kernel.ctx);
-            weights[y * dst_h + CLAMP(i, 0, border)] += temp;
-            norm += temp;
+            double temp_val = kernel.f(i - center, kernel.ctx);
+            if (temp_val == 0.0) continue;
+            norm += temp_val;
+            int temp_idx = CLAMP(i, 0, border);
+            if (row_ptr[y] != nnz && temp_idx == col_idx[nnz - 1]) {
+                values[nnz - 1] += temp_val;
+                continue;
+            }
+            values[nnz] = temp_val;
+            col_idx[nnz] = temp_idx;
+            nnz++;
         }
-        for (int i = CLAMP(low, 0, border); i <= CLAMP(high, 0, border); i++) {
-            weights[y * dst_h + i] /= norm;
+        for (int i = row_ptr[y]; i < nnz; i++) {
+            values[i] /= norm;
         }
+        row_ptr[y + 1] = nnz;
     }
     
-    double *matrix = (double *)mkl_malloc(sizeof(double) * dst_h * dst_h, 64);
-    cblas_dsyrk(CblasRowMajor, CblasUpper, CblasTrans, dst_h, src_h, 1.0, weights, dst_h, 0.0, matrix, dst_h);
-    for (int i = 0; i < dst_h; i++) matrix[i * dst_h + i] += lambda;
+    double  *reg_values  = mkl_malloc(sizeof(double) * dst_h, 64);
+    MKL_INT *reg_col_idx = mkl_malloc(sizeof(MKL_INT) * dst_h, 64);
+    MKL_INT *reg_row_ptr = mkl_malloc(sizeof(MKL_INT) * (dst_h + 1), 64);
+    reg_row_ptr[0] = 0;
     
-    double *src_buf = (double *)mkl_malloc(sizeof(double) * src_w * src_h, 64);
-    float_to_double(srcp, src_buf, src_w, src_h, dst_stride);
+    for (int i = 0; i < dst_h; i++) {
+        reg_values[i] = lambda;
+        reg_col_idx[i] = i;
+        reg_row_ptr[i + 1] = i + 1;
+    }
     
-    double *dst_buf = (double *)mkl_malloc(sizeof(double) * src_w * dst_h, 64);
-    cblas_dgemm(CblasRowMajor, CblasTrans, CblasNoTrans, dst_h, src_w, src_h, 1.0, weights, dst_h, src_buf, src_w, 0.0, dst_buf, src_w);
-    LAPACKE_dposv(LAPACK_ROW_MAJOR, 'U', dst_h, src_w, matrix, dst_h, dst_buf, src_w);
+    sparse_matrix_t weights, matrix, reg, reg_matrix;
+    mkl_sparse_d_create_csr(&weights, SPARSE_INDEX_BASE_ZERO, src_h, dst_h, row_ptr, row_ptr + 1, col_idx, values);
+    mkl_sparse_syrk(SPARSE_OPERATION_TRANSPOSE, weights, &matrix);
+    mkl_sparse_d_create_csr(
+        &reg, SPARSE_INDEX_BASE_ZERO, dst_h, dst_h, reg_row_ptr, reg_row_ptr + 1, reg_col_idx, reg_values
+    );
+    mkl_sparse_d_add(SPARSE_OPERATION_NON_TRANSPOSE, matrix, 1.0, reg, &reg_matrix);
     
-    double_to_float(dst_buf, dstp, src_w, dst_h, dst_stride);
+    double *src_buf = (double *)mkl_malloc(sizeof(double) * src_h, 64);
+    double *tmp_buf = (double *)mkl_malloc(sizeof(double) * dst_h, 64);
+    double *dst_buf = (double *)mkl_malloc(sizeof(double) * dst_h, 64);
     
+#ifdef __AVX2__
+    ptrdiff_t src_stride = (src_h + 7) / 8 * 8;
+    ptrdiff_t dst_stride = (dst_h + 7) / 8 * 8;
+    
+    float *src_buf_tr = (float *)mkl_malloc(sizeof(float) * src_stride * 8, 64);
+    float *dst_buf_tr = (float *)mkl_malloc(sizeof(float) * dst_stride * 8, 64);
+    
+    int tail_w = src_w % 8;
+    int mod8_w = src_w - tail_w;
+    
+    int tail_src = src_h % 8;
+    int mod8_h_src = src_h - tail_src;
+    
+    int32_t mask_arr_src[8] = {0};
+    for (int i = 0; i < tail_src; i++) mask_arr_src[i] = -1;
+    __m256i tail_mask_src = _mm256_loadu_si256((__m256i *)mask_arr_src);
+    __m256i tail_mask_src_0 = _mm256_cvtepi32_epi64(_mm256_extracti128_si256(tail_mask_src, 0));
+    __m256i tail_mask_src_1 = _mm256_cvtepi32_epi64(_mm256_extracti128_si256(tail_mask_src, 1));
+    
+    int tail_dst = dst_h % 8;
+    int mod8_h_dst = dst_h - tail_dst;
+    
+    int64_t mask_arr_dst[8] = {0};
+    for (int i = 0; i < tail_dst; i++) mask_arr_dst[i] = -1LL;
+    __m256i tail_mask_dst_0 = _mm256_loadu_si256((__m256i *)mask_arr_dst);
+    __m256i tail_mask_dst_1 = _mm256_loadu_si256((__m256i *)(mask_arr_dst + 4));
+#endif
+    
+    struct matrix_descr descr;
+    descr.type = SPARSE_MATRIX_TYPE_GENERAL;
+    mkl_sparse_set_mv_hint(weights, SPARSE_OPERATION_TRANSPOSE, descr, src_w);
+    mkl_sparse_optimize(weights);
+    
+    sparse_index_base_t indexing;
+    MKL_INT *rows_startC, *rows_endC, *colsC;
+    double *valsC;
+    MKL_INT nrows, ncols;
+    mkl_sparse_d_export_csr(reg_matrix, &indexing, &nrows, &ncols, &rows_startC, &rows_endC, &colsC, &valsC);
+    
+    void *pt[64] = {0};
+    MKL_INT iparm[64] = {0};
+    MKL_INT maxfct = 1, mnum = 1, phase, error = 0, msglvl = 0, mtype = 2;
+    iparm[0] = 1;
+    iparm[1] = 2;
+    iparm[7] = 2;
+    iparm[9] = 8;
+    iparm[20] = 1;
+    iparm[24] = 1;
+    iparm[34] = 1;
+    MKL_INT n = nrows, nrhs = 1;
+    
+    phase = 12;
+    PARDISO(
+        pt, &maxfct, &mnum, &mtype, &phase,
+        &n, valsC, rows_startC, colsC,
+        NULL, &nrhs, iparm, &msglvl, tmp_buf, dst_buf, &error
+    );
+    
+    phase = 33;
+    
+#ifdef __AVX2__
+    for (int x = 0; x < mod8_w; x += 8) {
+        float *srcp_buf_tr = src_buf_tr;
+        float *dstp_buf_tr = dst_buf_tr;
+        int y = 0;
+        for (; y < mod8_h_src; y += 8) {
+            __m256 line_0 = _mm256_load_ps(srcp + stride * (y + 0));
+            __m256 line_1 = _mm256_load_ps(srcp + stride * (y + 1));
+            __m256 line_2 = _mm256_load_ps(srcp + stride * (y + 2));
+            __m256 line_3 = _mm256_load_ps(srcp + stride * (y + 3));
+            __m256 line_4 = _mm256_load_ps(srcp + stride * (y + 4));
+            __m256 line_5 = _mm256_load_ps(srcp + stride * (y + 5));
+            __m256 line_6 = _mm256_load_ps(srcp + stride * (y + 6));
+            __m256 line_7 = _mm256_load_ps(srcp + stride * (y + 7));
+            _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+            _mm256_store_ps(src_buf_tr + src_stride * 0 + y, line_0);
+            _mm256_store_ps(src_buf_tr + src_stride * 1 + y, line_1);
+            _mm256_store_ps(src_buf_tr + src_stride * 2 + y, line_2);
+            _mm256_store_ps(src_buf_tr + src_stride * 3 + y, line_3);
+            _mm256_store_ps(src_buf_tr + src_stride * 4 + y, line_4);
+            _mm256_store_ps(src_buf_tr + src_stride * 5 + y, line_5);
+            _mm256_store_ps(src_buf_tr + src_stride * 6 + y, line_6);
+            _mm256_store_ps(src_buf_tr + src_stride * 7 + y, line_7);
+        }
+        if (tail_src) {
+            __m256 line_0 = _mm256_load_ps(srcp + stride * (y + 0));
+            __m256 line_1 = (tail_src > 1) ? _mm256_load_ps(srcp + stride * (y + 1)) : _mm256_setzero_ps();
+            __m256 line_2 = (tail_src > 2) ? _mm256_load_ps(srcp + stride * (y + 2)) : _mm256_setzero_ps();
+            __m256 line_3 = (tail_src > 3) ? _mm256_load_ps(srcp + stride * (y + 3)) : _mm256_setzero_ps();
+            __m256 line_4 = (tail_src > 4) ? _mm256_load_ps(srcp + stride * (y + 4)) : _mm256_setzero_ps();
+            __m256 line_5 = (tail_src > 5) ? _mm256_load_ps(srcp + stride * (y + 5)) : _mm256_setzero_ps();
+            __m256 line_6 = (tail_src > 6) ? _mm256_load_ps(srcp + stride * (y + 6)) : _mm256_setzero_ps();
+            __m256 line_7 = _mm256_setzero_ps();
+            _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+            _mm256_store_ps(src_buf_tr + src_stride * 0 + y, line_0);
+            _mm256_store_ps(src_buf_tr + src_stride * 1 + y, line_1);
+            _mm256_store_ps(src_buf_tr + src_stride * 2 + y, line_2);
+            _mm256_store_ps(src_buf_tr + src_stride * 3 + y, line_3);
+            _mm256_store_ps(src_buf_tr + src_stride * 4 + y, line_4);
+            _mm256_store_ps(src_buf_tr + src_stride * 5 + y, line_5);
+            _mm256_store_ps(src_buf_tr + src_stride * 6 + y, line_6);
+            _mm256_store_ps(src_buf_tr + src_stride * 7 + y, line_7);
+        }
+        for (int i = 0; i < 8; i++) {
+            int j = 0;
+            for (; j < mod8_h_src; j += 8) {
+                __m256 pix = _mm256_load_ps(srcp_buf_tr + j);
+                _mm256_store_pd(src_buf + j, _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)));
+                _mm256_store_pd(src_buf + j + 4, _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)));
+            }
+            if (tail_src) {
+                __m256 pix = _mm256_maskload_ps(srcp_buf_tr + j, tail_mask_src);
+                _mm256_maskstore_pd(src_buf + j, tail_mask_src_0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)));
+                _mm256_maskstore_pd(src_buf + j + 4, tail_mask_src_1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)));
+            }
+            mkl_sparse_d_mv(SPARSE_OPERATION_TRANSPOSE, 1.0, weights, descr, src_buf, 0.0, tmp_buf);
+            PARDISO(
+                pt, &maxfct, &mnum, &mtype, &phase,
+                &n, valsC, rows_startC, colsC,
+                NULL, &nrhs, iparm, &msglvl, tmp_buf, dst_buf, &error
+            );
+            j = 0;
+            for (; j < mod8_h_dst; j += 8) {
+                __m128 pix_0 = _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + j));
+                __m128 pix_1 = _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + j + 4));
+                _mm256_store_ps(dstp_buf_tr + j, _mm256_setr_m128(pix_0, pix_1));
+            }
+            if (tail_dst) {
+                __m128 pix_0 = _mm256_cvtpd_ps(_mm256_maskload_pd(dst_buf + j, tail_mask_dst_0));
+                __m128 pix_1 = _mm256_cvtpd_ps(_mm256_maskload_pd(dst_buf + j + 4, tail_mask_dst_1));
+                _mm256_store_ps(dstp_buf_tr + j, _mm256_setr_m128(pix_0, pix_1));
+            }
+            srcp_buf_tr += src_stride;
+            dstp_buf_tr += dst_stride;
+        }
+        y = 0;
+        for (; y < mod8_h_dst; y += 8) {
+            __m256 line_0 = _mm256_load_ps(dst_buf_tr + dst_stride * 0 + y);
+            __m256 line_1 = _mm256_load_ps(dst_buf_tr + dst_stride * 1 + y);
+            __m256 line_2 = _mm256_load_ps(dst_buf_tr + dst_stride * 2 + y);
+            __m256 line_3 = _mm256_load_ps(dst_buf_tr + dst_stride * 3 + y);
+            __m256 line_4 = _mm256_load_ps(dst_buf_tr + dst_stride * 4 + y);
+            __m256 line_5 = _mm256_load_ps(dst_buf_tr + dst_stride * 5 + y);
+            __m256 line_6 = _mm256_load_ps(dst_buf_tr + dst_stride * 6 + y);
+            __m256 line_7 = _mm256_load_ps(dst_buf_tr + dst_stride * 7 + y);
+            _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+            _mm256_stream_ps(dstp + stride * (y + 0), line_0);
+            _mm256_stream_ps(dstp + stride * (y + 1), line_1);
+            _mm256_stream_ps(dstp + stride * (y + 2), line_2);
+            _mm256_stream_ps(dstp + stride * (y + 3), line_3);
+            _mm256_stream_ps(dstp + stride * (y + 4), line_4);
+            _mm256_stream_ps(dstp + stride * (y + 5), line_5);
+            _mm256_stream_ps(dstp + stride * (y + 6), line_6);
+            _mm256_stream_ps(dstp + stride * (y + 7), line_7);
+        }
+        if (tail_dst) {
+            __m256 line_0 = _mm256_load_ps(dst_buf_tr + dst_stride * 0 + y);
+            __m256 line_1 = _mm256_load_ps(dst_buf_tr + dst_stride * 1 + y);
+            __m256 line_2 = _mm256_load_ps(dst_buf_tr + dst_stride * 2 + y);
+            __m256 line_3 = _mm256_load_ps(dst_buf_tr + dst_stride * 3 + y);
+            __m256 line_4 = _mm256_load_ps(dst_buf_tr + dst_stride * 4 + y);
+            __m256 line_5 = _mm256_load_ps(dst_buf_tr + dst_stride * 5 + y);
+            __m256 line_6 = _mm256_load_ps(dst_buf_tr + dst_stride * 6 + y);
+            __m256 line_7 = _mm256_load_ps(dst_buf_tr + dst_stride * 7 + y);
+            _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+            _mm256_stream_ps(dstp + stride * (y + 0), line_0);
+            if (tail_dst > 1) _mm256_stream_ps(dstp + stride * (y + 1), line_1);
+            if (tail_dst > 2) _mm256_stream_ps(dstp + stride * (y + 2), line_2);
+            if (tail_dst > 3) _mm256_stream_ps(dstp + stride * (y + 3), line_3);
+            if (tail_dst > 4) _mm256_stream_ps(dstp + stride * (y + 4), line_4);
+            if (tail_dst > 5) _mm256_stream_ps(dstp + stride * (y + 5), line_5);
+            if (tail_dst > 6) _mm256_stream_ps(dstp + stride * (y + 6), line_6);
+        }
+        srcp += 8;
+        dstp += 8;
+    }
+    if (tail_w) {
+        float *srcp_buf_tr = src_buf_tr;
+        float *dstp_buf_tr = dst_buf_tr;
+        int y = 0;
+        for (; y < mod8_h_src; y += 8) {
+            __m256 line_0 = _mm256_load_ps(srcp + stride * (y + 0));
+            __m256 line_1 = _mm256_load_ps(srcp + stride * (y + 1));
+            __m256 line_2 = _mm256_load_ps(srcp + stride * (y + 2));
+            __m256 line_3 = _mm256_load_ps(srcp + stride * (y + 3));
+            __m256 line_4 = _mm256_load_ps(srcp + stride * (y + 4));
+            __m256 line_5 = _mm256_load_ps(srcp + stride * (y + 5));
+            __m256 line_6 = _mm256_load_ps(srcp + stride * (y + 6));
+            __m256 line_7 = _mm256_load_ps(srcp + stride * (y + 7));
+            _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+            _mm256_store_ps(src_buf_tr + src_stride * 0 + y, line_0);
+            _mm256_store_ps(src_buf_tr + src_stride * 1 + y, line_1);
+            _mm256_store_ps(src_buf_tr + src_stride * 2 + y, line_2);
+            _mm256_store_ps(src_buf_tr + src_stride * 3 + y, line_3);
+            _mm256_store_ps(src_buf_tr + src_stride * 4 + y, line_4);
+            _mm256_store_ps(src_buf_tr + src_stride * 5 + y, line_5);
+            _mm256_store_ps(src_buf_tr + src_stride * 6 + y, line_6);
+            _mm256_store_ps(src_buf_tr + src_stride * 7 + y, line_7);
+        }
+        if (tail_src) {
+            __m256 line_0 = _mm256_load_ps(srcp + stride * (y + 0));
+            __m256 line_1 = (tail_src > 1) ? _mm256_load_ps(srcp + stride * (y + 1)) : _mm256_setzero_ps();
+            __m256 line_2 = (tail_src > 2) ? _mm256_load_ps(srcp + stride * (y + 2)) : _mm256_setzero_ps();
+            __m256 line_3 = (tail_src > 3) ? _mm256_load_ps(srcp + stride * (y + 3)) : _mm256_setzero_ps();
+            __m256 line_4 = (tail_src > 4) ? _mm256_load_ps(srcp + stride * (y + 4)) : _mm256_setzero_ps();
+            __m256 line_5 = (tail_src > 5) ? _mm256_load_ps(srcp + stride * (y + 5)) : _mm256_setzero_ps();
+            __m256 line_6 = (tail_src > 6) ? _mm256_load_ps(srcp + stride * (y + 6)) : _mm256_setzero_ps();
+            __m256 line_7 = _mm256_setzero_ps();
+            _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+            _mm256_store_ps(src_buf_tr + src_stride * 0 + y, line_0);
+            _mm256_store_ps(src_buf_tr + src_stride * 1 + y, line_1);
+            _mm256_store_ps(src_buf_tr + src_stride * 2 + y, line_2);
+            _mm256_store_ps(src_buf_tr + src_stride * 3 + y, line_3);
+            _mm256_store_ps(src_buf_tr + src_stride * 4 + y, line_4);
+            _mm256_store_ps(src_buf_tr + src_stride * 5 + y, line_5);
+            _mm256_store_ps(src_buf_tr + src_stride * 6 + y, line_6);
+            _mm256_store_ps(src_buf_tr + src_stride * 7 + y, line_7);
+        }
+        for (int i = 0; i < tail_w; i++) {
+            int j = 0;
+            for (; j < mod8_h_src; j += 8) {
+                __m256 pix = _mm256_load_ps(srcp_buf_tr + j);
+                _mm256_store_pd(src_buf + j, _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)));
+                _mm256_store_pd(src_buf + j + 4, _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)));
+            }
+            if (tail_src) {
+                __m256 pix = _mm256_maskload_ps(srcp_buf_tr + j, tail_mask_src);
+                _mm256_maskstore_pd(src_buf + j, tail_mask_src_0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)));
+                _mm256_maskstore_pd(src_buf + j + 4, tail_mask_src_1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)));
+            }
+            mkl_sparse_d_mv(SPARSE_OPERATION_TRANSPOSE, 1.0, weights, descr, src_buf, 0.0, tmp_buf);
+            PARDISO(
+                pt, &maxfct, &mnum, &mtype, &phase,
+                &n, valsC, rows_startC, colsC,
+                NULL, &nrhs, iparm, &msglvl, tmp_buf, dst_buf, &error
+            );
+            j = 0;
+            for (; j < mod8_h_dst; j += 8) {
+                __m128 pix_0 = _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + j));
+                __m128 pix_1 = _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + j + 4));
+                _mm256_store_ps(dstp_buf_tr + j, _mm256_setr_m128(pix_0, pix_1));
+            }
+            if (tail_dst) {
+                __m128 pix_0 = _mm256_cvtpd_ps(_mm256_maskload_pd(dst_buf + j, tail_mask_dst_0));
+                __m128 pix_1 = _mm256_cvtpd_ps(_mm256_maskload_pd(dst_buf + j + 4, tail_mask_dst_1));
+                _mm256_store_ps(dstp_buf_tr + j, _mm256_setr_m128(pix_0, pix_1));
+            }
+            srcp_buf_tr += src_stride;
+            dstp_buf_tr += dst_stride;
+        }
+        y = 0;
+        for (; y < mod8_h_dst; y += 8) {
+            __m256 line_0 = _mm256_load_ps(dst_buf_tr + dst_stride * 0 + y);
+            __m256 line_1 = _mm256_load_ps(dst_buf_tr + dst_stride * 1 + y);
+            __m256 line_2 = _mm256_load_ps(dst_buf_tr + dst_stride * 2 + y);
+            __m256 line_3 = _mm256_load_ps(dst_buf_tr + dst_stride * 3 + y);
+            __m256 line_4 = _mm256_load_ps(dst_buf_tr + dst_stride * 4 + y);
+            __m256 line_5 = _mm256_load_ps(dst_buf_tr + dst_stride * 5 + y);
+            __m256 line_6 = _mm256_load_ps(dst_buf_tr + dst_stride * 6 + y);
+            __m256 line_7 = _mm256_load_ps(dst_buf_tr + dst_stride * 7 + y);
+            _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+            _mm256_stream_ps(dstp + stride * (y + 0), line_0);
+            _mm256_stream_ps(dstp + stride * (y + 1), line_1);
+            _mm256_stream_ps(dstp + stride * (y + 2), line_2);
+            _mm256_stream_ps(dstp + stride * (y + 3), line_3);
+            _mm256_stream_ps(dstp + stride * (y + 4), line_4);
+            _mm256_stream_ps(dstp + stride * (y + 5), line_5);
+            _mm256_stream_ps(dstp + stride * (y + 6), line_6);
+            _mm256_stream_ps(dstp + stride * (y + 7), line_7);
+        }
+        if (tail_dst) {
+            __m256 line_0 = _mm256_load_ps(dst_buf_tr + dst_stride * 0 + y);
+            __m256 line_1 = _mm256_load_ps(dst_buf_tr + dst_stride * 1 + y);
+            __m256 line_2 = _mm256_load_ps(dst_buf_tr + dst_stride * 2 + y);
+            __m256 line_3 = _mm256_load_ps(dst_buf_tr + dst_stride * 3 + y);
+            __m256 line_4 = _mm256_load_ps(dst_buf_tr + dst_stride * 4 + y);
+            __m256 line_5 = _mm256_load_ps(dst_buf_tr + dst_stride * 5 + y);
+            __m256 line_6 = _mm256_load_ps(dst_buf_tr + dst_stride * 6 + y);
+            __m256 line_7 = _mm256_load_ps(dst_buf_tr + dst_stride * 7 + y);
+            _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+            _mm256_stream_ps(dstp + stride * (y + 0), line_0);
+            if (tail_dst > 1) _mm256_stream_ps(dstp + stride * (y + 1), line_1);
+            if (tail_dst > 2) _mm256_stream_ps(dstp + stride * (y + 2), line_2);
+            if (tail_dst > 3) _mm256_stream_ps(dstp + stride * (y + 3), line_3);
+            if (tail_dst > 4) _mm256_stream_ps(dstp + stride * (y + 4), line_4);
+            if (tail_dst > 5) _mm256_stream_ps(dstp + stride * (y + 5), line_5);
+            if (tail_dst > 6) _mm256_stream_ps(dstp + stride * (y + 6), line_6);
+        }
+    }
+    _mm_sfence();
+#else
+    for (int x = 0; x < src_w; x++) {
+        for (int y = 0; y < src_h; y++) {
+            src_buf[y] = (double)srcp[y * stride];
+        }
+        mkl_sparse_d_mv(SPARSE_OPERATION_TRANSPOSE, 1.0, weights, descr, src_buf, 0.0, tmp_buf);
+        PARDISO(
+            pt, &maxfct, &mnum, &mtype, &phase,
+            &n, valsC, rows_startC, colsC,
+            NULL, &nrhs, iparm, &msglvl, tmp_buf, dst_buf, &error
+        );
+        for (int y = 0; y < dst_h; y++) {
+            dstp[y * stride] = (float)dst_buf[y];
+        }
+        srcp++;
+        dstp++;
+    }
+#endif
+    
+    phase = -1;
+    PARDISO(
+        pt, &maxfct, &mnum, &mtype, &phase,
+        &n, valsC, rows_startC, colsC,
+        NULL, &nrhs, iparm, &msglvl, tmp_buf, dst_buf, &error
+    );
+    
+    mkl_sparse_destroy(reg_matrix);
+    mkl_sparse_destroy(reg);
+    mkl_sparse_destroy(matrix);
+    mkl_sparse_destroy(weights);
     mkl_free(dst_buf);
+    mkl_free(tmp_buf);
     mkl_free(src_buf);
-    mkl_free(matrix);
-    mkl_free(weights);
+#ifdef __AVX2__
+    mkl_free(dst_buf_tr);
+    mkl_free(src_buf_tr);
+#endif
+    mkl_free(reg_row_ptr);
+    mkl_free(reg_col_idx);
+    mkl_free(reg_values);
+    mkl_free(values);
+    mkl_free(row_ptr);
+    mkl_free(col_idx);
 }
 
 static const VSFrame *VS_CC DescaleGetFrame(
-    int n, int activationReason, void *instanceData, void **frameData,
+    int n, int activationReason, void *instanceData, void **frameData UNUSED,
     VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi
 ) {
-    (void)frameData;
     DescaleData *d = (DescaleData *)instanceData;
     
     if (activationReason == arInitial) {
@@ -2305,8 +2741,7 @@ static const VSFrame *VS_CC DescaleGetFrame(
     return NULL;
 }
 
-static void VS_CC DescaleFree(void *instanceData, VSCore *core, const VSAPI *vsapi) {
-    (void)core;
+static void VS_CC DescaleFree(void *instanceData, VSCore *core UNUSED, const VSAPI *vsapi) {
     DescaleData *d = (DescaleData *)instanceData;
     vsapi->freeNode(d->node);
     
@@ -2321,8 +2756,7 @@ static void VS_CC DescaleFree(void *instanceData, VSCore *core, const VSAPI *vsa
     free(d);
 }
 
-static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core, const VSAPI *vsapi) {
-    (void)userData;
+static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData UNUSED, VSCore *core, const VSAPI *vsapi) {
     DescaleData d;
     d.node = vsapi->mapGetNode(in, "clip", 0, NULL);
     d.vi = *vsapi->getVideoInfo(d.node);
@@ -2593,10 +3027,9 @@ typedef struct {
 } RelativeErrorData;
 
 static const VSFrame *VS_CC RelativeErrorGetFrame(
-    int n, int activationReason, void *instanceData, void **frameData,
+    int n, int activationReason, void *instanceData, void **frameData UNUSED,
     VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi
 ) {
-    (void)frameData;
     RelativeErrorData *d = (RelativeErrorData *)instanceData;
     
     if (activationReason == arInitial) {
@@ -2634,16 +3067,16 @@ static const VSFrame *VS_CC RelativeErrorGetFrame(
     return NULL;
 }
 
-static void VS_CC RelativeErrorFree(void *instanceData, VSCore *core, const VSAPI *vsapi) {
-    (void)core;
+static void VS_CC RelativeErrorFree(void *instanceData, VSCore *core UNUSED, const VSAPI *vsapi) {
     RelativeErrorData *d = (RelativeErrorData *)instanceData;
     vsapi->freeNode(d->node0);
     vsapi->freeNode(d->node1);
     free(d);
 }
 
-static void VS_CC RelativeErrorCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core, const VSAPI *vsapi) {
-    (void)userData;
+static void VS_CC RelativeErrorCreate(
+    const VSMap *in, VSMap *out, void *userData UNUSED, VSCore *core, const VSAPI *vsapi
+) {
     RelativeErrorData d;
     d.node0 = vsapi->mapGetNode(in, "clip0", 0, NULL);
     d.node1 = vsapi->mapGetNode(in, "clip1", 0, NULL);
@@ -2679,10 +3112,9 @@ typedef struct {
 } GammaData;
 
 static const VSFrame *VS_CC LinearizeGetFrame(
-    int n, int activationReason, void *instanceData, void **frameData,
+    int n, int activationReason, void *instanceData, void **frameData UNUSED,
     VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi
 ) {
-    (void)frameData;
     GammaData *d = (GammaData *)instanceData;
     
     if (activationReason == arInitial) {
@@ -2719,15 +3151,15 @@ static const VSFrame *VS_CC LinearizeGetFrame(
     return NULL;
 }
 
-static void VS_CC LinearizeFree(void *instanceData, VSCore *core, const VSAPI *vsapi) {
-    (void)core;
+static void VS_CC LinearizeFree(void *instanceData, VSCore *core UNUSED, const VSAPI *vsapi) {
     GammaData *d = (GammaData *)instanceData;
     vsapi->freeNode(d->node);
     free(d);
 }
 
-static void VS_CC LinearizeCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core, const VSAPI *vsapi) {
-    (void)userData;
+static void VS_CC LinearizeCreate(
+    const VSMap *in, VSMap *out, void *userData UNUSED, VSCore *core, const VSAPI *vsapi
+) {
     GammaData d;
     d.node = vsapi->mapGetNode(in, "clip", 0, NULL);
     d.vi = *vsapi->getVideoInfo(d.node);
@@ -2783,10 +3215,9 @@ static void VS_CC LinearizeCreate(const VSMap *in, VSMap *out, void *userData, V
 }
 
 static const VSFrame *VS_CC GammaCorrGetFrame(
-    int n, int activationReason, void *instanceData, void **frameData,
+    int n, int activationReason, void *instanceData, void **frameData UNUSED,
     VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi
 ) {
-    (void)frameData;
     GammaData *d = (GammaData *)instanceData;
     
     if (activationReason == arInitial) {
@@ -2823,15 +3254,15 @@ static const VSFrame *VS_CC GammaCorrGetFrame(
     return NULL;
 }
 
-static void VS_CC GammaCorrFree(void *instanceData, VSCore *core, const VSAPI *vsapi) {
-    (void)core;
+static void VS_CC GammaCorrFree(void *instanceData, VSCore *core UNUSED, const VSAPI *vsapi) {
     GammaData *d = (GammaData *)instanceData;
     vsapi->freeNode(d->node);
     free(d);
 }
 
-static void VS_CC GammaCorrCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core, const VSAPI *vsapi) {
-    (void)userData;
+static void VS_CC GammaCorrCreate(
+    const VSMap *in, VSMap *out, void *userData UNUSED, VSCore *core, const VSAPI *vsapi
+) {
     GammaData d;
     d.node = vsapi->mapGetNode(in, "clip", 0, NULL);
     d.vi = *vsapi->getVideoInfo(d.node);
@@ -2893,10 +3324,9 @@ typedef struct {
 } BitDepthData;
 
 static const VSFrame *VS_CC BitDepthGetFrame(
-    int n, int activationReason, void *instanceData, void **frameData,
+    int n, int activationReason, void *instanceData, void **frameData UNUSED,
     VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi
 ) {
-    (void)frameData;
     BitDepthData *d = (BitDepthData *)instanceData;
     
     if (activationReason == arInitial) {
@@ -2957,15 +3387,15 @@ static const VSFrame *VS_CC BitDepthGetFrame(
     return NULL;
 }
 
-static void VS_CC BitDepthFree(void *instanceData, VSCore *core, const VSAPI *vsapi) {
-    (void)core;
+static void VS_CC BitDepthFree(void *instanceData, VSCore *core UNUSED, const VSAPI *vsapi) {
     BitDepthData *d = (BitDepthData *)instanceData;
     vsapi->freeNode(d->node);
     free(d);
 }
 
-static void VS_CC BitDepthCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core, const VSAPI *vsapi) {
-    (void)userData;
+static void VS_CC BitDepthCreate(
+    const VSMap *in, VSMap *out, void *userData UNUSED, VSCore *core, const VSAPI *vsapi
+) {
     BitDepthData d;
     d.node = vsapi->mapGetNode(in, "clip", 0, NULL);
     d.vi = *vsapi->getVideoInfo(d.node);
@@ -3013,7 +3443,7 @@ static void VS_CC BitDepthCreate(const VSMap *in, VSMap *out, void *userData, VS
 }
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
-    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(11, 3), VAPOURSYNTH_API_VERSION, 0, plugin);
+    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(12, 0), VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction("Resize",
                              "clip:vnode;"
                              "width:int;"

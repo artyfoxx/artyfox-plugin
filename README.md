@@ -54,7 +54,7 @@ Descaling via Tikhonov regularization and Cholesky decomposition. This is still 
 * `src_top`: The `y` coordinate of the point where the destination region after descaling starts. Defaults to 0.0
 * `src_width`: The width of the destination region after descaling relative to `src_left`. Defaults to `width`.
 * `src_height`: The height of the destination region after descaling relative to `src_top`. Defaults to `height`.
-* `kernel`: Selecting a kernel for convolution. See `Resize` for possible values.
+* `kernel`: Selecting a kernel for deconvolution. See `Resize` for possible values.
 * `b`: The `b` parameter in the `bicubic` kernel. Defaults to 1/3.
 * `c`: The `c` parameter in the `bicubic` kernel. Defaults to 1/3.
 * `taps`: Window radius value for `blackman`, `gauss`, `kaiser`, `lanczos` and `nuttall` kernels. Default is 3.
