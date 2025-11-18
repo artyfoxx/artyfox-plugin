@@ -9,6 +9,7 @@
 #include "VapourSynth4.h"
 #include "VSHelper4.h"
 
+#define ALWAYS_INLINE __attribute__((always_inline))
 #define UNUSED __attribute__((unused))
 #define CLAMP(x, min, max) ((x) > (max) ? (max) : ((x) < (min) ? (min) : (x))) 
 #define M_PI 3.14159265358979323846
@@ -871,35 +872,6 @@ static void float_to_uint16(
     _mm_sfence();
 }
 
-static void float_to_double(
-    const float *restrict srcp, double *restrict dstp, int src_w, int src_h, ptrdiff_t stride
-) {
-    int tail = src_w % 8;
-    int mod8_w = src_w - tail;
-    
-    int32_t mask_arr[8] = {0};
-    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
-    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
-    __m256i store_mask_0 = _mm256_cvtepi32_epi64(_mm256_extracti128_si256(tail_mask, 0));
-    __m256i store_mask_1 = _mm256_cvtepi32_epi64(_mm256_extracti128_si256(tail_mask, 1));
-    
-    for (int y = 0; y < src_h; y++) {
-        int x = 0;
-        for (; x < mod8_w; x += 8) {
-            __m256 pix = _mm256_load_ps(srcp + x);
-            _mm256_storeu_pd(dstp + x, _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)));
-            _mm256_storeu_pd(dstp + x + 4, _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)));
-        }
-        if (tail) {
-            __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
-            _mm256_maskstore_pd(dstp + x, store_mask_0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)));
-            _mm256_maskstore_pd(dstp + x + 4, store_mask_1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)));
-        }
-        srcp += stride;
-        dstp += src_w;
-    }
-}
-
 static void sharp_width(
     const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h, float sharp
 ) {
@@ -1011,6 +983,334 @@ static void sharp_height(
     }
 }
 
+typedef void (*transpose_block_horizontally_func)(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int x
+);
+
+static inline ALWAYS_INLINE void transpose_block_into_buffer_horizontally(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int x
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + x + stride * 0);
+    __m256 line_1 = _mm256_load_ps(srcp + x + stride * 1);
+    __m256 line_2 = _mm256_load_ps(srcp + x + stride * 2);
+    __m256 line_3 = _mm256_load_ps(srcp + x + stride * 3);
+    __m256 line_4 = _mm256_load_ps(srcp + x + stride * 4);
+    __m256 line_5 = _mm256_load_ps(srcp + x + stride * 5);
+    __m256 line_6 = _mm256_load_ps(srcp + x + stride * 6);
+    __m256 line_7 = _mm256_load_ps(srcp + x + stride * 7);
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_store_ps(dstp + x * 8 + 0, line_0);
+    _mm256_store_ps(dstp + x * 8 + 8, line_1);
+    _mm256_store_ps(dstp + x * 8 + 16, line_2);
+    _mm256_store_ps(dstp + x * 8 + 24, line_3);
+    _mm256_store_ps(dstp + x * 8 + 32, line_4);
+    _mm256_store_ps(dstp + x * 8 + 40, line_5);
+    _mm256_store_ps(dstp + x * 8 + 48, line_6);
+    _mm256_store_ps(dstp + x * 8 + 56, line_7);
+}
+
+static void transpose_block_into_buffer_horizontally_tail_1(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int x
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + x + stride * 0);
+    __m256 line_1 = _mm256_setzero_ps();
+    __m256 line_2 = _mm256_setzero_ps();
+    __m256 line_3 = _mm256_setzero_ps();
+    __m256 line_4 = _mm256_setzero_ps();
+    __m256 line_5 = _mm256_setzero_ps();
+    __m256 line_6 = _mm256_setzero_ps();
+    __m256 line_7 = _mm256_setzero_ps();
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_store_ps(dstp + x * 8 + 0, line_0);
+    _mm256_store_ps(dstp + x * 8 + 8, line_1);
+    _mm256_store_ps(dstp + x * 8 + 16, line_2);
+    _mm256_store_ps(dstp + x * 8 + 24, line_3);
+    _mm256_store_ps(dstp + x * 8 + 32, line_4);
+    _mm256_store_ps(dstp + x * 8 + 40, line_5);
+    _mm256_store_ps(dstp + x * 8 + 48, line_6);
+    _mm256_store_ps(dstp + x * 8 + 56, line_7);
+}
+
+static void transpose_block_into_buffer_horizontally_tail_2(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int x
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + x + stride * 0);
+    __m256 line_1 = _mm256_load_ps(srcp + x + stride * 1);
+    __m256 line_2 = _mm256_setzero_ps();
+    __m256 line_3 = _mm256_setzero_ps();
+    __m256 line_4 = _mm256_setzero_ps();
+    __m256 line_5 = _mm256_setzero_ps();
+    __m256 line_6 = _mm256_setzero_ps();
+    __m256 line_7 = _mm256_setzero_ps();
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_store_ps(dstp + x * 8 + 0, line_0);
+    _mm256_store_ps(dstp + x * 8 + 8, line_1);
+    _mm256_store_ps(dstp + x * 8 + 16, line_2);
+    _mm256_store_ps(dstp + x * 8 + 24, line_3);
+    _mm256_store_ps(dstp + x * 8 + 32, line_4);
+    _mm256_store_ps(dstp + x * 8 + 40, line_5);
+    _mm256_store_ps(dstp + x * 8 + 48, line_6);
+    _mm256_store_ps(dstp + x * 8 + 56, line_7);
+}
+
+static void transpose_block_into_buffer_horizontally_tail_3(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int x
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + x + stride * 0);
+    __m256 line_1 = _mm256_load_ps(srcp + x + stride * 1);
+    __m256 line_2 = _mm256_load_ps(srcp + x + stride * 2);
+    __m256 line_3 = _mm256_setzero_ps();
+    __m256 line_4 = _mm256_setzero_ps();
+    __m256 line_5 = _mm256_setzero_ps();
+    __m256 line_6 = _mm256_setzero_ps();
+    __m256 line_7 = _mm256_setzero_ps();
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_store_ps(dstp + x * 8 + 0, line_0);
+    _mm256_store_ps(dstp + x * 8 + 8, line_1);
+    _mm256_store_ps(dstp + x * 8 + 16, line_2);
+    _mm256_store_ps(dstp + x * 8 + 24, line_3);
+    _mm256_store_ps(dstp + x * 8 + 32, line_4);
+    _mm256_store_ps(dstp + x * 8 + 40, line_5);
+    _mm256_store_ps(dstp + x * 8 + 48, line_6);
+    _mm256_store_ps(dstp + x * 8 + 56, line_7);
+}
+
+static void transpose_block_into_buffer_horizontally_tail_4(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int x
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + x + stride * 0);
+    __m256 line_1 = _mm256_load_ps(srcp + x + stride * 1);
+    __m256 line_2 = _mm256_load_ps(srcp + x + stride * 2);
+    __m256 line_3 = _mm256_load_ps(srcp + x + stride * 3);
+    __m256 line_4 = _mm256_setzero_ps();
+    __m256 line_5 = _mm256_setzero_ps();
+    __m256 line_6 = _mm256_setzero_ps();
+    __m256 line_7 = _mm256_setzero_ps();
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_store_ps(dstp + x * 8 + 0, line_0);
+    _mm256_store_ps(dstp + x * 8 + 8, line_1);
+    _mm256_store_ps(dstp + x * 8 + 16, line_2);
+    _mm256_store_ps(dstp + x * 8 + 24, line_3);
+    _mm256_store_ps(dstp + x * 8 + 32, line_4);
+    _mm256_store_ps(dstp + x * 8 + 40, line_5);
+    _mm256_store_ps(dstp + x * 8 + 48, line_6);
+    _mm256_store_ps(dstp + x * 8 + 56, line_7);
+}
+
+static void transpose_block_into_buffer_horizontally_tail_5(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int x
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + x + stride * 0);
+    __m256 line_1 = _mm256_load_ps(srcp + x + stride * 1);
+    __m256 line_2 = _mm256_load_ps(srcp + x + stride * 2);
+    __m256 line_3 = _mm256_load_ps(srcp + x + stride * 3);
+    __m256 line_4 = _mm256_load_ps(srcp + x + stride * 4);
+    __m256 line_5 = _mm256_setzero_ps();
+    __m256 line_6 = _mm256_setzero_ps();
+    __m256 line_7 = _mm256_setzero_ps();
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_store_ps(dstp + x * 8 + 0, line_0);
+    _mm256_store_ps(dstp + x * 8 + 8, line_1);
+    _mm256_store_ps(dstp + x * 8 + 16, line_2);
+    _mm256_store_ps(dstp + x * 8 + 24, line_3);
+    _mm256_store_ps(dstp + x * 8 + 32, line_4);
+    _mm256_store_ps(dstp + x * 8 + 40, line_5);
+    _mm256_store_ps(dstp + x * 8 + 48, line_6);
+    _mm256_store_ps(dstp + x * 8 + 56, line_7);
+}
+
+static void transpose_block_into_buffer_horizontally_tail_6(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int x
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + x + stride * 0);
+    __m256 line_1 = _mm256_load_ps(srcp + x + stride * 1);
+    __m256 line_2 = _mm256_load_ps(srcp + x + stride * 2);
+    __m256 line_3 = _mm256_load_ps(srcp + x + stride * 3);
+    __m256 line_4 = _mm256_load_ps(srcp + x + stride * 4);
+    __m256 line_5 = _mm256_load_ps(srcp + x + stride * 5);
+    __m256 line_6 = _mm256_setzero_ps();
+    __m256 line_7 = _mm256_setzero_ps();
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_store_ps(dstp + x * 8 + 0, line_0);
+    _mm256_store_ps(dstp + x * 8 + 8, line_1);
+    _mm256_store_ps(dstp + x * 8 + 16, line_2);
+    _mm256_store_ps(dstp + x * 8 + 24, line_3);
+    _mm256_store_ps(dstp + x * 8 + 32, line_4);
+    _mm256_store_ps(dstp + x * 8 + 40, line_5);
+    _mm256_store_ps(dstp + x * 8 + 48, line_6);
+    _mm256_store_ps(dstp + x * 8 + 56, line_7);
+}
+
+static void transpose_block_into_buffer_horizontally_tail_7(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int x
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + x + stride * 0);
+    __m256 line_1 = _mm256_load_ps(srcp + x + stride * 1);
+    __m256 line_2 = _mm256_load_ps(srcp + x + stride * 2);
+    __m256 line_3 = _mm256_load_ps(srcp + x + stride * 3);
+    __m256 line_4 = _mm256_load_ps(srcp + x + stride * 4);
+    __m256 line_5 = _mm256_load_ps(srcp + x + stride * 5);
+    __m256 line_6 = _mm256_load_ps(srcp + x + stride * 6);
+    __m256 line_7 = _mm256_setzero_ps();
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_store_ps(dstp + x * 8 + 0, line_0);
+    _mm256_store_ps(dstp + x * 8 + 8, line_1);
+    _mm256_store_ps(dstp + x * 8 + 16, line_2);
+    _mm256_store_ps(dstp + x * 8 + 24, line_3);
+    _mm256_store_ps(dstp + x * 8 + 32, line_4);
+    _mm256_store_ps(dstp + x * 8 + 40, line_5);
+    _mm256_store_ps(dstp + x * 8 + 48, line_6);
+    _mm256_store_ps(dstp + x * 8 + 56, line_7);
+}
+
+static inline ALWAYS_INLINE void transpose_block_from_buffer_horizontally(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int x
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + x * 8 + 0);
+    __m256 line_1 = _mm256_load_ps(srcp + x * 8 + 8);
+    __m256 line_2 = _mm256_load_ps(srcp + x * 8 + 16);
+    __m256 line_3 = _mm256_load_ps(srcp + x * 8 + 24);
+    __m256 line_4 = _mm256_load_ps(srcp + x * 8 + 32);
+    __m256 line_5 = _mm256_load_ps(srcp + x * 8 + 40);
+    __m256 line_6 = _mm256_load_ps(srcp + x * 8 + 48);
+    __m256 line_7 = _mm256_load_ps(srcp + x * 8 + 56);
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_stream_ps(dstp + x + stride * 0, line_0);
+    _mm256_stream_ps(dstp + x + stride * 1, line_1);
+    _mm256_stream_ps(dstp + x + stride * 2, line_2);
+    _mm256_stream_ps(dstp + x + stride * 3, line_3);
+    _mm256_stream_ps(dstp + x + stride * 4, line_4);
+    _mm256_stream_ps(dstp + x + stride * 5, line_5);
+    _mm256_stream_ps(dstp + x + stride * 6, line_6);
+    _mm256_stream_ps(dstp + x + stride * 7, line_7);
+}
+
+static void transpose_block_from_buffer_horizontally_tail_1(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int x
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + x * 8 + 0);
+    __m256 line_1 = _mm256_load_ps(srcp + x * 8 + 8);
+    __m256 line_2 = _mm256_load_ps(srcp + x * 8 + 16);
+    __m256 line_3 = _mm256_load_ps(srcp + x * 8 + 24);
+    __m256 line_4 = _mm256_load_ps(srcp + x * 8 + 32);
+    __m256 line_5 = _mm256_load_ps(srcp + x * 8 + 40);
+    __m256 line_6 = _mm256_load_ps(srcp + x * 8 + 48);
+    __m256 line_7 = _mm256_load_ps(srcp + x * 8 + 56);
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_stream_ps(dstp + x + stride * 0, line_0);
+}
+
+static void transpose_block_from_buffer_horizontally_tail_2(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int x
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + x * 8 + 0);
+    __m256 line_1 = _mm256_load_ps(srcp + x * 8 + 8);
+    __m256 line_2 = _mm256_load_ps(srcp + x * 8 + 16);
+    __m256 line_3 = _mm256_load_ps(srcp + x * 8 + 24);
+    __m256 line_4 = _mm256_load_ps(srcp + x * 8 + 32);
+    __m256 line_5 = _mm256_load_ps(srcp + x * 8 + 40);
+    __m256 line_6 = _mm256_load_ps(srcp + x * 8 + 48);
+    __m256 line_7 = _mm256_load_ps(srcp + x * 8 + 56);
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_stream_ps(dstp + x + stride * 0, line_0);
+    _mm256_stream_ps(dstp + x + stride * 1, line_1);
+}
+
+static void transpose_block_from_buffer_horizontally_tail_3(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int x
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + x * 8 + 0);
+    __m256 line_1 = _mm256_load_ps(srcp + x * 8 + 8);
+    __m256 line_2 = _mm256_load_ps(srcp + x * 8 + 16);
+    __m256 line_3 = _mm256_load_ps(srcp + x * 8 + 24);
+    __m256 line_4 = _mm256_load_ps(srcp + x * 8 + 32);
+    __m256 line_5 = _mm256_load_ps(srcp + x * 8 + 40);
+    __m256 line_6 = _mm256_load_ps(srcp + x * 8 + 48);
+    __m256 line_7 = _mm256_load_ps(srcp + x * 8 + 56);
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_stream_ps(dstp + x + stride * 0, line_0);
+    _mm256_stream_ps(dstp + x + stride * 1, line_1);
+    _mm256_stream_ps(dstp + x + stride * 2, line_2);
+}
+
+static void transpose_block_from_buffer_horizontally_tail_4(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int x
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + x * 8 + 0);
+    __m256 line_1 = _mm256_load_ps(srcp + x * 8 + 8);
+    __m256 line_2 = _mm256_load_ps(srcp + x * 8 + 16);
+    __m256 line_3 = _mm256_load_ps(srcp + x * 8 + 24);
+    __m256 line_4 = _mm256_load_ps(srcp + x * 8 + 32);
+    __m256 line_5 = _mm256_load_ps(srcp + x * 8 + 40);
+    __m256 line_6 = _mm256_load_ps(srcp + x * 8 + 48);
+    __m256 line_7 = _mm256_load_ps(srcp + x * 8 + 56);
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_stream_ps(dstp + x + stride * 0, line_0);
+    _mm256_stream_ps(dstp + x + stride * 1, line_1);
+    _mm256_stream_ps(dstp + x + stride * 2, line_2);
+    _mm256_stream_ps(dstp + x + stride * 3, line_3);
+}
+
+static void transpose_block_from_buffer_horizontally_tail_5(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int x
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + x * 8 + 0);
+    __m256 line_1 = _mm256_load_ps(srcp + x * 8 + 8);
+    __m256 line_2 = _mm256_load_ps(srcp + x * 8 + 16);
+    __m256 line_3 = _mm256_load_ps(srcp + x * 8 + 24);
+    __m256 line_4 = _mm256_load_ps(srcp + x * 8 + 32);
+    __m256 line_5 = _mm256_load_ps(srcp + x * 8 + 40);
+    __m256 line_6 = _mm256_load_ps(srcp + x * 8 + 48);
+    __m256 line_7 = _mm256_load_ps(srcp + x * 8 + 56);
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_stream_ps(dstp + x + stride * 0, line_0);
+    _mm256_stream_ps(dstp + x + stride * 1, line_1);
+    _mm256_stream_ps(dstp + x + stride * 2, line_2);
+    _mm256_stream_ps(dstp + x + stride * 3, line_3);
+    _mm256_stream_ps(dstp + x + stride * 4, line_4);
+}
+
+static void transpose_block_from_buffer_horizontally_tail_6(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int x
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + x * 8 + 0);
+    __m256 line_1 = _mm256_load_ps(srcp + x * 8 + 8);
+    __m256 line_2 = _mm256_load_ps(srcp + x * 8 + 16);
+    __m256 line_3 = _mm256_load_ps(srcp + x * 8 + 24);
+    __m256 line_4 = _mm256_load_ps(srcp + x * 8 + 32);
+    __m256 line_5 = _mm256_load_ps(srcp + x * 8 + 40);
+    __m256 line_6 = _mm256_load_ps(srcp + x * 8 + 48);
+    __m256 line_7 = _mm256_load_ps(srcp + x * 8 + 56);
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_stream_ps(dstp + x + stride * 0, line_0);
+    _mm256_stream_ps(dstp + x + stride * 1, line_1);
+    _mm256_stream_ps(dstp + x + stride * 2, line_2);
+    _mm256_stream_ps(dstp + x + stride * 3, line_3);
+    _mm256_stream_ps(dstp + x + stride * 4, line_4);
+    _mm256_stream_ps(dstp + x + stride * 5, line_5);
+}
+
+static void transpose_block_from_buffer_horizontally_tail_7(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int x
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + x * 8 + 0);
+    __m256 line_1 = _mm256_load_ps(srcp + x * 8 + 8);
+    __m256 line_2 = _mm256_load_ps(srcp + x * 8 + 16);
+    __m256 line_3 = _mm256_load_ps(srcp + x * 8 + 24);
+    __m256 line_4 = _mm256_load_ps(srcp + x * 8 + 32);
+    __m256 line_5 = _mm256_load_ps(srcp + x * 8 + 40);
+    __m256 line_6 = _mm256_load_ps(srcp + x * 8 + 48);
+    __m256 line_7 = _mm256_load_ps(srcp + x * 8 + 56);
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_stream_ps(dstp + x + stride * 0, line_0);
+    _mm256_stream_ps(dstp + x + stride * 1, line_1);
+    _mm256_stream_ps(dstp + x + stride * 2, line_2);
+    _mm256_stream_ps(dstp + x + stride * 3, line_3);
+    _mm256_stream_ps(dstp + x + stride * 4, line_4);
+    _mm256_stream_ps(dstp + x + stride * 5, line_5);
+    _mm256_stream_ps(dstp + x + stride * 6, line_6);
+}
+
 static void resize_width(
     const float *restrict srcp, float *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride,
     int src_w, int src_h, int dst_w, double start_w, double real_w, kernel_t kernel
@@ -1022,24 +1322,34 @@ static void resize_width(
     int border = src_w - 1;
     double radius = kernel.radius / scale;
     int step = (int)ceil(radius * 2.0) + 2;
-    int64_t *counts = (int64_t *)malloc(sizeof(int64_t) * dst_w * step);
-    double *weights = (double *)malloc(sizeof(double) * dst_w * step);
-    int *lengths = (int *)malloc(sizeof(int) * dst_w);
+    double *weights = (double *)malloc(sizeof(double) * step * dst_w);
+    int64_t *col_idx = (int64_t *)malloc(sizeof(int64_t) * step * dst_w);
+    int *row_ptr = (int *)malloc(sizeof(int) * (dst_w + 1));
+    row_ptr[0] = 0;
+    int nnz = 0;
     
     for (int x = 0; x < dst_w; x++) {
         double center = (x + 0.5) / factor - 0.5 + start_w;
         int low = VSMAX((int)floor(center - radius), min_w);
         int high = VSMIN((int)ceil(center + radius), max_w);
-        lengths[x] = high - low + 1;
         double norm = 0.0;
-        for (int i = 0; i < lengths[x]; i++) {
-            counts[x * step + i] = CLAMP(i + low, 0, border);
-            weights[x * step + i] = kernel.f((i + low - center) * scale, kernel.ctx);
-            norm += weights[x * step + i];
+        for (int i = low; i <= high; i++) {
+            double temp_val = kernel.f((i - center) * scale, kernel.ctx);
+            if (temp_val == 0.0) continue;
+            norm += temp_val;
+            int64_t temp_idx = CLAMP(i, 0, border) * 8LL;
+            if (row_ptr[x] != nnz && temp_idx == col_idx[nnz - 1]) {
+                weights[nnz - 1] += temp_val;
+                continue;
+            }
+            weights[nnz] = temp_val;
+            col_idx[nnz] = temp_idx;
+            nnz++;
         }
-        for (int i = 0; i < lengths[x]; i++) {
-            weights[x * step + i] /= norm;
+        for (int i = row_ptr[x]; i < nnz; i++) {
+            weights[i] /= norm;
         }
+        row_ptr[x + 1] = nnz;
     }
     
     float *restrict src_buf = (float *)_mm_malloc(sizeof(float) * src_stride * 8, 64);
@@ -1048,115 +1358,90 @@ static void resize_width(
     int tail = src_h % 8;
     int mod8_h = src_h - tail;
     
+    transpose_block_horizontally_func transpose_block_into_buffer_horizontally_tail;
+    transpose_block_horizontally_func transpose_block_from_buffer_horizontally_tail;
+    
+    switch (tail) {
+    case 1:
+        transpose_block_into_buffer_horizontally_tail = transpose_block_into_buffer_horizontally_tail_1;
+        transpose_block_from_buffer_horizontally_tail = transpose_block_from_buffer_horizontally_tail_1;
+        break;
+    case 2:
+        transpose_block_into_buffer_horizontally_tail = transpose_block_into_buffer_horizontally_tail_2;
+        transpose_block_from_buffer_horizontally_tail = transpose_block_from_buffer_horizontally_tail_2;
+        break;
+    case 3:
+        transpose_block_into_buffer_horizontally_tail = transpose_block_into_buffer_horizontally_tail_3;
+        transpose_block_from_buffer_horizontally_tail = transpose_block_from_buffer_horizontally_tail_3;
+        break;
+    case 4:
+        transpose_block_into_buffer_horizontally_tail = transpose_block_into_buffer_horizontally_tail_4;
+        transpose_block_from_buffer_horizontally_tail = transpose_block_from_buffer_horizontally_tail_4;
+        break;
+    case 5:
+        transpose_block_into_buffer_horizontally_tail = transpose_block_into_buffer_horizontally_tail_5;
+        transpose_block_from_buffer_horizontally_tail = transpose_block_from_buffer_horizontally_tail_5;
+        break;
+    case 6:
+        transpose_block_into_buffer_horizontally_tail = transpose_block_into_buffer_horizontally_tail_6;
+        transpose_block_from_buffer_horizontally_tail = transpose_block_from_buffer_horizontally_tail_6;
+        break;
+    case 7:
+        transpose_block_into_buffer_horizontally_tail = transpose_block_into_buffer_horizontally_tail_7;
+        transpose_block_from_buffer_horizontally_tail = transpose_block_from_buffer_horizontally_tail_7;
+        break;
+    default:
+        transpose_block_into_buffer_horizontally_tail = transpose_block_into_buffer_horizontally;
+        transpose_block_from_buffer_horizontally_tail = transpose_block_from_buffer_horizontally;
+        break;
+    }
+    
     for (int y = 0; y < mod8_h; y += 8) {
         for (int x = 0; x < src_w; x += 8) {
-            __m256 line_0 = _mm256_load_ps(srcp + x + src_stride * 0);
-            __m256 line_1 = _mm256_load_ps(srcp + x + src_stride * 1);
-            __m256 line_2 = _mm256_load_ps(srcp + x + src_stride * 2);
-            __m256 line_3 = _mm256_load_ps(srcp + x + src_stride * 3);
-            __m256 line_4 = _mm256_load_ps(srcp + x + src_stride * 4);
-            __m256 line_5 = _mm256_load_ps(srcp + x + src_stride * 5);
-            __m256 line_6 = _mm256_load_ps(srcp + x + src_stride * 6);
-            __m256 line_7 = _mm256_load_ps(srcp + x + src_stride * 7);
-            _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
-            _mm256_store_ps(src_buf + x * 8 + 0, line_0);
-            _mm256_store_ps(src_buf + x * 8 + 8, line_1);
-            _mm256_store_ps(src_buf + x * 8 + 16, line_2);
-            _mm256_store_ps(src_buf + x * 8 + 24, line_3);
-            _mm256_store_ps(src_buf + x * 8 + 32, line_4);
-            _mm256_store_ps(src_buf + x * 8 + 40, line_5);
-            _mm256_store_ps(src_buf + x * 8 + 48, line_6);
-            _mm256_store_ps(src_buf + x * 8 + 56, line_7);
+            transpose_block_into_buffer_horizontally(srcp, src_buf, src_stride, x);
         }
         for (int x = 0; x < dst_w; x++) {
             __m256d v_acc_0 = _mm256_setzero_pd();
             __m256d v_acc_1 = _mm256_setzero_pd();
-            for (int i = 0; i < lengths[x]; i++) {
-                __m256 pix = _mm256_load_ps(src_buf + counts[x * step + i] * 8);
-                __m256d v_weight = _mm256_set1_pd(weights[x * step + i]);
+            for (int i = row_ptr[x]; i < row_ptr[x + 1]; i++) {
+                __m256 pix = _mm256_load_ps(src_buf + col_idx[i]);
+                __m256d v_weight = _mm256_set1_pd(weights[i]);
                 v_acc_0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), v_weight, v_acc_0);
                 v_acc_1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), v_weight, v_acc_1);
             }
             _mm256_store_ps(dst_buf + x * 8, _mm256_setr_m128(_mm256_cvtpd_ps(v_acc_0), _mm256_cvtpd_ps(v_acc_1)));
         }
         for (int x = 0; x < dst_w; x += 8) {
-            __m256 line_0 = _mm256_load_ps(dst_buf + x * 8 + 0);
-            __m256 line_1 = _mm256_load_ps(dst_buf + x * 8 + 8);
-            __m256 line_2 = _mm256_load_ps(dst_buf + x * 8 + 16);
-            __m256 line_3 = _mm256_load_ps(dst_buf + x * 8 + 24);
-            __m256 line_4 = _mm256_load_ps(dst_buf + x * 8 + 32);
-            __m256 line_5 = _mm256_load_ps(dst_buf + x * 8 + 40);
-            __m256 line_6 = _mm256_load_ps(dst_buf + x * 8 + 48);
-            __m256 line_7 = _mm256_load_ps(dst_buf + x * 8 + 56);
-            _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
-            _mm256_stream_ps(dstp + x + dst_stride * 0, line_0);
-            _mm256_stream_ps(dstp + x + dst_stride * 1, line_1);
-            _mm256_stream_ps(dstp + x + dst_stride * 2, line_2);
-            _mm256_stream_ps(dstp + x + dst_stride * 3, line_3);
-            _mm256_stream_ps(dstp + x + dst_stride * 4, line_4);
-            _mm256_stream_ps(dstp + x + dst_stride * 5, line_5);
-            _mm256_stream_ps(dstp + x + dst_stride * 6, line_6);
-            _mm256_stream_ps(dstp + x + dst_stride * 7, line_7);
+            transpose_block_from_buffer_horizontally(dst_buf, dstp, dst_stride, x);
         }
         dstp += dst_stride * 8;
         srcp += src_stride * 8;
     }
     if (tail) {
         for (int x = 0; x < src_w; x += 8) {
-            __m256 line_0 = _mm256_load_ps(srcp + x + src_stride * 0);
-            __m256 line_1 = (tail > 1) ? _mm256_load_ps(srcp + x + src_stride * 1) : _mm256_setzero_ps();
-            __m256 line_2 = (tail > 2) ? _mm256_load_ps(srcp + x + src_stride * 2) : _mm256_setzero_ps();
-            __m256 line_3 = (tail > 3) ? _mm256_load_ps(srcp + x + src_stride * 3) : _mm256_setzero_ps();
-            __m256 line_4 = (tail > 4) ? _mm256_load_ps(srcp + x + src_stride * 4) : _mm256_setzero_ps();
-            __m256 line_5 = (tail > 5) ? _mm256_load_ps(srcp + x + src_stride * 5) : _mm256_setzero_ps();
-            __m256 line_6 = (tail > 6) ? _mm256_load_ps(srcp + x + src_stride * 6) : _mm256_setzero_ps();
-            __m256 line_7 = _mm256_setzero_ps();
-            _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
-            _mm256_store_ps(src_buf + x * 8 + 0, line_0);
-            _mm256_store_ps(src_buf + x * 8 + 8, line_1);
-            _mm256_store_ps(src_buf + x * 8 + 16, line_2);
-            _mm256_store_ps(src_buf + x * 8 + 24, line_3);
-            _mm256_store_ps(src_buf + x * 8 + 32, line_4);
-            _mm256_store_ps(src_buf + x * 8 + 40, line_5);
-            _mm256_store_ps(src_buf + x * 8 + 48, line_6);
-            _mm256_store_ps(src_buf + x * 8 + 56, line_7);
+            transpose_block_into_buffer_horizontally_tail(srcp, src_buf, src_stride, x);
         }
         for (int x = 0; x < dst_w; x++) {
             __m256d v_acc_0 = _mm256_setzero_pd();
             __m256d v_acc_1 = _mm256_setzero_pd();
-            for (int i = 0; i < lengths[x]; i++) {
-                __m256 pix = _mm256_load_ps(src_buf + counts[x * step + i] * 8);
-                __m256d v_weight = _mm256_set1_pd(weights[x * step + i]);
+            for (int i = row_ptr[x]; i < row_ptr[x + 1]; i++) {
+                __m256 pix = _mm256_load_ps(src_buf + col_idx[i]);
+                __m256d v_weight = _mm256_set1_pd(weights[i]);
                 v_acc_0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), v_weight, v_acc_0);
                 v_acc_1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), v_weight, v_acc_1);
             }
             _mm256_store_ps(dst_buf + x * 8, _mm256_setr_m128(_mm256_cvtpd_ps(v_acc_0), _mm256_cvtpd_ps(v_acc_1)));
         }
         for (int x = 0; x < dst_w; x += 8) {
-            __m256 line_0 = _mm256_load_ps(dst_buf + x * 8 + 0);
-            __m256 line_1 = _mm256_load_ps(dst_buf + x * 8 + 8);
-            __m256 line_2 = _mm256_load_ps(dst_buf + x * 8 + 16);
-            __m256 line_3 = _mm256_load_ps(dst_buf + x * 8 + 24);
-            __m256 line_4 = _mm256_load_ps(dst_buf + x * 8 + 32);
-            __m256 line_5 = _mm256_load_ps(dst_buf + x * 8 + 40);
-            __m256 line_6 = _mm256_load_ps(dst_buf + x * 8 + 48);
-            __m256 line_7 = _mm256_load_ps(dst_buf + x * 8 + 56);
-            _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
-            _mm256_stream_ps(dstp + x + dst_stride * 0, line_0);
-            if (tail > 1) _mm256_stream_ps(dstp + x + dst_stride * 1, line_1);
-            if (tail > 2) _mm256_stream_ps(dstp + x + dst_stride * 2, line_2);
-            if (tail > 3) _mm256_stream_ps(dstp + x + dst_stride * 3, line_3);
-            if (tail > 4) _mm256_stream_ps(dstp + x + dst_stride * 4, line_4);
-            if (tail > 5) _mm256_stream_ps(dstp + x + dst_stride * 5, line_5);
-            if (tail > 6) _mm256_stream_ps(dstp + x + dst_stride * 6, line_6);
+            transpose_block_from_buffer_horizontally_tail(dst_buf, dstp, dst_stride, x);
         }
     }
     _mm_sfence();
-    _mm_free(src_buf);
     _mm_free(dst_buf);
-    free(counts);
+    _mm_free(src_buf);
+    free(row_ptr);
+    free(col_idx);
     free(weights);
-    free(lengths);
 }
 
 static void resize_height(
@@ -1177,29 +1462,37 @@ static void resize_height(
     int border = src_h - 1;
     double radius = kernel.radius / scale;
     int step = (int)ceil(radius * 2.0) + 2;
-    int64_t *counts = (int64_t *)malloc(sizeof(int64_t) * step);
     double *weights = (double *)malloc(sizeof(double) * step);
+    int64_t *col_idx = (int64_t *)malloc(sizeof(int64_t) * step);
     
     for (int y = 0; y < dst_h; y++) {
         double center = (y + 0.5) / factor - 0.5 + start_h;
         int low = VSMAX((int)floor(center - radius), min_h);
         int high = VSMIN((int)ceil(center + radius), max_h);
-        int length = high - low + 1;
+        int nnz = 0;
         double norm = 0.0;
-        for (int i = 0; i < length; i++) {
-            counts[i] = CLAMP(i + low, 0, border) * dst_stride;
-            weights[i] = kernel.f((i + low - center) * scale, kernel.ctx);
-            norm += weights[i];
+        for (int i = low; i <= high; i++) {
+            double temp_val = kernel.f((i - center) * scale, kernel.ctx);
+            if (temp_val == 0.0) continue;
+            norm += temp_val;
+            int64_t temp_idx = CLAMP(i, 0, border) * dst_stride;
+            if (nnz && temp_idx == col_idx[nnz - 1]) {
+                weights[nnz - 1] += temp_val;
+                continue;
+            }
+            weights[nnz] = temp_val;
+            col_idx[nnz] = temp_idx;
+            nnz++;
         }
-        for (int i = 0; i < length; i++) {
+        for (int i = 0; i < nnz; i++) {
             weights[i] /= norm;
         }
         int x = 0;
         for (; x < mod8_w; x += 8) {
             __m256d v_acc_0 = _mm256_setzero_pd();
             __m256d v_acc_1 = _mm256_setzero_pd();
-            for (int i = 0; i < length; i++) {
-                __m256 pix = _mm256_load_ps(srcp + counts[i] + x);
+            for (int i = 0; i < nnz; i++) {
+                __m256 pix = _mm256_load_ps(srcp + col_idx[i] + x);
                 __m256d v_weight = _mm256_set1_pd(weights[i]);
                 v_acc_0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), v_weight, v_acc_0);
                 v_acc_1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), v_weight, v_acc_1);
@@ -1209,8 +1502,8 @@ static void resize_height(
         if (tail) {
             __m256d v_acc_0 = _mm256_setzero_pd();
             __m256d v_acc_1 = _mm256_setzero_pd();
-            for (int i = 0; i < length; i++) {
-                __m256 pix = _mm256_maskload_ps(srcp + counts[i] + x, tail_mask);
+            for (int i = 0; i < nnz; i++) {
+                __m256 pix = _mm256_maskload_ps(srcp + col_idx[i] + x, tail_mask);
                 __m256d v_weight = _mm256_set1_pd(weights[i]);
                 v_acc_0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), v_weight, v_acc_0);
                 v_acc_1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), v_weight, v_acc_1);
@@ -1220,7 +1513,7 @@ static void resize_height(
         dstp += dst_stride;
     }
     _mm_sfence();
-    free(counts);
+    free(col_idx);
     free(weights);
 }
 
@@ -1443,18 +1736,6 @@ static void float_to_uint16(
         }
         srcp += src_stride;
         dstp += dst_stride;
-    }
-}
-
-static void float_to_double(
-    const float *restrict srcp, double *restrict dstp, int src_w, int src_h, ptrdiff_t stride
-) {
-    for (int y = 0; y < src_h; y++) {
-        for (int x = 0; x < src_w; x++) {
-            dstp[x] = (double)srcp[x];
-        }
-        srcp += stride;
-        dstp += src_w;
     }
 }
 
@@ -2070,6 +2351,335 @@ typedef struct {
     bool process_w, process_h;
 } DescaleData;
 
+#ifdef __AVX2__
+typedef void (*transpose_block_vertically_func)(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride, int y
+);
+
+static inline ALWAYS_INLINE void transpose_block_into_buffer_vertically(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride, int y
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + src_stride * (y + 0));
+    __m256 line_1 = _mm256_load_ps(srcp + src_stride * (y + 1));
+    __m256 line_2 = _mm256_load_ps(srcp + src_stride * (y + 2));
+    __m256 line_3 = _mm256_load_ps(srcp + src_stride * (y + 3));
+    __m256 line_4 = _mm256_load_ps(srcp + src_stride * (y + 4));
+    __m256 line_5 = _mm256_load_ps(srcp + src_stride * (y + 5));
+    __m256 line_6 = _mm256_load_ps(srcp + src_stride * (y + 6));
+    __m256 line_7 = _mm256_load_ps(srcp + src_stride * (y + 7));
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_store_ps(dstp + dst_stride * 0 + y, line_0);
+    _mm256_store_ps(dstp + dst_stride * 1 + y, line_1);
+    _mm256_store_ps(dstp + dst_stride * 2 + y, line_2);
+    _mm256_store_ps(dstp + dst_stride * 3 + y, line_3);
+    _mm256_store_ps(dstp + dst_stride * 4 + y, line_4);
+    _mm256_store_ps(dstp + dst_stride * 5 + y, line_5);
+    _mm256_store_ps(dstp + dst_stride * 6 + y, line_6);
+    _mm256_store_ps(dstp + dst_stride * 7 + y, line_7);
+}
+static void transpose_block_into_buffer_vertically_tail_1(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride, int y
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + src_stride * (y + 0));
+    __m256 line_1 = _mm256_setzero_ps();
+    __m256 line_2 = _mm256_setzero_ps();
+    __m256 line_3 = _mm256_setzero_ps();
+    __m256 line_4 = _mm256_setzero_ps();
+    __m256 line_5 = _mm256_setzero_ps();
+    __m256 line_6 = _mm256_setzero_ps();
+    __m256 line_7 = _mm256_setzero_ps();
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_store_ps(dstp + dst_stride * 0 + y, line_0);
+    _mm256_store_ps(dstp + dst_stride * 1 + y, line_1);
+    _mm256_store_ps(dstp + dst_stride * 2 + y, line_2);
+    _mm256_store_ps(dstp + dst_stride * 3 + y, line_3);
+    _mm256_store_ps(dstp + dst_stride * 4 + y, line_4);
+    _mm256_store_ps(dstp + dst_stride * 5 + y, line_5);
+    _mm256_store_ps(dstp + dst_stride * 6 + y, line_6);
+    _mm256_store_ps(dstp + dst_stride * 7 + y, line_7);
+}
+
+static void transpose_block_into_buffer_vertically_tail_2(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride, int y
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + src_stride * (y + 0));
+    __m256 line_1 = _mm256_load_ps(srcp + src_stride * (y + 1));
+    __m256 line_2 = _mm256_setzero_ps();
+    __m256 line_3 = _mm256_setzero_ps();
+    __m256 line_4 = _mm256_setzero_ps();
+    __m256 line_5 = _mm256_setzero_ps();
+    __m256 line_6 = _mm256_setzero_ps();
+    __m256 line_7 = _mm256_setzero_ps();
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_store_ps(dstp + dst_stride * 0 + y, line_0);
+    _mm256_store_ps(dstp + dst_stride * 1 + y, line_1);
+    _mm256_store_ps(dstp + dst_stride * 2 + y, line_2);
+    _mm256_store_ps(dstp + dst_stride * 3 + y, line_3);
+    _mm256_store_ps(dstp + dst_stride * 4 + y, line_4);
+    _mm256_store_ps(dstp + dst_stride * 5 + y, line_5);
+    _mm256_store_ps(dstp + dst_stride * 6 + y, line_6);
+    _mm256_store_ps(dstp + dst_stride * 7 + y, line_7);
+}
+
+static void transpose_block_into_buffer_vertically_tail_3(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride, int y
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + src_stride * (y + 0));
+    __m256 line_1 = _mm256_load_ps(srcp + src_stride * (y + 1));
+    __m256 line_2 = _mm256_load_ps(srcp + src_stride * (y + 2));
+    __m256 line_3 = _mm256_setzero_ps();
+    __m256 line_4 = _mm256_setzero_ps();
+    __m256 line_5 = _mm256_setzero_ps();
+    __m256 line_6 = _mm256_setzero_ps();
+    __m256 line_7 = _mm256_setzero_ps();
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_store_ps(dstp + dst_stride * 0 + y, line_0);
+    _mm256_store_ps(dstp + dst_stride * 1 + y, line_1);
+    _mm256_store_ps(dstp + dst_stride * 2 + y, line_2);
+    _mm256_store_ps(dstp + dst_stride * 3 + y, line_3);
+    _mm256_store_ps(dstp + dst_stride * 4 + y, line_4);
+    _mm256_store_ps(dstp + dst_stride * 5 + y, line_5);
+    _mm256_store_ps(dstp + dst_stride * 6 + y, line_6);
+    _mm256_store_ps(dstp + dst_stride * 7 + y, line_7);
+}
+
+static void transpose_block_into_buffer_vertically_tail_4(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride, int y
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + src_stride * (y + 0));
+    __m256 line_1 = _mm256_load_ps(srcp + src_stride * (y + 1));
+    __m256 line_2 = _mm256_load_ps(srcp + src_stride * (y + 2));
+    __m256 line_3 = _mm256_load_ps(srcp + src_stride * (y + 3));
+    __m256 line_4 = _mm256_setzero_ps();
+    __m256 line_5 = _mm256_setzero_ps();
+    __m256 line_6 = _mm256_setzero_ps();
+    __m256 line_7 = _mm256_setzero_ps();
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_store_ps(dstp + dst_stride * 0 + y, line_0);
+    _mm256_store_ps(dstp + dst_stride * 1 + y, line_1);
+    _mm256_store_ps(dstp + dst_stride * 2 + y, line_2);
+    _mm256_store_ps(dstp + dst_stride * 3 + y, line_3);
+    _mm256_store_ps(dstp + dst_stride * 4 + y, line_4);
+    _mm256_store_ps(dstp + dst_stride * 5 + y, line_5);
+    _mm256_store_ps(dstp + dst_stride * 6 + y, line_6);
+    _mm256_store_ps(dstp + dst_stride * 7 + y, line_7);
+}
+
+static void transpose_block_into_buffer_vertically_tail_5(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride, int y
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + src_stride * (y + 0));
+    __m256 line_1 = _mm256_load_ps(srcp + src_stride * (y + 1));
+    __m256 line_2 = _mm256_load_ps(srcp + src_stride * (y + 2));
+    __m256 line_3 = _mm256_load_ps(srcp + src_stride * (y + 3));
+    __m256 line_4 = _mm256_load_ps(srcp + src_stride * (y + 4));
+    __m256 line_5 = _mm256_setzero_ps();
+    __m256 line_6 = _mm256_setzero_ps();
+    __m256 line_7 = _mm256_setzero_ps();
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_store_ps(dstp + dst_stride * 0 + y, line_0);
+    _mm256_store_ps(dstp + dst_stride * 1 + y, line_1);
+    _mm256_store_ps(dstp + dst_stride * 2 + y, line_2);
+    _mm256_store_ps(dstp + dst_stride * 3 + y, line_3);
+    _mm256_store_ps(dstp + dst_stride * 4 + y, line_4);
+    _mm256_store_ps(dstp + dst_stride * 5 + y, line_5);
+    _mm256_store_ps(dstp + dst_stride * 6 + y, line_6);
+    _mm256_store_ps(dstp + dst_stride * 7 + y, line_7);
+}
+
+static void transpose_block_into_buffer_vertically_tail_6(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride, int y
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + src_stride * (y + 0));
+    __m256 line_1 = _mm256_load_ps(srcp + src_stride * (y + 1));
+    __m256 line_2 = _mm256_load_ps(srcp + src_stride * (y + 2));
+    __m256 line_3 = _mm256_load_ps(srcp + src_stride * (y + 3));
+    __m256 line_4 = _mm256_load_ps(srcp + src_stride * (y + 4));
+    __m256 line_5 = _mm256_load_ps(srcp + src_stride * (y + 5));
+    __m256 line_6 = _mm256_setzero_ps();
+    __m256 line_7 = _mm256_setzero_ps();
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_store_ps(dstp + dst_stride * 0 + y, line_0);
+    _mm256_store_ps(dstp + dst_stride * 1 + y, line_1);
+    _mm256_store_ps(dstp + dst_stride * 2 + y, line_2);
+    _mm256_store_ps(dstp + dst_stride * 3 + y, line_3);
+    _mm256_store_ps(dstp + dst_stride * 4 + y, line_4);
+    _mm256_store_ps(dstp + dst_stride * 5 + y, line_5);
+    _mm256_store_ps(dstp + dst_stride * 6 + y, line_6);
+    _mm256_store_ps(dstp + dst_stride * 7 + y, line_7);
+}
+
+static void transpose_block_into_buffer_vertically_tail_7(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride, int y
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + src_stride * (y + 0));
+    __m256 line_1 = _mm256_load_ps(srcp + src_stride * (y + 1));
+    __m256 line_2 = _mm256_load_ps(srcp + src_stride * (y + 2));
+    __m256 line_3 = _mm256_load_ps(srcp + src_stride * (y + 3));
+    __m256 line_4 = _mm256_load_ps(srcp + src_stride * (y + 4));
+    __m256 line_5 = _mm256_load_ps(srcp + src_stride * (y + 5));
+    __m256 line_6 = _mm256_load_ps(srcp + src_stride * (y + 6));
+    __m256 line_7 = _mm256_setzero_ps();
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_store_ps(dstp + dst_stride * 0 + y, line_0);
+    _mm256_store_ps(dstp + dst_stride * 1 + y, line_1);
+    _mm256_store_ps(dstp + dst_stride * 2 + y, line_2);
+    _mm256_store_ps(dstp + dst_stride * 3 + y, line_3);
+    _mm256_store_ps(dstp + dst_stride * 4 + y, line_4);
+    _mm256_store_ps(dstp + dst_stride * 5 + y, line_5);
+    _mm256_store_ps(dstp + dst_stride * 6 + y, line_6);
+    _mm256_store_ps(dstp + dst_stride * 7 + y, line_7);
+}
+
+static inline ALWAYS_INLINE void transpose_block_from_buffer_vertically(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride, int y
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + src_stride * 0 + y);
+    __m256 line_1 = _mm256_load_ps(srcp + src_stride * 1 + y);
+    __m256 line_2 = _mm256_load_ps(srcp + src_stride * 2 + y);
+    __m256 line_3 = _mm256_load_ps(srcp + src_stride * 3 + y);
+    __m256 line_4 = _mm256_load_ps(srcp + src_stride * 4 + y);
+    __m256 line_5 = _mm256_load_ps(srcp + src_stride * 5 + y);
+    __m256 line_6 = _mm256_load_ps(srcp + src_stride * 6 + y);
+    __m256 line_7 = _mm256_load_ps(srcp + src_stride * 7 + y);
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_stream_ps(dstp + dst_stride * (y + 0), line_0);
+    _mm256_stream_ps(dstp + dst_stride * (y + 1), line_1);
+    _mm256_stream_ps(dstp + dst_stride * (y + 2), line_2);
+    _mm256_stream_ps(dstp + dst_stride * (y + 3), line_3);
+    _mm256_stream_ps(dstp + dst_stride * (y + 4), line_4);
+    _mm256_stream_ps(dstp + dst_stride * (y + 5), line_5);
+    _mm256_stream_ps(dstp + dst_stride * (y + 6), line_6);
+    _mm256_stream_ps(dstp + dst_stride * (y + 7), line_7);
+}
+
+static void transpose_block_from_buffer_vertically_tail_1(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride, int y
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + src_stride * 0 + y);
+    __m256 line_1 = _mm256_load_ps(srcp + src_stride * 1 + y);
+    __m256 line_2 = _mm256_load_ps(srcp + src_stride * 2 + y);
+    __m256 line_3 = _mm256_load_ps(srcp + src_stride * 3 + y);
+    __m256 line_4 = _mm256_load_ps(srcp + src_stride * 4 + y);
+    __m256 line_5 = _mm256_load_ps(srcp + src_stride * 5 + y);
+    __m256 line_6 = _mm256_load_ps(srcp + src_stride * 6 + y);
+    __m256 line_7 = _mm256_load_ps(srcp + src_stride * 7 + y);
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_stream_ps(dstp + dst_stride * (y + 0), line_0);
+}
+
+static void transpose_block_from_buffer_vertically_tail_2(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride, int y
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + src_stride * 0 + y);
+    __m256 line_1 = _mm256_load_ps(srcp + src_stride * 1 + y);
+    __m256 line_2 = _mm256_load_ps(srcp + src_stride * 2 + y);
+    __m256 line_3 = _mm256_load_ps(srcp + src_stride * 3 + y);
+    __m256 line_4 = _mm256_load_ps(srcp + src_stride * 4 + y);
+    __m256 line_5 = _mm256_load_ps(srcp + src_stride * 5 + y);
+    __m256 line_6 = _mm256_load_ps(srcp + src_stride * 6 + y);
+    __m256 line_7 = _mm256_load_ps(srcp + src_stride * 7 + y);
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_stream_ps(dstp + dst_stride * (y + 0), line_0);
+    _mm256_stream_ps(dstp + dst_stride * (y + 1), line_1);
+}
+
+static void transpose_block_from_buffer_vertically_tail_3(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride, int y
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + src_stride * 0 + y);
+    __m256 line_1 = _mm256_load_ps(srcp + src_stride * 1 + y);
+    __m256 line_2 = _mm256_load_ps(srcp + src_stride * 2 + y);
+    __m256 line_3 = _mm256_load_ps(srcp + src_stride * 3 + y);
+    __m256 line_4 = _mm256_load_ps(srcp + src_stride * 4 + y);
+    __m256 line_5 = _mm256_load_ps(srcp + src_stride * 5 + y);
+    __m256 line_6 = _mm256_load_ps(srcp + src_stride * 6 + y);
+    __m256 line_7 = _mm256_load_ps(srcp + src_stride * 7 + y);
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_stream_ps(dstp + dst_stride * (y + 0), line_0);
+    _mm256_stream_ps(dstp + dst_stride * (y + 1), line_1);
+    _mm256_stream_ps(dstp + dst_stride * (y + 2), line_2);
+}
+
+static void transpose_block_from_buffer_vertically_tail_4(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride, int y
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + src_stride * 0 + y);
+    __m256 line_1 = _mm256_load_ps(srcp + src_stride * 1 + y);
+    __m256 line_2 = _mm256_load_ps(srcp + src_stride * 2 + y);
+    __m256 line_3 = _mm256_load_ps(srcp + src_stride * 3 + y);
+    __m256 line_4 = _mm256_load_ps(srcp + src_stride * 4 + y);
+    __m256 line_5 = _mm256_load_ps(srcp + src_stride * 5 + y);
+    __m256 line_6 = _mm256_load_ps(srcp + src_stride * 6 + y);
+    __m256 line_7 = _mm256_load_ps(srcp + src_stride * 7 + y);
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_stream_ps(dstp + dst_stride * (y + 0), line_0);
+    _mm256_stream_ps(dstp + dst_stride * (y + 1), line_1);
+    _mm256_stream_ps(dstp + dst_stride * (y + 2), line_2);
+    _mm256_stream_ps(dstp + dst_stride * (y + 3), line_3);
+}
+
+static void transpose_block_from_buffer_vertically_tail_5(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride, int y
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + src_stride * 0 + y);
+    __m256 line_1 = _mm256_load_ps(srcp + src_stride * 1 + y);
+    __m256 line_2 = _mm256_load_ps(srcp + src_stride * 2 + y);
+    __m256 line_3 = _mm256_load_ps(srcp + src_stride * 3 + y);
+    __m256 line_4 = _mm256_load_ps(srcp + src_stride * 4 + y);
+    __m256 line_5 = _mm256_load_ps(srcp + src_stride * 5 + y);
+    __m256 line_6 = _mm256_load_ps(srcp + src_stride * 6 + y);
+    __m256 line_7 = _mm256_load_ps(srcp + src_stride * 7 + y);
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_stream_ps(dstp + dst_stride * (y + 0), line_0);
+    _mm256_stream_ps(dstp + dst_stride * (y + 1), line_1);
+    _mm256_stream_ps(dstp + dst_stride * (y + 2), line_2);
+    _mm256_stream_ps(dstp + dst_stride * (y + 3), line_3);
+    _mm256_stream_ps(dstp + dst_stride * (y + 4), line_4);
+}
+
+static void transpose_block_from_buffer_vertically_tail_6(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride, int y
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + src_stride * 0 + y);
+    __m256 line_1 = _mm256_load_ps(srcp + src_stride * 1 + y);
+    __m256 line_2 = _mm256_load_ps(srcp + src_stride * 2 + y);
+    __m256 line_3 = _mm256_load_ps(srcp + src_stride * 3 + y);
+    __m256 line_4 = _mm256_load_ps(srcp + src_stride * 4 + y);
+    __m256 line_5 = _mm256_load_ps(srcp + src_stride * 5 + y);
+    __m256 line_6 = _mm256_load_ps(srcp + src_stride * 6 + y);
+    __m256 line_7 = _mm256_load_ps(srcp + src_stride * 7 + y);
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_stream_ps(dstp + dst_stride * (y + 0), line_0);
+    _mm256_stream_ps(dstp + dst_stride * (y + 1), line_1);
+    _mm256_stream_ps(dstp + dst_stride * (y + 2), line_2);
+    _mm256_stream_ps(dstp + dst_stride * (y + 3), line_3);
+    _mm256_stream_ps(dstp + dst_stride * (y + 4), line_4);
+    _mm256_stream_ps(dstp + dst_stride * (y + 5), line_5);
+}
+
+static void transpose_block_from_buffer_vertically_tail_7(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride, int y
+) {
+    __m256 line_0 = _mm256_load_ps(srcp + src_stride * 0 + y);
+    __m256 line_1 = _mm256_load_ps(srcp + src_stride * 1 + y);
+    __m256 line_2 = _mm256_load_ps(srcp + src_stride * 2 + y);
+    __m256 line_3 = _mm256_load_ps(srcp + src_stride * 3 + y);
+    __m256 line_4 = _mm256_load_ps(srcp + src_stride * 4 + y);
+    __m256 line_5 = _mm256_load_ps(srcp + src_stride * 5 + y);
+    __m256 line_6 = _mm256_load_ps(srcp + src_stride * 6 + y);
+    __m256 line_7 = _mm256_load_ps(srcp + src_stride * 7 + y);
+    _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
+    _mm256_stream_ps(dstp + dst_stride * (y + 0), line_0);
+    _mm256_stream_ps(dstp + dst_stride * (y + 1), line_1);
+    _mm256_stream_ps(dstp + dst_stride * (y + 2), line_2);
+    _mm256_stream_ps(dstp + dst_stride * (y + 3), line_3);
+    _mm256_stream_ps(dstp + dst_stride * (y + 4), line_4);
+    _mm256_stream_ps(dstp + dst_stride * (y + 5), line_5);
+    _mm256_stream_ps(dstp + dst_stride * (y + 6), line_6);
+}
+#endif
+
 static void descale_width(
     const float *restrict srcp, float *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride,
     int src_w, int src_h, int dst_w, double start_w, double real_w, double lambda, kernel_t kernel
@@ -2376,47 +2986,72 @@ static void descale_height(
     phase = 33;
     
 #ifdef __AVX2__
+    transpose_block_vertically_func transpose_block_into_buffer_vertically_tail;
+    transpose_block_vertically_func transpose_block_from_buffer_vertically_tail;
+    
+    switch (tail_src) {
+    case 1:
+        transpose_block_into_buffer_vertically_tail = transpose_block_into_buffer_vertically_tail_1;
+        break;
+    case 2:
+        transpose_block_into_buffer_vertically_tail = transpose_block_into_buffer_vertically_tail_2;
+        break;
+    case 3:
+        transpose_block_into_buffer_vertically_tail = transpose_block_into_buffer_vertically_tail_3;
+        break;
+    case 4:
+        transpose_block_into_buffer_vertically_tail = transpose_block_into_buffer_vertically_tail_4;
+        break;
+    case 5:
+        transpose_block_into_buffer_vertically_tail = transpose_block_into_buffer_vertically_tail_5;
+        break;
+    case 6:
+        transpose_block_into_buffer_vertically_tail = transpose_block_into_buffer_vertically_tail_6;
+        break;
+    case 7:
+        transpose_block_into_buffer_vertically_tail = transpose_block_into_buffer_vertically_tail_7;
+        break;
+    default:
+        transpose_block_into_buffer_vertically_tail = transpose_block_into_buffer_vertically;
+        break;
+    }
+    
+    switch (tail_dst) {
+    case 1:
+        transpose_block_from_buffer_vertically_tail = transpose_block_from_buffer_vertically_tail_1;
+        break;
+    case 2:
+        transpose_block_from_buffer_vertically_tail = transpose_block_from_buffer_vertically_tail_2;
+        break;
+    case 3:
+        transpose_block_from_buffer_vertically_tail = transpose_block_from_buffer_vertically_tail_3;
+        break;
+    case 4:
+        transpose_block_from_buffer_vertically_tail = transpose_block_from_buffer_vertically_tail_4;
+        break;
+    case 5:
+        transpose_block_from_buffer_vertically_tail = transpose_block_from_buffer_vertically_tail_5;
+        break;
+    case 6:
+        transpose_block_from_buffer_vertically_tail = transpose_block_from_buffer_vertically_tail_6;
+        break;
+    case 7:
+        transpose_block_from_buffer_vertically_tail = transpose_block_from_buffer_vertically_tail_7;
+        break;
+    default:
+        transpose_block_from_buffer_vertically_tail = transpose_block_from_buffer_vertically;
+        break;
+    }
+    
     for (int x = 0; x < mod8_w; x += 8) {
         float *srcp_buf_tr = src_buf_tr;
         float *dstp_buf_tr = dst_buf_tr;
         int y = 0;
         for (; y < mod8_h_src; y += 8) {
-            __m256 line_0 = _mm256_load_ps(srcp + stride * (y + 0));
-            __m256 line_1 = _mm256_load_ps(srcp + stride * (y + 1));
-            __m256 line_2 = _mm256_load_ps(srcp + stride * (y + 2));
-            __m256 line_3 = _mm256_load_ps(srcp + stride * (y + 3));
-            __m256 line_4 = _mm256_load_ps(srcp + stride * (y + 4));
-            __m256 line_5 = _mm256_load_ps(srcp + stride * (y + 5));
-            __m256 line_6 = _mm256_load_ps(srcp + stride * (y + 6));
-            __m256 line_7 = _mm256_load_ps(srcp + stride * (y + 7));
-            _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
-            _mm256_store_ps(src_buf_tr + src_stride * 0 + y, line_0);
-            _mm256_store_ps(src_buf_tr + src_stride * 1 + y, line_1);
-            _mm256_store_ps(src_buf_tr + src_stride * 2 + y, line_2);
-            _mm256_store_ps(src_buf_tr + src_stride * 3 + y, line_3);
-            _mm256_store_ps(src_buf_tr + src_stride * 4 + y, line_4);
-            _mm256_store_ps(src_buf_tr + src_stride * 5 + y, line_5);
-            _mm256_store_ps(src_buf_tr + src_stride * 6 + y, line_6);
-            _mm256_store_ps(src_buf_tr + src_stride * 7 + y, line_7);
+            transpose_block_into_buffer_vertically(srcp, src_buf_tr, stride, src_stride, y);
         }
         if (tail_src) {
-            __m256 line_0 = _mm256_load_ps(srcp + stride * (y + 0));
-            __m256 line_1 = (tail_src > 1) ? _mm256_load_ps(srcp + stride * (y + 1)) : _mm256_setzero_ps();
-            __m256 line_2 = (tail_src > 2) ? _mm256_load_ps(srcp + stride * (y + 2)) : _mm256_setzero_ps();
-            __m256 line_3 = (tail_src > 3) ? _mm256_load_ps(srcp + stride * (y + 3)) : _mm256_setzero_ps();
-            __m256 line_4 = (tail_src > 4) ? _mm256_load_ps(srcp + stride * (y + 4)) : _mm256_setzero_ps();
-            __m256 line_5 = (tail_src > 5) ? _mm256_load_ps(srcp + stride * (y + 5)) : _mm256_setzero_ps();
-            __m256 line_6 = (tail_src > 6) ? _mm256_load_ps(srcp + stride * (y + 6)) : _mm256_setzero_ps();
-            __m256 line_7 = _mm256_setzero_ps();
-            _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
-            _mm256_store_ps(src_buf_tr + src_stride * 0 + y, line_0);
-            _mm256_store_ps(src_buf_tr + src_stride * 1 + y, line_1);
-            _mm256_store_ps(src_buf_tr + src_stride * 2 + y, line_2);
-            _mm256_store_ps(src_buf_tr + src_stride * 3 + y, line_3);
-            _mm256_store_ps(src_buf_tr + src_stride * 4 + y, line_4);
-            _mm256_store_ps(src_buf_tr + src_stride * 5 + y, line_5);
-            _mm256_store_ps(src_buf_tr + src_stride * 6 + y, line_6);
-            _mm256_store_ps(src_buf_tr + src_stride * 7 + y, line_7);
+            transpose_block_into_buffer_vertically_tail(srcp, src_buf_tr, stride, src_stride, y);
         }
         for (int i = 0; i < 8; i++) {
             int j = 0;
@@ -2452,41 +3087,10 @@ static void descale_height(
         }
         y = 0;
         for (; y < mod8_h_dst; y += 8) {
-            __m256 line_0 = _mm256_load_ps(dst_buf_tr + dst_stride * 0 + y);
-            __m256 line_1 = _mm256_load_ps(dst_buf_tr + dst_stride * 1 + y);
-            __m256 line_2 = _mm256_load_ps(dst_buf_tr + dst_stride * 2 + y);
-            __m256 line_3 = _mm256_load_ps(dst_buf_tr + dst_stride * 3 + y);
-            __m256 line_4 = _mm256_load_ps(dst_buf_tr + dst_stride * 4 + y);
-            __m256 line_5 = _mm256_load_ps(dst_buf_tr + dst_stride * 5 + y);
-            __m256 line_6 = _mm256_load_ps(dst_buf_tr + dst_stride * 6 + y);
-            __m256 line_7 = _mm256_load_ps(dst_buf_tr + dst_stride * 7 + y);
-            _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
-            _mm256_stream_ps(dstp + stride * (y + 0), line_0);
-            _mm256_stream_ps(dstp + stride * (y + 1), line_1);
-            _mm256_stream_ps(dstp + stride * (y + 2), line_2);
-            _mm256_stream_ps(dstp + stride * (y + 3), line_3);
-            _mm256_stream_ps(dstp + stride * (y + 4), line_4);
-            _mm256_stream_ps(dstp + stride * (y + 5), line_5);
-            _mm256_stream_ps(dstp + stride * (y + 6), line_6);
-            _mm256_stream_ps(dstp + stride * (y + 7), line_7);
+            transpose_block_from_buffer_vertically(dst_buf_tr, dstp, dst_stride, stride, y);
         }
         if (tail_dst) {
-            __m256 line_0 = _mm256_load_ps(dst_buf_tr + dst_stride * 0 + y);
-            __m256 line_1 = _mm256_load_ps(dst_buf_tr + dst_stride * 1 + y);
-            __m256 line_2 = _mm256_load_ps(dst_buf_tr + dst_stride * 2 + y);
-            __m256 line_3 = _mm256_load_ps(dst_buf_tr + dst_stride * 3 + y);
-            __m256 line_4 = _mm256_load_ps(dst_buf_tr + dst_stride * 4 + y);
-            __m256 line_5 = _mm256_load_ps(dst_buf_tr + dst_stride * 5 + y);
-            __m256 line_6 = _mm256_load_ps(dst_buf_tr + dst_stride * 6 + y);
-            __m256 line_7 = _mm256_load_ps(dst_buf_tr + dst_stride * 7 + y);
-            _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
-            _mm256_stream_ps(dstp + stride * (y + 0), line_0);
-            if (tail_dst > 1) _mm256_stream_ps(dstp + stride * (y + 1), line_1);
-            if (tail_dst > 2) _mm256_stream_ps(dstp + stride * (y + 2), line_2);
-            if (tail_dst > 3) _mm256_stream_ps(dstp + stride * (y + 3), line_3);
-            if (tail_dst > 4) _mm256_stream_ps(dstp + stride * (y + 4), line_4);
-            if (tail_dst > 5) _mm256_stream_ps(dstp + stride * (y + 5), line_5);
-            if (tail_dst > 6) _mm256_stream_ps(dstp + stride * (y + 6), line_6);
+            transpose_block_from_buffer_vertically_tail(dst_buf_tr, dstp, dst_stride, stride, y);
         }
         srcp += 8;
         dstp += 8;
@@ -2496,42 +3100,10 @@ static void descale_height(
         float *dstp_buf_tr = dst_buf_tr;
         int y = 0;
         for (; y < mod8_h_src; y += 8) {
-            __m256 line_0 = _mm256_load_ps(srcp + stride * (y + 0));
-            __m256 line_1 = _mm256_load_ps(srcp + stride * (y + 1));
-            __m256 line_2 = _mm256_load_ps(srcp + stride * (y + 2));
-            __m256 line_3 = _mm256_load_ps(srcp + stride * (y + 3));
-            __m256 line_4 = _mm256_load_ps(srcp + stride * (y + 4));
-            __m256 line_5 = _mm256_load_ps(srcp + stride * (y + 5));
-            __m256 line_6 = _mm256_load_ps(srcp + stride * (y + 6));
-            __m256 line_7 = _mm256_load_ps(srcp + stride * (y + 7));
-            _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
-            _mm256_store_ps(src_buf_tr + src_stride * 0 + y, line_0);
-            _mm256_store_ps(src_buf_tr + src_stride * 1 + y, line_1);
-            _mm256_store_ps(src_buf_tr + src_stride * 2 + y, line_2);
-            _mm256_store_ps(src_buf_tr + src_stride * 3 + y, line_3);
-            _mm256_store_ps(src_buf_tr + src_stride * 4 + y, line_4);
-            _mm256_store_ps(src_buf_tr + src_stride * 5 + y, line_5);
-            _mm256_store_ps(src_buf_tr + src_stride * 6 + y, line_6);
-            _mm256_store_ps(src_buf_tr + src_stride * 7 + y, line_7);
+            transpose_block_into_buffer_vertically(srcp, src_buf_tr, stride, src_stride, y);
         }
         if (tail_src) {
-            __m256 line_0 = _mm256_load_ps(srcp + stride * (y + 0));
-            __m256 line_1 = (tail_src > 1) ? _mm256_load_ps(srcp + stride * (y + 1)) : _mm256_setzero_ps();
-            __m256 line_2 = (tail_src > 2) ? _mm256_load_ps(srcp + stride * (y + 2)) : _mm256_setzero_ps();
-            __m256 line_3 = (tail_src > 3) ? _mm256_load_ps(srcp + stride * (y + 3)) : _mm256_setzero_ps();
-            __m256 line_4 = (tail_src > 4) ? _mm256_load_ps(srcp + stride * (y + 4)) : _mm256_setzero_ps();
-            __m256 line_5 = (tail_src > 5) ? _mm256_load_ps(srcp + stride * (y + 5)) : _mm256_setzero_ps();
-            __m256 line_6 = (tail_src > 6) ? _mm256_load_ps(srcp + stride * (y + 6)) : _mm256_setzero_ps();
-            __m256 line_7 = _mm256_setzero_ps();
-            _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
-            _mm256_store_ps(src_buf_tr + src_stride * 0 + y, line_0);
-            _mm256_store_ps(src_buf_tr + src_stride * 1 + y, line_1);
-            _mm256_store_ps(src_buf_tr + src_stride * 2 + y, line_2);
-            _mm256_store_ps(src_buf_tr + src_stride * 3 + y, line_3);
-            _mm256_store_ps(src_buf_tr + src_stride * 4 + y, line_4);
-            _mm256_store_ps(src_buf_tr + src_stride * 5 + y, line_5);
-            _mm256_store_ps(src_buf_tr + src_stride * 6 + y, line_6);
-            _mm256_store_ps(src_buf_tr + src_stride * 7 + y, line_7);
+            transpose_block_into_buffer_vertically_tail(srcp, src_buf_tr, stride, src_stride, y);
         }
         for (int i = 0; i < tail_w; i++) {
             int j = 0;
@@ -2567,41 +3139,10 @@ static void descale_height(
         }
         y = 0;
         for (; y < mod8_h_dst; y += 8) {
-            __m256 line_0 = _mm256_load_ps(dst_buf_tr + dst_stride * 0 + y);
-            __m256 line_1 = _mm256_load_ps(dst_buf_tr + dst_stride * 1 + y);
-            __m256 line_2 = _mm256_load_ps(dst_buf_tr + dst_stride * 2 + y);
-            __m256 line_3 = _mm256_load_ps(dst_buf_tr + dst_stride * 3 + y);
-            __m256 line_4 = _mm256_load_ps(dst_buf_tr + dst_stride * 4 + y);
-            __m256 line_5 = _mm256_load_ps(dst_buf_tr + dst_stride * 5 + y);
-            __m256 line_6 = _mm256_load_ps(dst_buf_tr + dst_stride * 6 + y);
-            __m256 line_7 = _mm256_load_ps(dst_buf_tr + dst_stride * 7 + y);
-            _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
-            _mm256_stream_ps(dstp + stride * (y + 0), line_0);
-            _mm256_stream_ps(dstp + stride * (y + 1), line_1);
-            _mm256_stream_ps(dstp + stride * (y + 2), line_2);
-            _mm256_stream_ps(dstp + stride * (y + 3), line_3);
-            _mm256_stream_ps(dstp + stride * (y + 4), line_4);
-            _mm256_stream_ps(dstp + stride * (y + 5), line_5);
-            _mm256_stream_ps(dstp + stride * (y + 6), line_6);
-            _mm256_stream_ps(dstp + stride * (y + 7), line_7);
+            transpose_block_from_buffer_vertically(dst_buf_tr, dstp, dst_stride, stride, y);
         }
         if (tail_dst) {
-            __m256 line_0 = _mm256_load_ps(dst_buf_tr + dst_stride * 0 + y);
-            __m256 line_1 = _mm256_load_ps(dst_buf_tr + dst_stride * 1 + y);
-            __m256 line_2 = _mm256_load_ps(dst_buf_tr + dst_stride * 2 + y);
-            __m256 line_3 = _mm256_load_ps(dst_buf_tr + dst_stride * 3 + y);
-            __m256 line_4 = _mm256_load_ps(dst_buf_tr + dst_stride * 4 + y);
-            __m256 line_5 = _mm256_load_ps(dst_buf_tr + dst_stride * 5 + y);
-            __m256 line_6 = _mm256_load_ps(dst_buf_tr + dst_stride * 6 + y);
-            __m256 line_7 = _mm256_load_ps(dst_buf_tr + dst_stride * 7 + y);
-            _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
-            _mm256_stream_ps(dstp + stride * (y + 0), line_0);
-            if (tail_dst > 1) _mm256_stream_ps(dstp + stride * (y + 1), line_1);
-            if (tail_dst > 2) _mm256_stream_ps(dstp + stride * (y + 2), line_2);
-            if (tail_dst > 3) _mm256_stream_ps(dstp + stride * (y + 3), line_3);
-            if (tail_dst > 4) _mm256_stream_ps(dstp + stride * (y + 4), line_4);
-            if (tail_dst > 5) _mm256_stream_ps(dstp + stride * (y + 5), line_5);
-            if (tail_dst > 6) _mm256_stream_ps(dstp + stride * (y + 6), line_6);
+            transpose_block_from_buffer_vertically_tail(dst_buf_tr, dstp, dst_stride, stride, y);
         }
     }
     _mm_sfence();
@@ -3026,6 +3567,80 @@ typedef struct {
     VSNode *node1;
 } RelativeErrorData;
 
+#if defined(__AVX2__) && defined(__FMA__)
+static double get_relative_error(
+    const float *restrict srcp0, const float *restrict srcp1, int src_w, int src_h, ptrdiff_t stride
+) {
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    
+    __m256d acc0 = _mm256_setzero_pd();
+    __m256d acc1 = _mm256_setzero_pd();
+    __m256d acc2 = _mm256_setzero_pd();
+    __m256d acc3 = _mm256_setzero_pd();
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m256 pix0 = _mm256_load_ps(srcp0 + x);
+            __m256 pix1 = _mm256_load_ps(srcp1 + x);
+            __m256d pix0_0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 0));
+            __m256d pix0_1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 1));
+            __m256d sub0 = _mm256_sub_pd(pix0_0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 0)));
+            __m256d sub1 = _mm256_sub_pd(pix0_1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 1)));
+            acc0 = _mm256_fmadd_pd(sub0, sub0, acc0);
+            acc1 = _mm256_fmadd_pd(sub1, sub1, acc1);
+            acc2 = _mm256_fmadd_pd(pix0_0, pix0_0, acc2);
+            acc3 = _mm256_fmadd_pd(pix0_1, pix0_1, acc3);
+        }
+        if (tail) {
+            __m256 pix0 = _mm256_maskload_ps(srcp0 + x, tail_mask);
+            __m256 pix1 = _mm256_maskload_ps(srcp1 + x, tail_mask);
+            __m256d pix0_0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 0));
+            __m256d pix0_1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 1));
+            __m256d sub0 = _mm256_sub_pd(pix0_0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 0)));
+            __m256d sub1 = _mm256_sub_pd(pix0_1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 1)));
+            acc0 = _mm256_fmadd_pd(sub0, sub0, acc0);
+            acc1 = _mm256_fmadd_pd(sub1, sub1, acc1);
+            acc2 = _mm256_fmadd_pd(pix0_0, pix0_0, acc2);
+            acc3 = _mm256_fmadd_pd(pix0_1, pix0_1, acc3);
+        }
+        srcp0 += stride;
+        srcp1 += stride;
+    }
+    acc0 = _mm256_add_pd(acc0, acc1);
+    acc2 = _mm256_add_pd(acc2, acc3);
+    __m128d acc4 = _mm_add_pd(_mm256_extractf128_pd(acc0, 0), _mm256_extractf128_pd(acc0, 1));
+    __m128d acc5 = _mm_add_pd(_mm256_extractf128_pd(acc2, 0), _mm256_extractf128_pd(acc2, 1));
+    acc4 = _mm_add_sd(acc4, _mm_unpackhi_pd(acc4, acc4));
+    acc5 = _mm_add_sd(acc5, _mm_unpackhi_pd(acc5, acc5));
+    
+    return sqrt(_mm_cvtsd_f64(acc4)) / fmax(sqrt(_mm_cvtsd_f64(acc5)), 1e-16);
+}
+#else
+static double get_relative_error(
+    const float *restrict srcp0, const float *restrict srcp1, int src_w, int src_h, ptrdiff_t stride
+) {
+    double acc0 = 0.0;
+    double acc1 = 0.0;
+    
+    for (int y = 0; y < src_h; y++) {
+        for (int x = 0; x < src_w; x++) {
+            acc0 += pow((double)srcp0[x] - (double)srcp1[x], 2);
+            acc1 += pow((double)srcp0[x], 2);
+        }
+        srcp0 += stride;
+        srcp1 += stride;
+    }
+    
+    return sqrt(acc0) / fmax(sqrt(acc1), 1e-16);
+}
+#endif
+
 static const VSFrame *VS_CC RelativeErrorGetFrame(
     int n, int activationReason, void *instanceData, void **frameData UNUSED,
     VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi
@@ -3046,20 +3661,12 @@ static const VSFrame *VS_CC RelativeErrorGetFrame(
         ptrdiff_t src_stride = vsapi->getStride(src0, 0) / sizeof(float);
         int src_w = vsapi->getFrameWidth(src0, 0);
         int src_h = vsapi->getFrameHeight(src0, 0);
-        int size = src_w * src_h;
         
-        double *src_buf0 = (double *)mkl_malloc(sizeof(double) * size, 64);
-        double *src_buf1 = (double *)mkl_malloc(sizeof(double) * size, 64);
-        float_to_double(srcp0, src_buf0, src_w, src_h, src_stride);
-        float_to_double(srcp1, src_buf1, src_w, src_h, src_stride);
-        cblas_daxpy(size, -1.0, src_buf0, 1, src_buf1, 1);
-        double err = cblas_dnrm2(size, src_buf1, 1) / fmax(cblas_dnrm2(size, src_buf0, 1), 1e-16);
+        double err = get_relative_error(srcp0, srcp1, src_w, src_h, src_stride);
         
         VSMap *props = vsapi->getFramePropertiesRW(dst);
         vsapi->mapSetFloat(props, "RelativeError", err, maReplace);
         
-        mkl_free(src_buf0);
-        mkl_free(src_buf1);
         vsapi->freeFrame(src0);
         vsapi->freeFrame(src1);
         return dst;
@@ -3443,7 +4050,7 @@ static void VS_CC BitDepthCreate(
 }
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
-    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(12, 0), VAPOURSYNTH_API_VERSION, 0, plugin);
+    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(12, 1), VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction("Resize",
                              "clip:vnode;"
                              "width:int;"
