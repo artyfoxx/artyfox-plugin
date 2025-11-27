@@ -1,6 +1,6 @@
 # artyfox-plugin
 A disjointed set of filters for VapourSynth, I write everything that seems interesting.  
-By default it is compiled with AVX2 and FMA support, but you can also build a scalar version if you wish.
+The library is written using AVX2 intrinsics, with scalar implementations of functions added on a residual basis.
 ## Resize
 `artyfox.Resize(clip clip, int width, int height[, float src_left=0.0, float src_top=0.0, float src_width=clip.width, float src_height=clip.height, str kernel="area", float b=1/3, float c=1/3, int taps=3, float gamma=2.4 or ≈2.2, float sharp=1.0])`
 
@@ -46,7 +46,7 @@ Resize and alignment by fields are not supported.
 ## Descale
 `artyfox.Descale(clip clip, int width, int height[, float src_left=0.0, float src_top=0.0, float src_width=width, float src_height=height, str kernel="area", float b=1/3, float c=1/3, int taps=3, float lambda=1e-3])`
 
-Descaling via Tikhonov regularization and Cholesky decomposition. This is still just an early prototype on dense matrices, so the fps is a bit disappointing.
+Descaling via Tikhonov regularization and Cholesky decomposition. This is still just an early prototype, so the fps is a bit disappointing.
 * `clip`: Source clip to descale. Must be RGB, YUV or GRAY. 32-bit float sample type only.
 * `width`: Target width. Must be integer and match the source clip's subsampling.
 * `height`: Target height. Must be integer and match the source clip's subsampling.
@@ -63,7 +63,7 @@ Descaling via Tikhonov regularization and Cholesky decomposition. This is still 
 ## RelativeError
 `artyfox.RelativeError(clip clip0, clip clip1)`
 
-Calculates the relative error of the two input clips and stores it as the "RelativeError" property of the first clip.
+Calculates the relative error of the two input clips and stores it as the `"RelativeError"` property of the first clip.
 * `clip0`: Original clip. Must be GRAY. 32-bit float sample type only.
 * `clip1`: Restored clip. Must be GRAY. 32-bit float sample type only. The width, height and number of frames must match the original clip.
 
@@ -91,25 +91,8 @@ Converting the bit depth of a clip.
 * `bits`: The bit depth of the target clip. It can be from `8` to `16` or `32`. When converting from integer to float or vice versa, a color range conversion may also occur, since in the 32-bit float format, the concept of a limited range does not exist. The range is converted according to the frame's `"_ColorRange"` property. If this property does not exist or has an invalid value, the range is considered full for RGB and limited for YUV and GRAY. Conversion between integers occurs without regard to range. Downconversion of bit depth occurs with arithmetic rounding and saturation.
 * `direct`: If `True`, conversion from integer to float or vice versa always uses the full range and ignores the `"_ColorRange"` property. Defaults to `False`.
 
-## License
-
-This project is licensed under the MIT License — see the LICENSE file for details.
-
-### Note on Intel SVML and Intel MKL
-This project may be built using Intel software components such as:
-
-- **Intel Short Vector Math Library (SVML)** — used indirectly when compiling
-  with the Intel Compiler (ICX/ICC) to implement certain vector math intrinsics
-  such as `_mm256_pow_ps`, `_mm256_exp_ps`, `_mm256_log_ps`, etc.
-- **Intel Math Kernel Library (Intel MKL)** — optionally linked at build time to
-  provide optimized numerical routines such as matrix multiplication,
-  convolution, and related operations.
-
-No SVML or MKL source code or binaries are distributed with this project.
-Any SVML or MKL routines that may be embedded or dynamically linked into
-the compiled binary are used solely as part of the normal compilation and
-linking process provided by Intel’s compiler and libraries, and remain subject
-to Intel’s respective runtime and redistribution licenses.
-
-The original source code of this project is entirely independent and released
-under the terms of the MIT License.
+## Third-Party Components
+* This plugin uses mathematical functions from the [SLEEF library](https://sleef.org/), which is distributed under the Boost Software License 1.0.  
+A copy of the Boost Software License can be found at: https://www.boost.org/LICENSE_1_0.txt
+* This plugin uses mathematical functions from the [OpenBLAS Project](http://www.openmathlib.org/OpenBLAS/), which is distributed under the BSD-3-Clause License.  
+A copy of the BSD-3-Clause License can be found at: https://opensource.org/license/bsd-3-clause

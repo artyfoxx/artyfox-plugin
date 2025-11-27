@@ -24,55 +24,41 @@
             "group": "build",
             "detail": "Собрать GCC"
         },
-		{
+        {
             "type": "cppbuild",
-            "label": "C/C++: icx.exe сборка активного файла",
-            "command": "C:/Program Files (x86)/Intel/oneAPI/compiler/2025.3/bin/icx.exe",
+            "label": "C/C++: clang.exe сборка активного файла",
+            "command": "C:/msys64/ucrt64/bin/clang.exe",
             "args": [
-                "-LD",
+                "-shared",
+                "-static",
                 "-O2",
                 "-mavx2",
                 "-mfma",
                 "-ffast-math",
-                "-Qimf-precision=high:_mm256_pow_ps",
-				"-flto",
+                "-flto",
                 "-fuse-ld=lld",
                 "-Wall",
                 "-Wextra",
                 "-I\"C:\\Program Files\\VapourSynth\\sdk\\include\\vapoursynth\"",
-                "-I\"C:\\Program Files (x86)\\Intel\\oneAPI\\mkl\\2025.3\\include\"",
+                "-I\"C:\\msys64\\home\\artyfox\\install\\include\"",
                 "${file}",
                 "-o",
                 "${fileDirname}\\${fileBasenameNoExtension}.dll",
-                "-link",
-                "-LIBPATH:\"C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2025.3\\lib\"",
-                "-LIBPATH:\"C:\\Program Files (x86)\\Intel\\oneAPI\\mkl\\2025.3\\lib\"",
-                "mkl_sequential.lib",
-                "mkl_intel_lp64.lib",
-                "mkl_core.lib",
-                "-NOIMPLIB",
-                "-NOEXP"
+                "-L\"C:\\msys64\\home\\artyfox\\install\\lib\"",
+                "-lsleef",
+                "-lopenblas"
             ],
             "options": {
-                "cwd": "C:/Program Files (x86)/Intel/oneAPI/compiler/2025.3/bin"
+                "cwd": "C:/msys64/ucrt64/bin"
             },
-            "problemMatcher": {
-                "owner": "cpp",
-                "fileLocation": ["absolute"],
-                "pattern": {
-                    "regexp": "^(.*)\\((\\d+),(\\d+)\\): (warning|error): (.*)$",
-                    "file": 1,
-                    "line": 2,
-                    "column": 3,
-                    "severity": 4,
-                    "message": 5
-                }
-            },
+            "problemMatcher": [
+                "$gcc"
+            ],
             "group": {
                 "kind": "build",
                 "isDefault": true
             },
-            "detail": "Собрать Intel oneAPI"
+            "detail": "Собрать Clang"
         }
     ],
     "version": "2.0.0"
