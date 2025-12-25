@@ -24,41 +24,55 @@
             "group": "build",
             "detail": "Собрать GCC"
         },
-        {
+		{
             "type": "cppbuild",
-            "label": "C/C++: clang.exe сборка активного файла",
-            "command": "C:/msys64/ucrt64/bin/clang.exe",
+            "label": "C/C++: icx.exe сборка активного файла",
+            "command": "C:/Program Files (x86)/Intel/oneAPI/compiler/2025.3/bin/icx.exe",
             "args": [
-                "-shared",
-                "-static",
+                "-LD",
                 "-O2",
                 "-mavx2",
                 "-mfma",
                 "-ffast-math",
-                "-flto",
+                "-Qimf-precision=high:_mm256_pow_ps",
+				"-flto",
                 "-fuse-ld=lld",
                 "-Wall",
                 "-Wextra",
                 "-I\"C:\\Program Files\\VapourSynth\\sdk\\include\\vapoursynth\"",
-                "-I\"C:\\msys64\\home\\artyfox\\install\\include\"",
+                "-I\"C:\\Program Files (x86)\\Intel\\oneAPI\\mkl\\2025.3\\include\"",
                 "${file}",
                 "-o",
                 "${fileDirname}\\${fileBasenameNoExtension}.dll",
-                "-L\"C:\\msys64\\home\\artyfox\\install\\lib\"",
-                "-lsleef",
-                "-lopenblas"
+                "-link",
+                "-LIBPATH:\"C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2025.3\\lib\"",
+                "-LIBPATH:\"C:\\Program Files (x86)\\Intel\\oneAPI\\mkl\\2025.3\\lib\"",
+                "mkl_sequential.lib",
+                "mkl_intel_lp64.lib",
+                "mkl_core.lib",
+                "-NOIMPLIB",
+                "-NOEXP"
             ],
             "options": {
-                "cwd": "C:/msys64/ucrt64/bin"
+                "cwd": "C:/Program Files (x86)/Intel/oneAPI/compiler/2025.3/bin"
             },
-            "problemMatcher": [
-                "$gcc"
-            ],
+            "problemMatcher": {
+                "owner": "cpp",
+                "fileLocation": ["absolute"],
+                "pattern": {
+                    "regexp": "^(.*)\\((\\d+),(\\d+)\\): (warning|error): (.*)$",
+                    "file": 1,
+                    "line": 2,
+                    "column": 3,
+                    "severity": 4,
+                    "message": 5
+                }
+            },
             "group": {
                 "kind": "build",
                 "isDefault": true
             },
-            "detail": "Собрать Clang"
+            "detail": "Собрать Intel oneAPI"
         }
     ],
     "version": "2.0.0"

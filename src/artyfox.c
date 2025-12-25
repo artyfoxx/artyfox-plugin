@@ -3,12 +3,9 @@
 #include <stdlib.h>
 #ifdef __AVX2__
 #include <immintrin.h>
-#define SLEEF_STATIC_LIBS
-#include <sleef.h>
 #endif
 #include <math.h>
-#include <openblas/cblas.h>
-#include <openblas/lapacke.h>
+#include <mkl.h>
 #include "VapourSynth4.h"
 #include "VSHelper4.h"
 
@@ -16,36 +13,6 @@
 #define UNUSED __attribute__((unused))
 #define CLAMP(x, min, max) ((x) > (max) ? (max) : ((x) < (min) ? (min) : (x))) 
 #define M_PI 3.14159265358979323846
-
-#ifdef __AVX2__
-#define _MM256_TRANSPOSE8_PS(row0, row1, row2, row3, row4, row5, row6, row7) \
-do { \
-    __m256 __t0 = _mm256_unpacklo_ps((row0), (row2)); \
-    __m256 __t1 = _mm256_unpackhi_ps((row0), (row2)); \
-    __m256 __t2 = _mm256_unpacklo_ps((row1), (row3)); \
-    __m256 __t3 = _mm256_unpackhi_ps((row1), (row3)); \
-    __m256 __t4 = _mm256_unpacklo_ps((row4), (row6)); \
-    __m256 __t5 = _mm256_unpackhi_ps((row4), (row6)); \
-    __m256 __t6 = _mm256_unpacklo_ps((row5), (row7)); \
-    __m256 __t7 = _mm256_unpackhi_ps((row5), (row7)); \
-    __m256 __u0 = _mm256_unpacklo_ps(__t0, __t2); \
-    __m256 __u1 = _mm256_unpackhi_ps(__t0, __t2); \
-    __m256 __u2 = _mm256_unpacklo_ps(__t1, __t3); \
-    __m256 __u3 = _mm256_unpackhi_ps(__t1, __t3); \
-    __m256 __u4 = _mm256_unpacklo_ps(__t4, __t6); \
-    __m256 __u5 = _mm256_unpackhi_ps(__t4, __t6); \
-    __m256 __u6 = _mm256_unpacklo_ps(__t5, __t7); \
-    __m256 __u7 = _mm256_unpackhi_ps(__t5, __t7); \
-    (row0) = _mm256_permute2f128_ps(__u0, __u4, 0b00100000); \
-    (row1) = _mm256_permute2f128_ps(__u1, __u5, 0b00100000); \
-    (row2) = _mm256_permute2f128_ps(__u2, __u6, 0b00100000); \
-    (row3) = _mm256_permute2f128_ps(__u3, __u7, 0b00100000); \
-    (row4) = _mm256_permute2f128_ps(__u0, __u4, 0b00110001); \
-    (row5) = _mm256_permute2f128_ps(__u1, __u5, 0b00110001); \
-    (row6) = _mm256_permute2f128_ps(__u2, __u6, 0b00110001); \
-    (row7) = _mm256_permute2f128_ps(__u3, __u7, 0b00110001); \
-} while (0)
-#endif
 
 typedef double (*kernel_func)(double x, void *ctx);
 
@@ -56,13 +23,19 @@ typedef struct {
 } kernel_t;
 
 typedef struct {
+    float gamma, thr_to, thr_from, corr, div;
+    bool strict;
+} GammaData;
+
+typedef struct {
     VSNode *node;
     VSVideoInfo vi;
     int dst_width, dst_height;
     double start_w, start_h, real_w, real_h;
     kernel_t kernel_w, kernel_h;
-    float gamma, sharp;
-    bool process_w, process_h;
+    GammaData gamma;
+    float sharp;
+    bool linear, process_w, process_h;
 } ResizeData;
 
 typedef struct {
@@ -387,8 +360,8 @@ static double gauss_kernel(double x, void *ctx) {
 
 #if defined(__AVX2__) && defined(__FMA__)
 
-static void rgb_to_linear(
-    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h, float gamma
+static void to_linear(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h, GammaData d
 ) {
     int tail = src_w % 8;
     int mod8_w = src_w - tail;
@@ -397,39 +370,68 @@ static void rgb_to_linear(
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
     __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
     
-    __m256 v_0_04045 = _mm256_set1_ps(0.04045f);
-    __m256 v_0_055 = _mm256_set1_ps(0.055f);
-    __m256 v_1_055 = _mm256_set1_ps(1.055f);
-    __m256 v_gamma = _mm256_set1_ps(gamma);
-    __m256 v_12_92 = _mm256_set1_ps(12.92f);
-    for (int y = 0; y < src_h; y++) {
-        int x = 0;
-        for (; x < mod8_w; x += 8) {
-            __m256 pix = _mm256_load_ps(srcp + x);
-            __m256 pix_abs = Sleef_fabsf8_avx2(pix);
-            __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_0_04045, _CMP_GT_OQ);
-            __m256 branch_0 = Sleef_powf8_u10avx2(_mm256_div_ps(_mm256_add_ps(pix_abs, v_0_055), v_1_055), v_gamma);
-            __m256 branch_1 = _mm256_div_ps(pix_abs, v_12_92);
-            __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-            _mm256_stream_ps(dstp + x, Sleef_copysignf8_avx2(branch, pix));
+    __m256 v_thr = _mm256_set1_ps(d.thr_to);
+    __m256 v_corr = _mm256_set1_ps(d.corr);
+    __m256 v_corr_one = _mm256_set1_ps(1.0f + d.corr);
+    __m256 v_gamma = _mm256_set1_ps(d.gamma);
+    __m256 v_div = _mm256_set1_ps(d.div);
+    __m256 v_abs = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    
+    if (d.strict) {
+        for (int y = 0; y < src_h; y++) {
+            int x = 0;
+            for (; x < mod8_w; x += 8) {
+                __m256 pix = _mm256_load_ps(srcp + x);
+                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
+                __m256 branch_0 = _mm256_pow_ps(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
+                __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
+                __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
+            }
+            if (tail) {
+                __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
+                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
+                __m256 branch_0 = _mm256_pow_ps(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
+                __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
+                __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
+            }
+            srcp += stride;
+            dstp += stride;
         }
-        if (tail) {
-            __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
-            __m256 pix_abs = Sleef_fabsf8_avx2(pix);
-            __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_0_04045, _CMP_GT_OQ);
-            __m256 branch_0 = Sleef_powf8_u10avx2(_mm256_div_ps(_mm256_add_ps(pix_abs, v_0_055), v_1_055), v_gamma);
-            __m256 branch_1 = _mm256_div_ps(pix_abs, v_12_92);
-            __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-            _mm256_stream_ps(dstp + x, Sleef_copysignf8_avx2(branch, pix));
+    }
+    else {
+        for (int y = 0; y < src_h; y++) {
+            int x = 0;
+            for (; x < mod8_w; x += 8) {
+                __m256 pix = _mm256_load_ps(srcp + x);
+                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
+                __m256 branch_0 = _mm256_pow_ps(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
+                __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
+                __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
+            }
+            if (tail) {
+                __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
+                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
+                __m256 branch_0 = _mm256_pow_ps(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
+                __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
+                __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
+            }
+            srcp += stride;
+            dstp += stride;
         }
-        srcp += stride;
-        dstp += stride;
     }
     _mm_sfence();
 }
 
-static void yuv_to_linear(
-    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h, float gamma
+static void from_linear(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h, GammaData d
 ) {
     int tail = src_w % 8;
     int mod8_w = src_w - tail;
@@ -438,115 +440,62 @@ static void yuv_to_linear(
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
     __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
     
-    __m256 v_0_081 = _mm256_set1_ps(0.081f);
-    __m256 v_0_099 = _mm256_set1_ps(0.099f);
-    __m256 v_1_099 = _mm256_set1_ps(1.099f);
-    __m256 v_gamma = _mm256_set1_ps(gamma);
-    __m256 v_4_5 = _mm256_set1_ps(4.5f);
-    for (int y = 0; y < src_h; y++) {
-        int x = 0;
-        for (; x < mod8_w; x += 8) {
-            __m256 pix = _mm256_load_ps(srcp + x);
-            __m256 pix_abs = Sleef_fabsf8_avx2(pix);
-            __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_0_081, _CMP_GE_OQ);
-            __m256 branch_0 = Sleef_powf8_u10avx2(_mm256_div_ps(_mm256_add_ps(pix_abs, v_0_099), v_1_099), v_gamma);
-            __m256 branch_1 = _mm256_div_ps(pix_abs, v_4_5);
-            __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-            _mm256_stream_ps(dstp + x, Sleef_copysignf8_avx2(branch, pix));
+    __m256 v_thr = _mm256_set1_ps(d.thr_from);
+    __m256 v_corr = _mm256_set1_ps(d.corr);
+    __m256 v_corr_one = _mm256_set1_ps(1.0f + d.corr);
+    __m256 v_gamma = _mm256_set1_ps(1.0f / d.gamma);
+    __m256 v_div = _mm256_set1_ps(d.div);
+    __m256 v_abs = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    
+    if (d.strict) {
+        for (int y = 0; y < src_h; y++) {
+            int x = 0;
+            for (; x < mod8_w; x += 8) {
+                __m256 pix = _mm256_load_ps(srcp + x);
+                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
+                __m256 branch_0 = _mm256_fmsub_ps(_mm256_pow_ps(pix_abs, v_gamma), v_corr_one, v_corr);
+                __m256 branch_1 = _mm256_mul_ps(pix_abs, v_div);
+                __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
+            }
+            if (tail) {
+                __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
+                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
+                __m256 branch_0 = _mm256_fmsub_ps(_mm256_pow_ps(pix_abs, v_gamma), v_corr_one, v_corr);
+                __m256 branch_1 = _mm256_mul_ps(pix_abs, v_div);
+                __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
+            }
+            srcp += stride;
+            dstp += stride;
         }
-        if (tail) {
-            __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
-            __m256 pix_abs = Sleef_fabsf8_avx2(pix);
-            __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_0_081, _CMP_GE_OQ);
-            __m256 branch_0 = Sleef_powf8_u10avx2(_mm256_div_ps(_mm256_add_ps(pix_abs, v_0_099), v_1_099), v_gamma);
-            __m256 branch_1 = _mm256_div_ps(pix_abs, v_4_5);
-            __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-            _mm256_stream_ps(dstp + x, Sleef_copysignf8_avx2(branch, pix));
-        }
-        srcp += stride;
-        dstp += stride;
     }
-    _mm_sfence();
-}
-
-static void linear_to_rgb(
-    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h, float gamma
-) {
-    int tail = src_w % 8;
-    int mod8_w = src_w - tail;
-    
-    int32_t mask_arr[8] = {0};
-    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
-    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
-    
-    __m256 v_0_0031308 = _mm256_set1_ps(0.0031308f);
-    __m256 v_0_055 = _mm256_set1_ps(0.055f);
-    __m256 v_1_055 = _mm256_set1_ps(1.055f);
-    __m256 v_gamma = _mm256_set1_ps(1.0f / gamma);
-    __m256 v_12_92 = _mm256_set1_ps(12.92f);
-    for (int y = 0; y < src_h; y++) {
-        int x = 0;
-        for (; x < mod8_w; x += 8) {
-            __m256 pix = _mm256_load_ps(srcp + x);
-            __m256 pix_abs = Sleef_fabsf8_avx2(pix);
-            __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_0_0031308, _CMP_GT_OQ);
-            __m256 branch_0 = _mm256_fmsub_ps(Sleef_powf8_u10avx2(pix_abs, v_gamma), v_1_055, v_0_055);
-            __m256 branch_1 = _mm256_mul_ps(pix_abs, v_12_92);
-            __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-            _mm256_stream_ps(dstp + x, Sleef_copysignf8_avx2(branch, pix));
+    else {
+        for (int y = 0; y < src_h; y++) {
+            int x = 0;
+            for (; x < mod8_w; x += 8) {
+                __m256 pix = _mm256_load_ps(srcp + x);
+                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
+                __m256 branch_0 = _mm256_fmsub_ps(_mm256_pow_ps(pix_abs, v_gamma), v_corr_one, v_corr);
+                __m256 branch_1 = _mm256_mul_ps(pix_abs, v_div);
+                __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
+            }
+            if (tail) {
+                __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
+                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
+                __m256 branch_0 = _mm256_fmsub_ps(_mm256_pow_ps(pix_abs, v_gamma), v_corr_one, v_corr);
+                __m256 branch_1 = _mm256_mul_ps(pix_abs, v_div);
+                __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
+            }
+            srcp += stride;
+            dstp += stride;
         }
-        if (tail) {
-            __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
-            __m256 pix_abs = Sleef_fabsf8_avx2(pix);
-            __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_0_0031308, _CMP_GT_OQ);
-            __m256 branch_0 = _mm256_fmsub_ps(Sleef_powf8_u10avx2(pix_abs, v_gamma), v_1_055, v_0_055);
-            __m256 branch_1 = _mm256_mul_ps(pix_abs, v_12_92);
-            __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-            _mm256_stream_ps(dstp + x, Sleef_copysignf8_avx2(branch, pix));
-        }
-        srcp += stride;
-        dstp += stride;
-    }
-    _mm_sfence();
-}
-
-static void linear_to_yuv(
-    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h, float gamma
-) {
-    int tail = src_w % 8;
-    int mod8_w = src_w - tail;
-    
-    int32_t mask_arr[8] = {0};
-    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
-    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
-    
-    __m256 v_0_018 = _mm256_set1_ps(0.018f);
-    __m256 v_0_099 = _mm256_set1_ps(0.099f);
-    __m256 v_1_099 = _mm256_set1_ps(1.099f);
-    __m256 v_gamma = _mm256_set1_ps(1.0f / gamma);
-    __m256 v_4_5 = _mm256_set1_ps(4.5f);
-    for (int y = 0; y < src_h; y++) {
-        int x = 0;
-        for (; x < mod8_w; x += 8) {
-            __m256 pix = _mm256_load_ps(srcp + x);
-            __m256 pix_abs = Sleef_fabsf8_avx2(pix);
-            __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_0_018, _CMP_GE_OQ);
-            __m256 branch_0 = _mm256_fmsub_ps(Sleef_powf8_u10avx2(pix_abs, v_gamma), v_1_099, v_0_099);
-            __m256 branch_1 = _mm256_mul_ps(pix_abs, v_4_5);
-            __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-            _mm256_stream_ps(dstp + x, Sleef_copysignf8_avx2(branch, pix));
-        }
-        if (tail) {
-            __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
-            __m256 pix_abs = Sleef_fabsf8_avx2(pix);
-            __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_0_018, _CMP_GE_OQ);
-            __m256 branch_0 = _mm256_fmsub_ps(Sleef_powf8_u10avx2(pix_abs, v_gamma), v_1_099, v_0_099);
-            __m256 branch_1 = _mm256_mul_ps(pix_abs, v_4_5);
-            __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-            _mm256_stream_ps(dstp + x, Sleef_copysignf8_avx2(branch, pix));
-        }
-        srcp += stride;
-        dstp += stride;
     }
     _mm_sfence();
 }
@@ -599,7 +548,7 @@ static void uint8_to_float(
     }
     else {
         v_low = _mm256_set1_ps(chroma ? 128.0f : 0.0f);
-        v_high = _mm256_set1_ps(chroma ? 254.0f : 255.0f);
+        v_high = _mm256_set1_ps(chroma ? 256.0f : 255.0f);
     }
     
     for (int y = 0; y < src_h; y++) {
@@ -610,7 +559,7 @@ static void uint8_to_float(
             __m256 pix_1 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_shuffle_epi32(pix, _MM_SHUFFLE(1, 0, 3, 2))));
             __m256 branch_0 = _mm256_div_ps(_mm256_sub_ps(pix_0, v_low), v_high);
             __m256 branch_1 = _mm256_div_ps(_mm256_sub_ps(pix_1, v_low), v_high);
-            _mm256_stream_ps(dstp + x, branch_0);
+            _mm256_stream_ps(dstp + x + 0, branch_0);
             _mm256_stream_ps(dstp + x + 8, branch_1);
         }
         if (tail > 8) {
@@ -619,7 +568,7 @@ static void uint8_to_float(
             __m256 pix_1 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_shuffle_epi32(pix, _MM_SHUFFLE(1, 0, 3, 2))));
             __m256 branch_0 = _mm256_div_ps(_mm256_sub_ps(pix_0, v_low), v_high);
             __m256 branch_1 = _mm256_div_ps(_mm256_sub_ps(pix_1, v_low), v_high);
-            _mm256_stream_ps(dstp + x, branch_0);
+            _mm256_stream_ps(dstp + x + 0, branch_0);
             _mm256_stream_ps(dstp + x + 8, branch_1);
         }
         else if (tail) {
@@ -645,30 +594,24 @@ static void uint16_to_uint8(
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
     __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
     
-    __m256 v_div = _mm256_set1_ps((float)(1 << (bits - 8)));
-    __m256 v_half = _mm256_set1_ps(0.5f);
+    int count = bits - 8;
+    __m256i v_half = _mm256_set1_epi16(1 << (count - 1));
     
     for (int y = 0; y < src_h; y++) {
         int x = 0;
         for (; x < mod16_w; x += 16) {
             __m256i pix = _mm256_load_si256((__m256i *)(srcp + x));
-            __m256 pix_f_0 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 0)));
-            __m256 pix_f_1 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 1)));
-            __m256i pix_i_0 = _mm256_cvttps_epi32(_mm256_add_ps(_mm256_div_ps(pix_f_0, v_div), v_half));
-            __m256i pix_i_1 = _mm256_cvttps_epi32(_mm256_add_ps(_mm256_div_ps(pix_f_1, v_div), v_half));
-            __m128i pix_u_0 = _mm_packus_epi32(_mm256_extracti128_si256(pix_i_0, 0), _mm256_extracti128_si256(pix_i_0, 1));
-            __m128i pix_u_1 = _mm_packus_epi32(_mm256_extracti128_si256(pix_i_1, 0), _mm256_extracti128_si256(pix_i_1, 1));
-            _mm_stream_si128((__m128i *)(dstp + x), _mm_packus_epi16(pix_u_0, pix_u_1));
+            __m256i branch = _mm256_srli_epi16(_mm256_adds_epu16(pix, v_half), count);
+            __m128i branch_u_0 = _mm256_extracti128_si256(branch, 0);
+            __m128i branch_u_1 = _mm256_extracti128_si256(branch, 1);
+            _mm_stream_si128((__m128i *)(dstp + x), _mm_packus_epi16(branch_u_0, branch_u_1));
         }
         if (tail) {
             __m256i pix = _mm256_and_si256(_mm256_load_si256((__m256i *)(srcp + x)), tail_mask);
-            __m256 pix_f_0 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 0)));
-            __m256 pix_f_1 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 1)));
-            __m256i pix_i_0 = _mm256_cvttps_epi32(_mm256_add_ps(_mm256_div_ps(pix_f_0, v_div), v_half));
-            __m256i pix_i_1 = _mm256_cvttps_epi32(_mm256_add_ps(_mm256_div_ps(pix_f_1, v_div), v_half));
-            __m128i pix_u_0 = _mm_packus_epi32(_mm256_extracti128_si256(pix_i_0, 0), _mm256_extracti128_si256(pix_i_0, 1));
-            __m128i pix_u_1 = _mm_packus_epi32(_mm256_extracti128_si256(pix_i_1, 0), _mm256_extracti128_si256(pix_i_1, 1));
-            _mm_stream_si128((__m128i *)(dstp + x), _mm_packus_epi16(pix_u_0, pix_u_1));
+            __m256i branch = _mm256_srli_epi16(_mm256_adds_epu16(pix, v_half), count);
+            __m128i branch_u_0 = _mm256_extracti128_si256(branch, 0);
+            __m128i branch_u_1 = _mm256_extracti128_si256(branch, 1);
+            _mm_stream_si128((__m128i *)(dstp + x), _mm_packus_epi16(branch_u_0, branch_u_1));
         }
         srcp += src_stride;
         dstp += dst_stride;
@@ -706,26 +649,19 @@ static void uint16_to_uint16(
         }
     }
     else {
-        __m256 v_div = _mm256_set1_ps((float)(1 << (src_bits - dst_bits)));
-        __m256 v_half = _mm256_set1_ps(0.5f);
+        int count = src_bits - dst_bits;
+        __m256i v_half = _mm256_set1_epi16(1 << (count - 1));
+        __m256i v_max = _mm256_set1_epi16((1 << dst_bits) - 1);
         for (int y = 0; y < src_h; y++) {
             int x = 0;
             for (; x < mod16_w; x += 16) {
                 __m256i pix = _mm256_load_si256((__m256i *)(srcp + x));
-                __m256 pix_f_0 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 0)));
-                __m256 pix_f_1 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 1)));
-                __m256i pix_i_0 = _mm256_cvttps_epi32(_mm256_add_ps(_mm256_div_ps(pix_f_0, v_div), v_half));
-                __m256i pix_i_1 = _mm256_cvttps_epi32(_mm256_add_ps(_mm256_div_ps(pix_f_1, v_div), v_half));
-                __m256i branch = _mm256_permute4x64_epi64(_mm256_packus_epi32(pix_i_0, pix_i_1), _MM_SHUFFLE(3, 1, 2, 0));
+                __m256i branch = _mm256_min_epu16(_mm256_srli_epi16(_mm256_adds_epu16(pix, v_half), count), v_max);
                 _mm256_stream_si256((__m256i *)(dstp + x), branch);
             }
             if (tail) {
                 __m256i pix = _mm256_and_si256(_mm256_load_si256((__m256i *)(srcp + x)), tail_mask);
-                __m256 pix_f_0 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 0)));
-                __m256 pix_f_1 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 1)));
-                __m256i pix_i_0 = _mm256_cvttps_epi32(_mm256_add_ps(_mm256_div_ps(pix_f_0, v_div), v_half));
-                __m256i pix_i_1 = _mm256_cvttps_epi32(_mm256_add_ps(_mm256_div_ps(pix_f_1, v_div), v_half));
-                __m256i branch = _mm256_permute4x64_epi64(_mm256_packus_epi32(pix_i_0, pix_i_1), _MM_SHUFFLE(3, 1, 2, 0));
+                __m256i branch = _mm256_min_epu16(_mm256_srli_epi16(_mm256_adds_epu16(pix, v_half), count), v_max);
                 _mm256_stream_si256((__m256i *)(dstp + x), branch);
             }
             srcp += src_stride;
@@ -753,7 +689,7 @@ static void uint16_to_float(
     }
     else {
         v_low = _mm256_set1_ps(chroma ? (float)(128 << (bits - 8)) : 0.0f);
-        v_high = _mm256_set1_ps(chroma ? (float)((1 << bits) - 2) : (float)((1 << bits) - 1));
+        v_high = _mm256_set1_ps(chroma ? (float)(1 << bits) : (float)((1 << bits) - 1));
     }
     
     for (int y = 0; y < src_h; y++) {
@@ -795,13 +731,13 @@ static void float_to_uint8(
     }
     else {
         v_low = _mm256_set1_ps(chroma ? 128.5f : 0.5f);
-        v_high = _mm256_set1_ps(chroma ? 254.0f : 255.0f);
+        v_high = _mm256_set1_ps(chroma ? 256.0f : 255.0f);
     }
     
     for (int y = 0; y < src_h; y++) {
         int x = 0;
         for (; x < mod16_w; x += 16) {
-            __m256 pix_f_0 = _mm256_load_ps(srcp + x);
+            __m256 pix_f_0 = _mm256_load_ps(srcp + x + 0);
             __m256 pix_f_1 = _mm256_load_ps(srcp + x + 8);
             __m256i pix_i_0 = _mm256_cvttps_epi32(_mm256_fmadd_ps(pix_f_0, v_high, v_low));
             __m256i pix_i_1 = _mm256_cvttps_epi32(_mm256_fmadd_ps(pix_f_1, v_high, v_low));
@@ -810,7 +746,7 @@ static void float_to_uint8(
             _mm_stream_si128((__m128i *)(dstp + x), _mm_packus_epi16(pix_u_0, pix_u_1));
         }
         if (tail > 8) {
-            __m256 pix_f_0 = _mm256_load_ps(srcp + x);
+            __m256 pix_f_0 = _mm256_load_ps(srcp + x + 0);
             __m256 pix_f_1 = _mm256_maskload_ps(srcp + x + 8, tail_mask_1);
             __m256i pix_i_0 = _mm256_cvttps_epi32(_mm256_fmadd_ps(pix_f_0, v_high, v_low));
             __m256i pix_i_1 = _mm256_cvttps_epi32(_mm256_fmadd_ps(pix_f_1, v_high, v_low));
@@ -841,6 +777,7 @@ static void float_to_uint16(
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
     __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
     
+    __m256i v_max = _mm256_set1_epi32((1 << bits) - 1);
     __m256 v_low, v_high;
     if (range) {
         v_low = _mm256_set1_ps(0.5f + (float)((chroma ? 128 : 16) << (bits - 8)));
@@ -848,20 +785,20 @@ static void float_to_uint16(
     }
     else {
         v_low = _mm256_set1_ps(chroma ? 0.5f + (float)(128 << (bits - 8)) : 0.5f);
-        v_high = _mm256_set1_ps(chroma ? (float)((1 << bits) - 2) : (float)((1 << bits) - 1));
+        v_high = _mm256_set1_ps(chroma ? (float)(1 << bits) : (float)((1 << bits) - 1));
     }
     
     for (int y = 0; y < src_h; y++) {
         int x = 0;
         for (; x < mod8_w; x += 8) {
             __m256 pix_f = _mm256_load_ps(srcp + x);
-            __m256i pix_i = _mm256_cvttps_epi32(_mm256_fmadd_ps(pix_f, v_high, v_low));
+            __m256i pix_i = _mm256_min_epi32(_mm256_cvttps_epi32(_mm256_fmadd_ps(pix_f, v_high, v_low)), v_max);
             __m128i pix_u = _mm_packus_epi32(_mm256_extracti128_si256(pix_i, 0), _mm256_extracti128_si256(pix_i, 1));
             _mm_stream_si128((__m128i *)(dstp + x), pix_u);
         }
         if (tail) {
             __m256 pix_f = _mm256_maskload_ps(srcp + x, tail_mask);
-            __m256i pix_i = _mm256_cvttps_epi32(_mm256_fmadd_ps(pix_f, v_high, v_low));
+            __m256i pix_i = _mm256_min_epi32(_mm256_cvttps_epi32(_mm256_fmadd_ps(pix_f, v_high, v_low)), v_max);
             __m128i pix_u = _mm_packus_epi32(_mm256_extracti128_si256(pix_i, 0), _mm256_extracti128_si256(pix_i, 1));
             _mm_stream_si128((__m128i *)(dstp + x), pix_u);
         }
@@ -982,6 +919,107 @@ static void sharp_height(
     }
 }
 
+static void _mm256_transpose8_lane4_ps(__m256 *row0, __m256 *row1, __m256 *row2, __m256 *row3) {
+    __m256 t0 = _mm256_unpacklo_ps(*row0, *row2);
+    __m256 t1 = _mm256_unpackhi_ps(*row0, *row2);
+    __m256 t2 = _mm256_unpacklo_ps(*row1, *row3);
+    __m256 t3 = _mm256_unpackhi_ps(*row1, *row3);
+    __m256 u0 = _mm256_unpacklo_ps(t0, t2);
+    __m256 u1 = _mm256_unpackhi_ps(t0, t2);
+    __m256 u2 = _mm256_unpacklo_ps(t1, t3);
+    __m256 u3 = _mm256_unpackhi_ps(t1, t3);
+    *row0 = _mm256_permute2f128_ps(u0, u1, 0b00100000);
+    *row1 = _mm256_permute2f128_ps(u2, u3, 0b00100000);
+    *row2 = _mm256_permute2f128_ps(u0, u1, 0b00110001);
+    *row3 = _mm256_permute2f128_ps(u2, u3, 0b00110001);
+}
+
+static void _mm256_transpose4_lane8_ps(__m256 *row0, __m256 *row1, __m256 *row2, __m256 *row3) {
+    __m256 t0 = _mm256_permute2f128_ps(*row0, *row2, 0b00100000);
+    __m256 t1 = _mm256_permute2f128_ps(*row1, *row3, 0b00100000);
+    __m256 t2 = _mm256_permute2f128_ps(*row0, *row2, 0b00110001);
+    __m256 t3 = _mm256_permute2f128_ps(*row1, *row3, 0b00110001);
+    __m256 u0 = _mm256_unpacklo_ps(t0, t1);
+    __m256 u1 = _mm256_unpackhi_ps(t0, t1);
+    __m256 u2 = _mm256_unpacklo_ps(t2, t3);
+    __m256 u3 = _mm256_unpackhi_ps(t2, t3);
+    *row0 = _mm256_unpacklo_ps(u0, u2);
+    *row1 = _mm256_unpackhi_ps(u0, u2);
+    *row2 = _mm256_unpacklo_ps(u1, u3);
+    *row3 = _mm256_unpackhi_ps(u1, u3);
+}
+
+static void transpose_block_into_buf(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w
+) {
+    for (int x = 0; x < src_w; x += 8) {
+        __m256 line_0 = _mm256_load_ps(srcp + stride * 0);
+        __m256 line_1 = _mm256_load_ps(srcp + stride * 1);
+        __m256 line_2 = _mm256_load_ps(srcp + stride * 2);
+        __m256 line_3 = _mm256_load_ps(srcp + stride * 3);
+        _mm256_transpose8_lane4_ps(&line_0, &line_1, &line_2, &line_3);
+        _mm256_store_ps(dstp + 0, line_0);
+        _mm256_store_ps(dstp + 8, line_1);
+        _mm256_store_ps(dstp + 16, line_2);
+        _mm256_store_ps(dstp + 24, line_3);
+        srcp += 8;
+        dstp += 32;
+    }
+}
+
+static void transpose_block_into_buf_with_tail(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int tail
+) {
+    for (int x = 0; x < src_w; x += 8) {
+        __m256 line_0 = _mm256_load_ps(srcp + stride * 0);
+        __m256 line_1 = (tail > 1) ? _mm256_load_ps(srcp + stride * 1) : _mm256_setzero_ps();
+        __m256 line_2 = (tail > 2) ? _mm256_load_ps(srcp + stride * 2) : _mm256_setzero_ps();
+        __m256 line_3 = _mm256_setzero_ps();
+        _mm256_transpose8_lane4_ps(&line_0, &line_1, &line_2, &line_3);
+        _mm256_store_ps(dstp + 0, line_0);
+        _mm256_store_ps(dstp + 8, line_1);
+        _mm256_store_ps(dstp + 16, line_2);
+        _mm256_store_ps(dstp + 24, line_3);
+        srcp += 8;
+        dstp += 32;
+    }
+}
+
+static void transpose_block_from_buf(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int dst_w
+) {
+    for (int x = 0; x < dst_w; x += 8) {
+        __m256 line_0 = _mm256_load_ps(srcp + 0);
+        __m256 line_1 = _mm256_load_ps(srcp + 8);
+        __m256 line_2 = _mm256_load_ps(srcp + 16);
+        __m256 line_3 = _mm256_load_ps(srcp + 24);
+        _mm256_transpose4_lane8_ps(&line_0, &line_1, &line_2, &line_3);
+        _mm256_stream_ps(dstp + stride * 0, line_0);
+        _mm256_stream_ps(dstp + stride * 1, line_1);
+        _mm256_stream_ps(dstp + stride * 2, line_2);
+        _mm256_stream_ps(dstp + stride * 3, line_3);
+        srcp += 32;
+        dstp += 8;
+    }
+}
+
+static void transpose_block_from_buf_with_tail(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int dst_w, int tail
+) {
+    for (int x = 0; x < dst_w; x += 8) {
+        __m256 line_0 = _mm256_load_ps(srcp + 0);
+        __m256 line_1 = _mm256_load_ps(srcp + 8);
+        __m256 line_2 = _mm256_load_ps(srcp + 16);
+        __m256 line_3 = _mm256_load_ps(srcp + 24);
+        _mm256_transpose4_lane8_ps(&line_0, &line_1, &line_2, &line_3);
+        _mm256_stream_ps(dstp + stride * 0, line_0);
+        if (tail > 1) _mm256_stream_ps(dstp + stride * 1, line_1);
+        if (tail > 2) _mm256_stream_ps(dstp + stride * 2, line_2);
+        srcp += 32;
+        dstp += 8;
+    }
+}
+
 static void resize_width(
     const float *restrict srcp, float *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride,
     int src_w, int src_h, int dst_w, double start_w, double real_w, kernel_t kernel
@@ -1008,7 +1046,7 @@ static void resize_width(
             double temp_val = kernel.f((i - center) * scale, kernel.ctx);
             if (temp_val == 0.0) continue;
             norm += temp_val;
-            int64_t temp_idx = CLAMP(i, 0, border) * 8LL;
+            int64_t temp_idx = CLAMP(i, 0, border) * 4;
             if (row_ptr[x] != nnz && temp_idx == col_idx[nnz - 1]) {
                 weights[nnz - 1] += temp_val;
                 continue;
@@ -1023,114 +1061,39 @@ static void resize_width(
         row_ptr[x + 1] = nnz;
     }
     
-    float *restrict src_buf = (float *)_mm_malloc(sizeof(float) * src_stride * 8, 64);
-    float *restrict dst_buf = (float *)_mm_malloc(sizeof(float) * dst_stride * 8, 64);
+    float *restrict src_buf = (float *)_mm_malloc(sizeof(float) * src_stride * 4, 64);
+    float *restrict dst_buf = (float *)_mm_malloc(sizeof(float) * dst_stride * 4, 64);
     
-    int tail = src_h % 8;
-    int mod8_h = src_h - tail;
+    int tail = src_h % 4;
+    int mod4_h = src_h - tail;
     
-    for (int y = 0; y < mod8_h; y += 8) {
-        for (int x = 0; x < src_w; x += 8) {
-            __m256 line_0 = _mm256_load_ps(srcp + x + src_stride * 0);
-            __m256 line_1 = _mm256_load_ps(srcp + x + src_stride * 1);
-            __m256 line_2 = _mm256_load_ps(srcp + x + src_stride * 2);
-            __m256 line_3 = _mm256_load_ps(srcp + x + src_stride * 3);
-            __m256 line_4 = _mm256_load_ps(srcp + x + src_stride * 4);
-            __m256 line_5 = _mm256_load_ps(srcp + x + src_stride * 5);
-            __m256 line_6 = _mm256_load_ps(srcp + x + src_stride * 6);
-            __m256 line_7 = _mm256_load_ps(srcp + x + src_stride * 7);
-            _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
-            _mm256_store_ps(src_buf + x * 8 + 0, line_0);
-            _mm256_store_ps(src_buf + x * 8 + 8, line_1);
-            _mm256_store_ps(src_buf + x * 8 + 16, line_2);
-            _mm256_store_ps(src_buf + x * 8 + 24, line_3);
-            _mm256_store_ps(src_buf + x * 8 + 32, line_4);
-            _mm256_store_ps(src_buf + x * 8 + 40, line_5);
-            _mm256_store_ps(src_buf + x * 8 + 48, line_6);
-            _mm256_store_ps(src_buf + x * 8 + 56, line_7);
-        }
+    for (int y = 0; y < mod4_h; y += 4) {
+        transpose_block_into_buf(srcp, src_buf, src_stride, src_w);
         for (int x = 0; x < dst_w; x++) {
-            __m256d v_acc_0 = _mm256_setzero_pd();
-            __m256d v_acc_1 = _mm256_setzero_pd();
+            __m256d v_acc = _mm256_setzero_pd();
             for (int i = row_ptr[x]; i < row_ptr[x + 1]; i++) {
-                __m256 pix = _mm256_load_ps(src_buf + col_idx[i]);
+                __m128 pix = _mm_load_ps(src_buf + col_idx[i]);
                 __m256d v_weight = _mm256_set1_pd(weights[i]);
-                v_acc_0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), v_weight, v_acc_0);
-                v_acc_1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), v_weight, v_acc_1);
+                v_acc = _mm256_fmadd_pd(_mm256_cvtps_pd(pix), v_weight, v_acc);
             }
-            _mm256_store_ps(dst_buf + x * 8, _mm256_setr_m128(_mm256_cvtpd_ps(v_acc_0), _mm256_cvtpd_ps(v_acc_1)));
+            _mm_store_ps(dst_buf + x * 4, _mm256_cvtpd_ps(v_acc));
         }
-        for (int x = 0; x < dst_w; x += 8) {
-            __m256 line_0 = _mm256_load_ps(dst_buf + x * 8 + 0);
-            __m256 line_1 = _mm256_load_ps(dst_buf + x * 8 + 8);
-            __m256 line_2 = _mm256_load_ps(dst_buf + x * 8 + 16);
-            __m256 line_3 = _mm256_load_ps(dst_buf + x * 8 + 24);
-            __m256 line_4 = _mm256_load_ps(dst_buf + x * 8 + 32);
-            __m256 line_5 = _mm256_load_ps(dst_buf + x * 8 + 40);
-            __m256 line_6 = _mm256_load_ps(dst_buf + x * 8 + 48);
-            __m256 line_7 = _mm256_load_ps(dst_buf + x * 8 + 56);
-            _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
-            _mm256_stream_ps(dstp + x + dst_stride * 0, line_0);
-            _mm256_stream_ps(dstp + x + dst_stride * 1, line_1);
-            _mm256_stream_ps(dstp + x + dst_stride * 2, line_2);
-            _mm256_stream_ps(dstp + x + dst_stride * 3, line_3);
-            _mm256_stream_ps(dstp + x + dst_stride * 4, line_4);
-            _mm256_stream_ps(dstp + x + dst_stride * 5, line_5);
-            _mm256_stream_ps(dstp + x + dst_stride * 6, line_6);
-            _mm256_stream_ps(dstp + x + dst_stride * 7, line_7);
-        }
-        dstp += dst_stride * 8;
-        srcp += src_stride * 8;
+        transpose_block_from_buf(dst_buf, dstp, dst_stride, dst_w);
+        dstp += dst_stride * 4;
+        srcp += src_stride * 4;
     }
     if (tail) {
-        for (int x = 0; x < src_w; x += 8) {
-            __m256 line_0 = _mm256_load_ps(srcp + x + src_stride * 0);
-            __m256 line_1 = (tail > 1) ? _mm256_load_ps(srcp + x + src_stride * 1) : _mm256_setzero_ps();
-            __m256 line_2 = (tail > 2) ? _mm256_load_ps(srcp + x + src_stride * 2) : _mm256_setzero_ps();
-            __m256 line_3 = (tail > 3) ? _mm256_load_ps(srcp + x + src_stride * 3) : _mm256_setzero_ps();
-            __m256 line_4 = (tail > 4) ? _mm256_load_ps(srcp + x + src_stride * 4) : _mm256_setzero_ps();
-            __m256 line_5 = (tail > 5) ? _mm256_load_ps(srcp + x + src_stride * 5) : _mm256_setzero_ps();
-            __m256 line_6 = (tail > 6) ? _mm256_load_ps(srcp + x + src_stride * 6) : _mm256_setzero_ps();
-            __m256 line_7 = _mm256_setzero_ps();
-            _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
-            _mm256_store_ps(src_buf + x * 8 + 0, line_0);
-            _mm256_store_ps(src_buf + x * 8 + 8, line_1);
-            _mm256_store_ps(src_buf + x * 8 + 16, line_2);
-            _mm256_store_ps(src_buf + x * 8 + 24, line_3);
-            _mm256_store_ps(src_buf + x * 8 + 32, line_4);
-            _mm256_store_ps(src_buf + x * 8 + 40, line_5);
-            _mm256_store_ps(src_buf + x * 8 + 48, line_6);
-            _mm256_store_ps(src_buf + x * 8 + 56, line_7);
-        }
+        transpose_block_into_buf_with_tail(srcp, src_buf, src_stride, src_w, tail);
         for (int x = 0; x < dst_w; x++) {
-            __m256d v_acc_0 = _mm256_setzero_pd();
-            __m256d v_acc_1 = _mm256_setzero_pd();
+            __m256d v_acc = _mm256_setzero_pd();
             for (int i = row_ptr[x]; i < row_ptr[x + 1]; i++) {
-                __m256 pix = _mm256_load_ps(src_buf + col_idx[i]);
+                __m128 pix = _mm_load_ps(src_buf + col_idx[i]);
                 __m256d v_weight = _mm256_set1_pd(weights[i]);
-                v_acc_0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), v_weight, v_acc_0);
-                v_acc_1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), v_weight, v_acc_1);
+                v_acc = _mm256_fmadd_pd(_mm256_cvtps_pd(pix), v_weight, v_acc);
             }
-            _mm256_store_ps(dst_buf + x * 8, _mm256_setr_m128(_mm256_cvtpd_ps(v_acc_0), _mm256_cvtpd_ps(v_acc_1)));
+            _mm_store_ps(dst_buf + x * 4, _mm256_cvtpd_ps(v_acc));
         }
-        for (int x = 0; x < dst_w; x += 8) {
-            __m256 line_0 = _mm256_load_ps(dst_buf + x * 8 + 0);
-            __m256 line_1 = _mm256_load_ps(dst_buf + x * 8 + 8);
-            __m256 line_2 = _mm256_load_ps(dst_buf + x * 8 + 16);
-            __m256 line_3 = _mm256_load_ps(dst_buf + x * 8 + 24);
-            __m256 line_4 = _mm256_load_ps(dst_buf + x * 8 + 32);
-            __m256 line_5 = _mm256_load_ps(dst_buf + x * 8 + 40);
-            __m256 line_6 = _mm256_load_ps(dst_buf + x * 8 + 48);
-            __m256 line_7 = _mm256_load_ps(dst_buf + x * 8 + 56);
-            _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
-            _mm256_stream_ps(dstp + x + dst_stride * 0, line_0);
-            if (tail > 1) _mm256_stream_ps(dstp + x + dst_stride * 1, line_1);
-            if (tail > 2) _mm256_stream_ps(dstp + x + dst_stride * 2, line_2);
-            if (tail > 3) _mm256_stream_ps(dstp + x + dst_stride * 3, line_3);
-            if (tail > 4) _mm256_stream_ps(dstp + x + dst_stride * 4, line_4);
-            if (tail > 5) _mm256_stream_ps(dstp + x + dst_stride * 5, line_5);
-            if (tail > 6) _mm256_stream_ps(dstp + x + dst_stride * 6, line_6);
-        }
+        transpose_block_from_buf_with_tail(dst_buf, dstp, dst_stride, dst_w, tail);
     }
     _mm_sfence();
     _mm_free(dst_buf);
@@ -1215,83 +1178,81 @@ static void resize_height(
 
 #else
 
-static void rgb_to_linear(
-    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h, float gamma
+static void to_linear(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h, GammaData d
 ) {
-    for (int y = 0; y < src_h; y++) {
-        for (int x = 0; x < src_w; x++) {
-            if (srcp[x] > 0.04045f) {
-                dstp[x] = powf((srcp[x] + 0.055f) / 1.055f, gamma);
+    if (d.strict) {
+        for (int y = 0; y < src_h; y++) {
+            for (int x = 0; x < src_w; x++) {
+                float pix = fabsf(srcp[x]);
+                float dst;
+                if (pix > d.thr_to) {
+                    dst = powf((pix + d.corr) / (d.corr + 1.0f), d.gamma);
+                }
+                else {
+                    dst = pix / d.div;
+                }
+                dstp[x] = copysignf(dst, srcp[x]);
             }
-            else if (srcp[x] < -0.04045f) {
-                dstp[x] = -powf((-srcp[x] + 0.055f) / 1.055f, gamma);
-            }
-            else {
-                dstp[x] = srcp[x] / 12.92f;
-            }
+            srcp += stride;
+            dstp += stride;
         }
-        srcp += stride;
-        dstp += stride;
+    }
+    else {
+        for (int y = 0; y < src_h; y++) {
+            for (int x = 0; x < src_w; x++) {
+                float pix = fabsf(srcp[x]);
+                float dst;
+                if (pix >= d.thr_to) {
+                    dst = powf((pix + d.corr) / (d.corr + 1.0f), d.gamma);
+                }
+                else {
+                    dst = pix / d.div;
+                }
+                dstp[x] = copysignf(dst, srcp[x]);
+            }
+            srcp += stride;
+            dstp += stride;
+        }
     }
 }
 
-static void yuv_to_linear(
-    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h, float gamma
+static void from_linear(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h, GammaData d
 ) {
-    for (int y = 0; y < src_h; y++) {
-        for (int x = 0; x < src_w; x++) {
-            if (srcp[x] >= 0.081f) {
-                dstp[x] = powf((srcp[x] + 0.099f) / 1.099f, gamma);
+    if (d.strict) {
+        for (int y = 0; y < src_h; y++) {
+            for (int x = 0; x < src_w; x++) {
+                float pix = fabsf(srcp[x]);
+                float dst;
+                if (pix > d.thr_from) {
+                    dst = powf(pix, 1.0f / d.gamma) * (d.corr + 1.0f) - d.corr;
+                }
+                else {
+                    dst = pix * d.div;
+                }
+                dstp[x] = copysignf(dst, srcp[x]);
             }
-            else if (srcp[x] <= -0.081f) {
-                dstp[x] = -powf((-srcp[x] + 0.099f) / 1.099f, gamma);
-            }
-            else {
-                dstp[x] = srcp[x] / 4.5f;
-            }
+            srcp += stride;
+            dstp += stride;
         }
-        srcp += stride;
-        dstp += stride;
     }
-}
-
-static void linear_to_rgb(
-    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h, float gamma
-) {
-    for (int y = 0; y < src_h; y++) {
-        for (int x = 0; x < src_w; x++) {
-            if (srcp[x] > 0.0031308f) {
-                dstp[x] = powf(srcp[x], 1.0f / gamma) * 1.055f - 0.055f;
+    else {
+        for (int y = 0; y < src_h; y++) {
+            for (int x = 0; x < src_w; x++) {
+                float pix = fabsf(srcp[x]);
+                float dst;
+                if (pix >= d.thr_from) {
+                    dst = powf(pix, 1.0f / d.gamma) * (d.corr + 1.0f) - d.corr;
+                }
+                else {
+                    dst = pix * d.div;
+                }
+                dstp[x] = copysignf(dst, srcp[x]);
             }
-            else if (srcp[x] < -0.0031308f) {
-                dstp[x] = powf(-srcp[x], 1.0f / gamma) * -1.055f + 0.055f;
-            }
-            else {
-                dstp[x] = srcp[x] * 12.92f;
-            }
+            srcp += stride;
+            dstp += stride;
         }
-        srcp += stride;
-        dstp += stride;
-    }
-}
-
-static void linear_to_yuv(
-    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h, float gamma
-) {
-    for (int y = 0; y < src_h; y++) {
-        for (int x = 0; x < src_w; x++) {
-            if (srcp[x] >= 0.018f) {
-                dstp[x] = powf(srcp[x], 1.0f / gamma) * 1.099f - 0.099f;
-            }
-            else if (srcp[x] <= -0.018f) {
-                dstp[x] = powf(-srcp[x], 1.0f / gamma) * -1.099f + 0.099f;
-            }
-            else {
-                dstp[x] = srcp[x] * 4.5f;
-            }
-        }
-        srcp += stride;
-        dstp += stride;
     }
 }
 
@@ -1319,7 +1280,7 @@ static void uint8_to_float(
     }
     else {
         low = (chroma ? 128.0f : 0.0f);
-        high = (chroma ? 254.0f : 255.0f);
+        high = (chroma ? 256.0f : 255.0f);
     }
     for (int y = 0; y < src_h; y++) {
         for (int x = 0; x < src_w; x++) {
@@ -1379,7 +1340,7 @@ static void uint16_to_float(
     }
     else {
         low = (chroma ? 128 << (bits - 8) : 0);
-        high = (chroma ? (1 << bits) - 2 : (1 << bits) - 1);
+        high = (chroma ? 1 << bits : (1 << bits) - 1);
     }
     for (int y = 0; y < src_h; y++) {
         for (int x = 0; x < src_w; x++) {
@@ -1401,7 +1362,7 @@ static void float_to_uint8(
     }
     else {
         low = (chroma ? 128.0f : 0.0f);
-        high = (chroma ? 254.0f : 255.0f);
+        high = (chroma ? 256.0f : 255.0f);
     }
     for (int y = 0; y < src_h; y++) {
         for (int x = 0; x < src_w; x++) {
@@ -1416,6 +1377,7 @@ static void float_to_uint16(
     const float *restrict srcp, uint16_t *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride,
     int src_w, int src_h, bool chroma, bool range, int bits
 ) {
+    float full = (1 << bits) - 1;
     float low, high;
     if (range) {
         low = (chroma ? 128 : 16) << (bits - 8);
@@ -1423,9 +1385,8 @@ static void float_to_uint16(
     }
     else {
         low = (chroma ? 128 << (bits - 8) : 0);
-        high = (chroma ? (1 << bits) - 2 : (1 << bits) - 1);
+        high = (chroma ? 1 << bits : full);
     }
-    float full = (1 << bits) - 1;
     for (int y = 0; y < src_h; y++) {
         for (int x = 0; x < src_w; x++) {
             dstp[x] = fmaxf(fminf(srcp[x] * high + low + 0.5f, full), 0.0f);
@@ -1586,7 +1547,7 @@ static const VSFrame *VS_CC ResizeGetFrame(
         
         VSFrame *lin = NULL;
         VSFrame *gcr = NULL;
-        if (d->gamma != 1.0f) {
+        if (d->linear) {
             lin = vsapi->newVideoFrame(&d->vi.format, d->vi.width, d->vi.height, NULL, core);
             gcr = vsapi->newVideoFrame(&d->vi.format, d->dst_width, d->dst_height, NULL, core);
         }
@@ -1663,14 +1624,9 @@ static const VSFrame *VS_CC ResizeGetFrame(
                 dst_stride = vsapi->getStride(dst, plane) / sizeof(float);
             }
             
-            if (d->gamma != 1.0f) {
+            if (d->linear) {
                 float *restrict linp = (float *)vsapi->getWritePtr(lin, plane);
-                if (fi->colorFamily == cfRGB) {
-                    rgb_to_linear(srcp, linp, src_stride, src_w, src_h, d->gamma);
-                }
-                else {
-                    yuv_to_linear(srcp, linp, src_stride, src_w, src_h, d->gamma);
-                }
+                to_linear(srcp, linp, src_stride, src_w, src_h, d->gamma);
                 srcp = linp;
                 dstp = (void *)vsapi->getWritePtr(gcr, plane);
             }
@@ -1696,15 +1652,10 @@ static const VSFrame *VS_CC ResizeGetFrame(
                 sharp_height(shrp, dstp, dst_stride, dst_w, dst_h, d->sharp);
             }
             
-            if (d->gamma != 1.0f) {
+            if (d->linear) {
                 float *restrict gcrp = dstp;
                 dstp = bit_convert ? (void *)vsapi->getWritePtr(bcd, plane) : (void *)vsapi->getWritePtr(dst, plane);
-                if (fi->colorFamily == cfRGB) {
-                    linear_to_rgb(gcrp, dstp, dst_stride, dst_w, dst_h, d->gamma);
-                }
-                else {
-                    linear_to_yuv(gcrp, dstp, dst_stride, dst_w, dst_h, d->gamma);
-                }
+                from_linear(gcrp, dstp, dst_stride, dst_w, dst_h, d->gamma);
             }
             
             if (bit_convert) {
@@ -1844,13 +1795,37 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData UNUSE
         d.real_h += d.vi.height - d.start_h;
     }
     
-    d.gamma = vsapi->mapGetFloatSaturated(in, "gamma", 0, &err);
-    if (err) {
-        d.gamma = (d.vi.format.colorFamily == cfRGB) ? 2.4f : 1.0f / 0.45f;
-    }
+    d.linear = true;
     
-    if (d.gamma < 0.1f || d.gamma > 5.0f) {
-        vsapi->mapSetError(out, "Resize: gamma must be between 0.1 and 5");
+    const char *gamma = vsapi->mapGetData(in, "gamma", 0, &err);
+    if (err) {
+        if (d.vi.format.colorFamily == cfRGB) {
+            d.gamma = (GammaData){2.4f, 0.04045f, 0.0031308f, 0.055f, 12.92f, true};
+        }
+        else {
+            d.gamma = (GammaData){1.0f / 0.45f, 0.081f, 0.018f, 0.099f, 4.5f, false};
+        }
+    }
+    else if (!strcmp(gamma, "srgb")) {
+        d.gamma = (GammaData){2.4f, 0.04045f, 0.0031308f, 0.055f, 12.92f, true};
+    }
+    else if (!strcmp(gamma, "smpte170m")) {
+        d.gamma = (GammaData){1.0f / 0.45f, 0.081f, 0.018f, 0.099f, 4.5f, false};
+    }
+    else if (!strcmp(gamma, "adobe")) {
+        d.gamma = (GammaData){2.19921875f, 0.0f, 0.0f, 0.0f, 1.0f, false};
+    }
+    else if (!strcmp(gamma, "dcip3")) {
+        d.gamma = (GammaData){2.6f, 0.0f, 0.0f, 0.0f, 1.0f, false};
+    }
+    else if (!strcmp(gamma, "smpte240m")) {
+        d.gamma = (GammaData){1.0f / 0.45f, 0.0913f, 0.0228f, 0.1115f, 4.0f, false};
+    }
+    else if (!strcmp(gamma, "none")) {
+        d.linear = false;
+    }
+    else {
+        vsapi->mapSetError(out, "Resize: invalid gamma specified");
         vsapi->freeNode(d.node);
         return;
     }
@@ -2109,6 +2084,65 @@ static void banded_packed_gramian_from_csr(
     }
 }
 
+static void transpose_double_block_from_buf(
+    const double *restrict srcp, float *restrict dstp, ptrdiff_t stride, int dst_w
+) {
+    for (int x = 0; x < dst_w; x += 8) {
+        __m256 line_0 = _mm256_setr_m128(
+            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 0)),
+            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 4))
+        );
+        __m256 line_1 = _mm256_setr_m128(
+            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 8)),
+            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 12))
+        );
+        __m256 line_2 = _mm256_setr_m128(
+            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 16)),
+            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 20))
+        );
+        __m256 line_3 = _mm256_setr_m128(
+            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 24)),
+            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 28))
+        );
+        _mm256_transpose4_lane8_ps(&line_0, &line_1, &line_2, &line_3);
+        _mm256_stream_ps(dstp + stride * 0, line_0);
+        _mm256_stream_ps(dstp + stride * 1, line_1);
+        _mm256_stream_ps(dstp + stride * 2, line_2);
+        _mm256_stream_ps(dstp + stride * 3, line_3);
+        srcp += 32;
+        dstp += 8;
+    }
+}
+
+static void transpose_double_block_from_buf_with_tail(
+    const double *restrict srcp, float *restrict dstp, ptrdiff_t stride, int dst_w, int tail
+) {
+    for (int x = 0; x < dst_w; x += 8) {
+        __m256 line_0 = _mm256_setr_m128(
+            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 0)),
+            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 4))
+        );
+        __m256 line_1 = _mm256_setr_m128(
+            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 8)),
+            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 12))
+        );
+        __m256 line_2 = _mm256_setr_m128(
+            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 16)),
+            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 20))
+        );
+        __m256 line_3 = _mm256_setr_m128(
+            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 24)),
+            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 28))
+        );
+        _mm256_transpose4_lane8_ps(&line_0, &line_1, &line_2, &line_3);
+        _mm256_stream_ps(dstp + stride * 0, line_0);
+        if (tail > 1) _mm256_stream_ps(dstp + stride * 1, line_1);
+        if (tail > 2) _mm256_stream_ps(dstp + stride * 2, line_2);
+        srcp += 32;
+        dstp += 8;
+    }
+}
+
 static void descale_width(
     const float *restrict srcp, float *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride,
     int src_w, int src_h, int dst_w, double start_w, double real_w, double lambda, kernel_t kernel
@@ -2118,9 +2152,9 @@ static void descale_width(
     int max_w = (int)ceil(real_w + start_w) - 1;
     int border = dst_w - 1;
     int step = (int)ceil(kernel.radius * 2) + 2;
-    double *weights = _mm_malloc(sizeof(double) * step * src_w, 64);
-    int *col_idx = _mm_malloc(sizeof(int) * step * src_w, 64);
-    int *row_ptr = _mm_malloc(sizeof(int) * (src_w + 1), 64);
+    double *weights = malloc(sizeof(double) * step * src_w);
+    int *col_idx = malloc(sizeof(int) * step * src_w);
+    int *row_ptr = malloc(sizeof(int) * (src_w + 1));
     row_ptr[0] = 0;
     int nnz = 0;
     
@@ -2148,9 +2182,9 @@ static void descale_width(
         row_ptr[x + 1] = nnz;
     }
     
-    double *weights_tr = _mm_malloc(sizeof(double) * nnz, 64);
-    int *col_idx_tr = _mm_malloc(sizeof(int) * nnz, 64);
-    int *row_ptr_tr = _mm_malloc(sizeof(int) * (dst_w + 1), 64);
+    double *weights_tr = malloc(sizeof(double) * nnz);
+    int *col_idx_tr = malloc(sizeof(int) * nnz);
+    int *row_ptr_tr = malloc(sizeof(int) * (dst_w + 1));
     transpose_csr(weights, col_idx, row_ptr, weights_tr, col_idx_tr, row_ptr_tr, nnz, dst_w, src_w);
     
     int ku = get_ku_from_csr(col_idx, row_ptr, src_w);
@@ -2164,181 +2198,52 @@ static void descale_width(
     
     LAPACKE_dpbtrf(LAPACK_ROW_MAJOR, 'U', dst_w, ku, matrix, dst_stride);
     
-    float *restrict src_buf = (float *)_mm_malloc(sizeof(float) * src_stride * 8, 64);
-    double *restrict dst_buf = (double *)_mm_malloc(sizeof(double) * dst_stride * 8, 64);
+    float *restrict src_buf = (float *)_mm_malloc(sizeof(float) * src_stride * 4, 64);
+    double *restrict dst_buf = (double *)_mm_malloc(sizeof(double) * dst_stride * 4, 64);
     
-    int tail = src_h % 8;
-    int mod8_h = src_h - tail;
+    int tail = src_h % 4;
+    int mod4_h = src_h - tail;
     
-    for (int y = 0; y < mod8_h; y += 8) {
-        for (int x = 0; x < src_w; x += 8) {
-            __m256 line_0 = _mm256_load_ps(srcp + x + src_stride * 0);
-            __m256 line_1 = _mm256_load_ps(srcp + x + src_stride * 1);
-            __m256 line_2 = _mm256_load_ps(srcp + x + src_stride * 2);
-            __m256 line_3 = _mm256_load_ps(srcp + x + src_stride * 3);
-            __m256 line_4 = _mm256_load_ps(srcp + x + src_stride * 4);
-            __m256 line_5 = _mm256_load_ps(srcp + x + src_stride * 5);
-            __m256 line_6 = _mm256_load_ps(srcp + x + src_stride * 6);
-            __m256 line_7 = _mm256_load_ps(srcp + x + src_stride * 7);
-            _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
-            _mm256_store_ps(src_buf + x * 8 + 0, line_0);
-            _mm256_store_ps(src_buf + x * 8 + 8, line_1);
-            _mm256_store_ps(src_buf + x * 8 + 16, line_2);
-            _mm256_store_ps(src_buf + x * 8 + 24, line_3);
-            _mm256_store_ps(src_buf + x * 8 + 32, line_4);
-            _mm256_store_ps(src_buf + x * 8 + 40, line_5);
-            _mm256_store_ps(src_buf + x * 8 + 48, line_6);
-            _mm256_store_ps(src_buf + x * 8 + 56, line_7);
-        }
+    for (int y = 0; y < mod4_h; y += 4) {
+        transpose_block_into_buf(srcp, src_buf, src_stride, src_w);
         for (int x = 0; x < dst_w; x++) {
-            __m256d v_acc_0 = _mm256_setzero_pd();
-            __m256d v_acc_1 = _mm256_setzero_pd();
+            __m256d v_acc = _mm256_setzero_pd();
             for (int i = row_ptr_tr[x]; i < row_ptr_tr[x + 1]; i++) {
-                __m256 pix = _mm256_load_ps(src_buf + col_idx_tr[i] * 8);
+                __m128 pix = _mm_load_ps(src_buf + col_idx_tr[i] * 4);
                 __m256d v_weight = _mm256_set1_pd(weights_tr[i]);
-                v_acc_0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), v_weight, v_acc_0);
-                v_acc_1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), v_weight, v_acc_1);
+                v_acc = _mm256_fmadd_pd(_mm256_cvtps_pd(pix), v_weight, v_acc);
             }
-            _mm256_store_pd(dst_buf + x * 8 + 0, v_acc_0);
-            _mm256_store_pd(dst_buf + x * 8 + 4, v_acc_1);
+            _mm256_store_pd(dst_buf + x * 4, v_acc);
         }
-        
-        LAPACKE_dpbtrs(LAPACK_ROW_MAJOR, 'U', dst_w, ku, 8, matrix, dst_stride, dst_buf, 8);
-        
-        for (int x = 0; x < dst_w; x += 8) {
-            __m256 line_0 = _mm256_setr_m128(
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 0)),
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 4))
-            );
-            __m256 line_1 = _mm256_setr_m128(
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 8)),
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 12))
-            );
-            __m256 line_2 = _mm256_setr_m128(
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 16)),
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 20))
-            );
-            __m256 line_3 = _mm256_setr_m128(
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 24)),
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 28))
-            );
-            __m256 line_4 = _mm256_setr_m128(
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 32)),
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 36))
-            );
-            __m256 line_5 = _mm256_setr_m128(
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 40)),
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 44))
-            );
-            __m256 line_6 = _mm256_setr_m128(
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 48)),
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 52))
-            );
-            __m256 line_7 = _mm256_setr_m128(
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 56)),
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 60))
-            );
-            _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
-            _mm256_stream_ps(dstp + x + dst_stride * 0, line_0);
-            _mm256_stream_ps(dstp + x + dst_stride * 1, line_1);
-            _mm256_stream_ps(dstp + x + dst_stride * 2, line_2);
-            _mm256_stream_ps(dstp + x + dst_stride * 3, line_3);
-            _mm256_stream_ps(dstp + x + dst_stride * 4, line_4);
-            _mm256_stream_ps(dstp + x + dst_stride * 5, line_5);
-            _mm256_stream_ps(dstp + x + dst_stride * 6, line_6);
-            _mm256_stream_ps(dstp + x + dst_stride * 7, line_7);
-        }
-        dstp += dst_stride * 8;
-        srcp += src_stride * 8;
+        LAPACKE_dpbtrs(LAPACK_ROW_MAJOR, 'U', dst_w, ku, 4, matrix, dst_stride, dst_buf, 4);
+        transpose_double_block_from_buf(dst_buf, dstp, dst_stride, dst_w);
+        dstp += dst_stride * 4;
+        srcp += src_stride * 4;
     }
     if (tail) {
-        for (int x = 0; x < src_w; x += 8) {
-            __m256 line_0 = _mm256_load_ps(srcp + x + src_stride * 0);
-            __m256 line_1 = (tail > 1) ? _mm256_load_ps(srcp + x + src_stride * 1) : _mm256_setzero_ps();
-            __m256 line_2 = (tail > 2) ? _mm256_load_ps(srcp + x + src_stride * 2) : _mm256_setzero_ps();
-            __m256 line_3 = (tail > 3) ? _mm256_load_ps(srcp + x + src_stride * 3) : _mm256_setzero_ps();
-            __m256 line_4 = (tail > 4) ? _mm256_load_ps(srcp + x + src_stride * 4) : _mm256_setzero_ps();
-            __m256 line_5 = (tail > 5) ? _mm256_load_ps(srcp + x + src_stride * 5) : _mm256_setzero_ps();
-            __m256 line_6 = (tail > 6) ? _mm256_load_ps(srcp + x + src_stride * 6) : _mm256_setzero_ps();
-            __m256 line_7 = _mm256_setzero_ps();
-            _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
-            _mm256_store_ps(src_buf + x * 8 + 0, line_0);
-            _mm256_store_ps(src_buf + x * 8 + 8, line_1);
-            _mm256_store_ps(src_buf + x * 8 + 16, line_2);
-            _mm256_store_ps(src_buf + x * 8 + 24, line_3);
-            _mm256_store_ps(src_buf + x * 8 + 32, line_4);
-            _mm256_store_ps(src_buf + x * 8 + 40, line_5);
-            _mm256_store_ps(src_buf + x * 8 + 48, line_6);
-            _mm256_store_ps(src_buf + x * 8 + 56, line_7);
-        }
+        transpose_block_into_buf_with_tail(srcp, src_buf, src_stride, src_w, tail);
         for (int x = 0; x < dst_w; x++) {
-            __m256d v_acc_0 = _mm256_setzero_pd();
-            __m256d v_acc_1 = _mm256_setzero_pd();
+            __m256d v_acc = _mm256_setzero_pd();
             for (int i = row_ptr_tr[x]; i < row_ptr_tr[x + 1]; i++) {
-                __m256 pix = _mm256_load_ps(src_buf + col_idx_tr[i] * 8);
+                __m128 pix = _mm_load_ps(src_buf + col_idx_tr[i] * 4);
                 __m256d v_weight = _mm256_set1_pd(weights_tr[i]);
-                v_acc_0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), v_weight, v_acc_0);
-                v_acc_1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), v_weight, v_acc_1);
+                v_acc = _mm256_fmadd_pd(_mm256_cvtps_pd(pix), v_weight, v_acc);
             }
-            _mm256_store_pd(dst_buf + x * 8 + 0, v_acc_0);
-            _mm256_store_pd(dst_buf + x * 8 + 4, v_acc_1);
+            _mm256_store_pd(dst_buf + x * 4, v_acc);
         }
-        
-        LAPACKE_dpbtrs(LAPACK_ROW_MAJOR, 'U', dst_w, ku, tail, matrix, dst_stride, dst_buf, 8);
-        
-        for (int x = 0; x < dst_w; x += 8) {
-            __m256 line_0 = _mm256_setr_m128(
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 0)),
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 4))
-            );
-            __m256 line_1 = _mm256_setr_m128(
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 8)),
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 12))
-            );
-            __m256 line_2 = _mm256_setr_m128(
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 16)),
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 20))
-            );
-            __m256 line_3 = _mm256_setr_m128(
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 24)),
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 28))
-            );
-            __m256 line_4 = _mm256_setr_m128(
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 32)),
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 36))
-            );
-            __m256 line_5 = _mm256_setr_m128(
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 40)),
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 44))
-            );
-            __m256 line_6 = _mm256_setr_m128(
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 48)),
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 52))
-            );
-            __m256 line_7 = _mm256_setr_m128(
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 56)),
-                _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + x * 8 + 60))
-            );
-            _MM256_TRANSPOSE8_PS(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7);
-            _mm256_stream_ps(dstp + x + dst_stride * 0, line_0);
-            if (tail > 1) _mm256_stream_ps(dstp + x + dst_stride * 1, line_1);
-            if (tail > 2) _mm256_stream_ps(dstp + x + dst_stride * 2, line_2);
-            if (tail > 3) _mm256_stream_ps(dstp + x + dst_stride * 3, line_3);
-            if (tail > 4) _mm256_stream_ps(dstp + x + dst_stride * 4, line_4);
-            if (tail > 5) _mm256_stream_ps(dstp + x + dst_stride * 5, line_5);
-            if (tail > 6) _mm256_stream_ps(dstp + x + dst_stride * 6, line_6);
-        }
+        LAPACKE_dpbtrs(LAPACK_ROW_MAJOR, 'U', dst_w, ku, tail, matrix, dst_stride, dst_buf, 4);
+        transpose_double_block_from_buf_with_tail(dst_buf, dstp, dst_stride, dst_w, tail);
     }
     _mm_sfence();
     _mm_free(dst_buf);
     _mm_free(src_buf);
     _mm_free(matrix);
-    _mm_free(row_ptr_tr);
-    _mm_free(col_idx_tr);
-    _mm_free(weights_tr);
-    _mm_free(row_ptr);
-    _mm_free(col_idx);
-    _mm_free(weights);
+    free(row_ptr_tr);
+    free(col_idx_tr);
+    free(weights_tr);
+    free(row_ptr);
+    free(col_idx);
+    free(weights);
 }
 
 static void descale_height(
@@ -2357,9 +2262,9 @@ static void descale_height(
     int max_h = (int)ceil(real_h + start_h) - 1;
     int border = dst_h - 1;
     int step = (int)ceil(kernel.radius * 2) + 2;
-    double *weights = _mm_malloc(sizeof(double) * step * src_h, 64);
-    int *col_idx = _mm_malloc(sizeof(int) * step * src_h, 64);
-    int *row_ptr = _mm_malloc(sizeof(int) * (src_h + 1), 64);
+    double *weights = malloc(sizeof(double) * step * src_h);
+    int *col_idx = malloc(sizeof(int) * step * src_h);
+    int *row_ptr = malloc(sizeof(int) * (src_h + 1));
     row_ptr[0] = 0;
     int nnz = 0;
     
@@ -2387,9 +2292,9 @@ static void descale_height(
         row_ptr[y + 1] = nnz;
     }
     
-    double *weights_tr = _mm_malloc(sizeof(double) * nnz, 64);
-    int *col_idx_tr = _mm_malloc(sizeof(int) * nnz, 64);
-    int *row_ptr_tr = _mm_malloc(sizeof(int) * (dst_h + 1), 64);
+    double *weights_tr = malloc(sizeof(double) * nnz);
+    int *col_idx_tr = malloc(sizeof(int) * nnz);
+    int *row_ptr_tr = malloc(sizeof(int) * (dst_h + 1));
     transpose_csr(weights, col_idx, row_ptr, weights_tr, col_idx_tr, row_ptr_tr, nnz, dst_h, src_h);
     
     int ku = get_ku_from_csr(col_idx, row_ptr, src_h);
@@ -2420,9 +2325,7 @@ static void descale_height(
             _mm256_store_pd(dst_buf + y * 8 + 0, v_acc_0);
             _mm256_store_pd(dst_buf + y * 8 + 4, v_acc_1);
         }
-        
         LAPACKE_dpbtrs(LAPACK_ROW_MAJOR, 'U', dst_h, ku, 8, matrix, dst_stride, dst_buf, 8);
-        
         for (int y = 0; y < dst_h; y++) {
             __m128 pix0 = _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + y * 8 + 0));
             __m128 pix1 = _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + y * 8 + 4));
@@ -2444,9 +2347,7 @@ static void descale_height(
             _mm256_store_pd(dst_buf + y * 8 + 0, v_acc_0);
             _mm256_store_pd(dst_buf + y * 8 + 4, v_acc_1);
         }
-        
         LAPACKE_dpbtrs(LAPACK_ROW_MAJOR, 'U', dst_h, ku, tail, matrix, dst_stride, dst_buf, 8);
-        
         for (int y = 0; y < dst_h; y++) {
             __m128 pix0 = _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + y * 8 + 0));
             __m128 pix1 = _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + y * 8 + 4));
@@ -2456,12 +2357,12 @@ static void descale_height(
     _mm_sfence();
     _mm_free(dst_buf);
     _mm_free(matrix);
-    _mm_free(row_ptr_tr);
-    _mm_free(col_idx_tr);
-    _mm_free(weights_tr);
-    _mm_free(row_ptr);
-    _mm_free(col_idx);
-    _mm_free(weights);
+    free(row_ptr_tr);
+    free(col_idx_tr);
+    free(weights_tr);
+    free(row_ptr);
+    free(col_idx);
+    free(weights);
 }
 
 static const VSFrame *VS_CC DescaleGetFrame(
@@ -2988,15 +2889,15 @@ static void VS_CC RelativeErrorCreate(
 typedef struct {
     VSNode *node;
     VSVideoInfo vi;
-    float gamma;
+    GammaData gamma;
     bool process[3];
-} GammaData;
+} LinearData;
 
 static const VSFrame *VS_CC LinearizeGetFrame(
     int n, int activationReason, void *instanceData, void **frameData UNUSED,
     VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi
 ) {
-    GammaData *d = (GammaData *)instanceData;
+    LinearData *d = (LinearData *)instanceData;
     
     if (activationReason == arInitial) {
         vsapi->requestFrameFilter(n, d->node, frameCtx);
@@ -3015,12 +2916,7 @@ static const VSFrame *VS_CC LinearizeGetFrame(
             int src_h = vsapi->getFrameHeight(src, plane);
             
             if (d->process[plane]) {
-                if (fi->colorFamily == cfRGB) {
-                    rgb_to_linear(srcp, dstp, src_stride, src_w, src_h, d->gamma);
-                }
-                else {
-                    yuv_to_linear(srcp, dstp, src_stride, src_w, src_h, d->gamma);
-                }
+                to_linear(srcp, dstp, src_stride, src_w, src_h, d->gamma);
             }
             else {
                 vsh_bitblt(dstp, sizeof(float) * src_stride, srcp, sizeof(float) * src_stride, sizeof(float) * src_w, src_h);
@@ -3033,7 +2929,7 @@ static const VSFrame *VS_CC LinearizeGetFrame(
 }
 
 static void VS_CC LinearizeFree(void *instanceData, VSCore *core UNUSED, const VSAPI *vsapi) {
-    GammaData *d = (GammaData *)instanceData;
+    LinearData *d = (LinearData *)instanceData;
     vsapi->freeNode(d->node);
     free(d);
 }
@@ -3041,7 +2937,7 @@ static void VS_CC LinearizeFree(void *instanceData, VSCore *core UNUSED, const V
 static void VS_CC LinearizeCreate(
     const VSMap *in, VSMap *out, void *userData UNUSED, VSCore *core, const VSAPI *vsapi
 ) {
-    GammaData d;
+    LinearData d;
     d.node = vsapi->mapGetNode(in, "clip", 0, NULL);
     d.vi = *vsapi->getVideoInfo(d.node);
     
@@ -3053,13 +2949,32 @@ static void VS_CC LinearizeCreate(
     
     int err;
     
-    d.gamma = vsapi->mapGetFloatSaturated(in, "gamma", 0, &err);
+    const char *gamma = vsapi->mapGetData(in, "gamma", 0, &err);
     if (err) {
-        d.gamma = (d.vi.format.colorFamily == cfRGB) ? 2.4f : 1.0f / 0.45f;
+        if (d.vi.format.colorFamily == cfRGB) {
+            d.gamma = (GammaData){2.4f, 0.04045f, 0.0031308f, 0.055f, 12.92f, true};
+        }
+        else {
+            d.gamma = (GammaData){1.0f / 0.45f, 0.081f, 0.018f, 0.099f, 4.5f, false};
+        }
     }
-    
-    if (d.gamma < 0.1f || d.gamma > 5.0f) {
-        vsapi->mapSetError(out, "Linearize: gamma must be between 0.1 and 5");
+    else if (!strcmp(gamma, "srgb")) {
+        d.gamma = (GammaData){2.4f, 0.04045f, 0.0031308f, 0.055f, 12.92f, true};
+    }
+    else if (!strcmp(gamma, "smpte170m")) {
+        d.gamma = (GammaData){1.0f / 0.45f, 0.081f, 0.018f, 0.099f, 4.5f, false};
+    }
+    else if (!strcmp(gamma, "adobe")) {
+        d.gamma = (GammaData){2.19921875f, 0.0f, 0.0f, 0.0f, 1.0f, false};
+    }
+    else if (!strcmp(gamma, "dcip3")) {
+        d.gamma = (GammaData){2.6f, 0.0f, 0.0f, 0.0f, 1.0f, false};
+    }
+    else if (!strcmp(gamma, "smpte240m")) {
+        d.gamma = (GammaData){1.0f / 0.45f, 0.0913f, 0.0228f, 0.1115f, 4.0f, false};
+    }
+    else {
+        vsapi->mapSetError(out, "Linearize: invalid gamma specified");
         vsapi->freeNode(d.node);
         return;
     }
@@ -3088,7 +3003,7 @@ static void VS_CC LinearizeCreate(
         d.process[n] = true;
     }
     
-    GammaData *data = (GammaData *)malloc(sizeof d);
+    LinearData *data = (LinearData *)malloc(sizeof d);
     *data = d;
     
     VSFilterDependency deps[] = {{d.node, rpStrictSpatial}};
@@ -3099,7 +3014,7 @@ static const VSFrame *VS_CC GammaCorrGetFrame(
     int n, int activationReason, void *instanceData, void **frameData UNUSED,
     VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi
 ) {
-    GammaData *d = (GammaData *)instanceData;
+    LinearData *d = (LinearData *)instanceData;
     
     if (activationReason == arInitial) {
         vsapi->requestFrameFilter(n, d->node, frameCtx);
@@ -3118,12 +3033,7 @@ static const VSFrame *VS_CC GammaCorrGetFrame(
             int src_h = vsapi->getFrameHeight(src, plane);
             
             if (d->process[plane]) {
-                if (fi->colorFamily == cfRGB) {
-                    linear_to_rgb(srcp, dstp, src_stride, src_w, src_h, d->gamma);
-                }
-                else {
-                    linear_to_yuv(srcp, dstp, src_stride, src_w, src_h, d->gamma);
-                }
+                from_linear(srcp, dstp, src_stride, src_w, src_h, d->gamma);
             }
             else {
                 vsh_bitblt(dstp, sizeof(float) * src_stride, srcp, sizeof(float) * src_stride, sizeof(float) * src_w, src_h);
@@ -3136,7 +3046,7 @@ static const VSFrame *VS_CC GammaCorrGetFrame(
 }
 
 static void VS_CC GammaCorrFree(void *instanceData, VSCore *core UNUSED, const VSAPI *vsapi) {
-    GammaData *d = (GammaData *)instanceData;
+    LinearData *d = (LinearData *)instanceData;
     vsapi->freeNode(d->node);
     free(d);
 }
@@ -3144,7 +3054,7 @@ static void VS_CC GammaCorrFree(void *instanceData, VSCore *core UNUSED, const V
 static void VS_CC GammaCorrCreate(
     const VSMap *in, VSMap *out, void *userData UNUSED, VSCore *core, const VSAPI *vsapi
 ) {
-    GammaData d;
+    LinearData d;
     d.node = vsapi->mapGetNode(in, "clip", 0, NULL);
     d.vi = *vsapi->getVideoInfo(d.node);
     
@@ -3156,13 +3066,32 @@ static void VS_CC GammaCorrCreate(
     
     int err;
     
-    d.gamma = vsapi->mapGetFloatSaturated(in, "gamma", 0, &err);
+    const char *gamma = vsapi->mapGetData(in, "gamma", 0, &err);
     if (err) {
-        d.gamma = (d.vi.format.colorFamily == cfRGB) ? 2.4f : 1.0f / 0.45f;
+        if (d.vi.format.colorFamily == cfRGB) {
+            d.gamma = (GammaData){2.4f, 0.04045f, 0.0031308f, 0.055f, 12.92f, true};
+        }
+        else {
+            d.gamma = (GammaData){1.0f / 0.45f, 0.081f, 0.018f, 0.099f, 4.5f, false};
+        }
     }
-    
-    if (d.gamma < 0.1f || d.gamma > 5.0f) {
-        vsapi->mapSetError(out, "GammaCorr: gamma must be between 0.1 and 5");
+    else if (!strcmp(gamma, "srgb")) {
+        d.gamma = (GammaData){2.4f, 0.04045f, 0.0031308f, 0.055f, 12.92f, true};
+    }
+    else if (!strcmp(gamma, "smpte170m")) {
+        d.gamma = (GammaData){1.0f / 0.45f, 0.081f, 0.018f, 0.099f, 4.5f, false};
+    }
+    else if (!strcmp(gamma, "adobe")) {
+        d.gamma = (GammaData){2.19921875f, 0.0f, 0.0f, 0.0f, 1.0f, false};
+    }
+    else if (!strcmp(gamma, "dcip3")) {
+        d.gamma = (GammaData){2.6f, 0.0f, 0.0f, 0.0f, 1.0f, false};
+    }
+    else if (!strcmp(gamma, "smpte240m")) {
+        d.gamma = (GammaData){1.0f / 0.45f, 0.0913f, 0.0228f, 0.1115f, 4.0f, false};
+    }
+    else {
+        vsapi->mapSetError(out, "GammaCorr: invalid gamma specified");
         vsapi->freeNode(d.node);
         return;
     }
@@ -3191,7 +3120,7 @@ static void VS_CC GammaCorrCreate(
         d.process[n] = true;
     }
     
-    GammaData *data = (GammaData *)malloc(sizeof d);
+    LinearData *data = (LinearData *)malloc(sizeof d);
     *data = d;
     
     VSFilterDependency deps[] = {{d.node, rpStrictSpatial}};
@@ -3337,7 +3266,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
                              "b:float:opt;"
                              "c:float:opt;"
                              "taps:int:opt;"
-                             "gamma:float:opt;"
+                             "gamma:data:opt;"
                              "sharp:float:opt;",
                              "clip:vnode;",
                              ResizeCreate,
@@ -3369,7 +3298,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
                              plugin);
     vspapi->registerFunction("Linearize",
                              "clip:vnode;"
-                             "gamma:float:opt;"
+                             "gamma:data:opt;"
                              "planes:int[]:opt;",
                              "clip:vnode;",
                              LinearizeCreate,
@@ -3377,7 +3306,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
                              plugin);
     vspapi->registerFunction("GammaCorr",
                              "clip:vnode;"
-                             "gamma:float:opt;"
+                             "gamma:data:opt;"
                              "planes:int[]:opt;",
                              "clip:vnode;",
                              GammaCorrCreate,
