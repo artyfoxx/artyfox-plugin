@@ -92,8 +92,24 @@ Converting the bit depth of a clip.
 * `bits`: The bit depth of the target clip. It can be from `8` to `16` or `32`. When converting from integer to float or vice versa, a color range conversion may also occur, since in the 32-bit float format, the concept of a limited range does not exist. The range is converted according to the frame's `"_ColorRange"` property. If this property does not exist or has an invalid value, the range is considered full for RGB and limited for YUV and GRAY. Conversion between integers occurs without regard to range. Downconversion of bit depth occurs with arithmetic rounding and saturation.
 * `direct`: If `True`, conversion from integer to float or vice versa always uses the full range and ignores the `"_ColorRange"` property. Defaults to `False`.
 
-## Third-Party Components
-* This plugin uses mathematical functions from the [SLEEF library](https://sleef.org/), which is distributed under the Boost Software License 1.0.  
-A copy of the Boost Software License can be found at: https://www.boost.org/LICENSE_1_0.txt
-* This plugin uses mathematical functions from the [OpenBLAS Project](http://www.openmathlib.org/OpenBLAS/), which is distributed under the BSD-3-Clause License.  
-A copy of the BSD-3-Clause License can be found at: https://opensource.org/license/bsd-3-clause
+## License
+This project is licensed under the MIT License — see the LICENSE file for details.
+
+### Note on Intel SVML and Intel MKL
+This project may be built using Intel software components such as:
+
+- **Intel Short Vector Math Library (SVML)** — used indirectly when compiling
+  with the Intel Compiler (ICX/ICC) to implement certain vector math intrinsics
+  such as `_mm256_pow_ps`, `_mm256_exp_ps`, `_mm256_log_ps`, etc.
+- **Intel Math Kernel Library (Intel MKL)** — optionally linked at build time to
+  provide optimized numerical routines such as matrix multiplication,
+  convolution, and related operations.
+
+No SVML or MKL source code or binaries are distributed with this project.
+Any SVML or MKL routines that may be embedded or dynamically linked into
+the compiled binary are used solely as part of the normal compilation and
+linking process provided by Intel’s compiler and libraries, and remain subject
+to Intel’s respective runtime and redistribution licenses.
+
+The original source code of this project is entirely independent and released
+under the terms of the MIT License.
