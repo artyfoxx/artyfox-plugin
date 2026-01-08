@@ -43,9 +43,9 @@ Chroma alignment in YUV with subsampling is performed based on the `"_ChromaLoca
 Resize and alignment by fields are not supported.
 
 ## Descale
-`artyfox.Descale(clip clip, int width, int height[, float src_left=0.0, float src_top=0.0, float src_width=width, float src_height=height, str kernel="area", float b=1/3, float c=1/3, int taps=3, float lambda=1e-3])`
+`artyfox.Descale(clip clip, int width, int height[, float src_left=0.0, float src_top=0.0, float src_width=width, float src_height=height, str kernel="area", float b=1/3, float c=1/3, int taps=3, float lambda=1e-4])`
 
-Descaling via Tikhonov regularization and Cholesky decomposition. This is still just an early prototype, so the fps is a bit disappointing.
+Descaling via Tikhonov regularization and Cholesky decomposition (U.T @ U). This is still just an early prototype, so the fps is a bit disappointing.
 * `clip`: Source clip to descale. Must be RGB, YUV or GRAY. 32-bit float sample type only.
 * `width`: Target width. Must be integer and match the source clip's subsampling.
 * `height`: Target height. Must be integer and match the source clip's subsampling.
@@ -57,7 +57,7 @@ Descaling via Tikhonov regularization and Cholesky decomposition. This is still 
 * `b`: The `b` parameter in the `bicubic` kernel. Defaults to 1/3.
 * `c`: The `c` parameter in the `bicubic` kernel. Defaults to 1/3.
 * `taps`: Window radius value for `blackman`, `gauss`, `kaiser`, `lanczos` and `nuttall` kernels. Default is 3.
-* `lambda`: Regularization parameter. Ensures positive definiteness and stability of the solution to the system of equations. Small values ​​can lead to increased noise, quantization artifacts, and ringing. Excessively large values ​​produce a smooth image, suppressing fine details. Default is 1e-3. Valid range: 0 < `lambda` < 1. Since `lambda` is a Python keyword, you may [append an underscore to the argument’s name when invoking the filter](https://www.vapoursynth.com/doc/pythonreference.html#python-keywords-as-filter-arguments).
+* `lambda`: Regularization parameter. Ensures positive definiteness and stability of the solution to the system of equations. Small values ​​can lead to increased noise, quantization artifacts, and ringing. Excessively large values ​​produce a smooth image, suppressing fine details. Default is 1e-4. Valid range: 1e-12 <= `lambda` < 1. Since `lambda` is a Python keyword, you may [append an underscore to the argument’s name when invoking the filter](https://www.vapoursynth.com/doc/pythonreference.html#python-keywords-as-filter-arguments).
 
 ## RelativeError
 `artyfox.RelativeError(clip clip0, clip clip1)`
@@ -93,23 +93,17 @@ Converting the bit depth of a clip.
 * `direct`: If `True`, conversion from integer to float or vice versa always uses the full range and ignores the `"_ColorRange"` property. Defaults to `False`.
 
 ## License
-This project is licensed under the MIT License — see the LICENSE file for details.
+This project is licensed under the MIT License - see the LICENSE file for details.
 
-### Note on Intel SVML and Intel MKL
-This project may be built using Intel software components such as:
+### Note on Intel SVML
+This project may be built using the Intel Compiler (ICX/ICC), which can internally
+use functions from the Intel Short Vector Math Library (SVML) to implement standard
+vector math intrinsics such as `_mm256_pow_ps`, `_mm256_exp_ps`, `_mm256_log_ps`, etc.
 
-- **Intel Short Vector Math Library (SVML)** — used indirectly when compiling
-  with the Intel Compiler (ICX/ICC) to implement certain vector math intrinsics
-  such as `_mm256_pow_ps`, `_mm256_exp_ps`, `_mm256_log_ps`, etc.
-- **Intel Math Kernel Library (Intel MKL)** — optionally linked at build time to
-  provide optimized numerical routines such as matrix multiplication,
-  convolution, and related operations.
-
-No SVML or MKL source code or binaries are distributed with this project.
-Any SVML or MKL routines that may be embedded or dynamically linked into
-the compiled binary are used solely as part of the normal compilation and
-linking process provided by Intel’s compiler and libraries, and remain subject
-to Intel’s respective runtime and redistribution licenses.
+No SVML source code or binaries are distributed with this project.
+Any SVML routines that may be embedded in the compiled binary are used solely as
+part of the normal compilation and optimization process provided by the Intel Compiler,
+and remain subject to Intel's compiler runtime license.
 
 The original source code of this project is entirely independent and released
 under the terms of the MIT License.

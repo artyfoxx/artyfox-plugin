@@ -5,7 +5,6 @@
 #include <immintrin.h>
 #endif
 #include <math.h>
-#include <mkl.h>
 #include "VapourSynth4.h"
 #include "VSHelper4.h"
 
@@ -2063,7 +2062,7 @@ static int get_ku_from_csr(int *restrict col_idx, int *restrict row_ptr, int y) 
     return ku;
 }
 
-static void banded_packed_gramian_from_csr(
+static void packed_banded_gramian_from_csr(
     double *restrict dst, double *restrict values, int *restrict col_idx, int *restrict row_ptr, int x, int y, int ku
 ) {
     for (int i = 0; i < y; i++) {
@@ -2081,6 +2080,63 @@ static void banded_packed_gramian_from_csr(
                 dst[col * x + ck] += vj * vk;
             }
         }
+    }
+}
+
+static void packed_banded_cholesky_from_gramian(double *restrict srcp, int x, int ku) {
+    for (int i = 0; i < x; i++) {
+        int j_start = VSMAX(i - ku, 0);
+        for (int j = j_start; j < i; j++) {
+            double acc = 0.0;
+            int k_start = VSMAX(j - ku, j_start);
+            for (int k = k_start; k < j; k++) {
+                int idx_jk = (ku + k - j) * x + j;
+                int idx_ik = (ku + k - i) * x + i;
+                acc += srcp[idx_jk] * srcp[idx_ik];
+            }
+            int idx_ij = (ku + j - i) * x + i;
+            int idx_jj = ku * x + j;
+            srcp[idx_ij] = (srcp[idx_ij] - acc) / srcp[idx_jj];
+        }
+        double acc = 0.0;
+        for (int j = j_start; j < i; j++) {
+            int idx_ik = (ku + j - i) * x + i;
+            double lik = srcp[idx_ik];
+            acc += lik * lik;
+        }
+        int idx_ii = ku * x + i;
+        srcp[idx_ii] = sqrt(srcp[idx_ii] - acc);
+    }
+}
+
+static void solve_packed_banded_cholesky_lane4(double *srcp, double *dstp, int n, int ku) {
+    for (int i = 0; i < n; i++) {
+        int start = VSMAX(0, i - ku);
+        __m256d v_acc = _mm256_load_pd(dstp + i * 4);
+        for (int j = start; j < i; j++) {
+            int row_in_src = ku + j - i;
+            if (row_in_src >= 0) {
+                __m256d pix = _mm256_load_pd(dstp + j * 4);
+                __m256d v_weight = _mm256_set1_pd(srcp[row_in_src * n + i]);
+                v_acc = _mm256_fnmadd_pd(pix, v_weight, v_acc);
+            }
+        }
+        __m256d v_div = _mm256_set1_pd(srcp[ku * n + i]);
+        _mm256_store_pd(dstp + i * 4, _mm256_div_pd(v_acc, v_div));
+    }
+    for (int i = n - 1; i >= 0; i--) {
+        int end = VSMIN(n - 1, i + ku);
+        __m256d v_acc = _mm256_load_pd(dstp + i * 4);
+        for (int j = i + 1; j <= end; j++) {
+            int row_in_src = ku + i - j;
+            if (row_in_src >= 0) {
+                __m256d pix = _mm256_load_pd(dstp + j * 4);
+                __m256d v_weight = _mm256_set1_pd(srcp[row_in_src * n + j]);
+                v_acc = _mm256_fnmadd_pd(pix, v_weight, v_acc);
+            }
+        }
+        __m256d v_div = _mm256_set1_pd(srcp[ku * n + i]);
+        _mm256_store_pd(dstp + i * 4, _mm256_div_pd(v_acc, v_div));
     }
 }
 
@@ -2190,13 +2246,12 @@ static void descale_width(
     int ku = get_ku_from_csr(col_idx, row_ptr, src_w);
     int kt = ku + 1;
     
-    double *matrix = (double *)_mm_malloc(sizeof(double) * dst_stride * kt, 64);
-    memset(matrix, 0, sizeof(double) * dst_stride * kt);
-    banded_packed_gramian_from_csr(matrix, weights, col_idx, row_ptr, dst_stride, src_w, ku);
+    double *matrix = (double *)calloc(dst_w * kt, sizeof(double));
+    packed_banded_gramian_from_csr(matrix, weights, col_idx, row_ptr, dst_w, src_w, ku);
     
-    for (int i = dst_stride * ku; i < dst_stride * kt; i++) matrix[i] += lambda;
+    for (int i = dst_w * ku; i < dst_w * kt; i++) matrix[i] += lambda;
     
-    LAPACKE_dpbtrf(LAPACK_ROW_MAJOR, 'U', dst_w, ku, matrix, dst_stride);
+    packed_banded_cholesky_from_gramian(matrix, dst_w, ku);
     
     float *restrict src_buf = (float *)_mm_malloc(sizeof(float) * src_stride * 4, 64);
     double *restrict dst_buf = (double *)_mm_malloc(sizeof(double) * dst_stride * 4, 64);
@@ -2215,7 +2270,7 @@ static void descale_width(
             }
             _mm256_store_pd(dst_buf + x * 4, v_acc);
         }
-        LAPACKE_dpbtrs(LAPACK_ROW_MAJOR, 'U', dst_w, ku, 4, matrix, dst_stride, dst_buf, 4);
+        solve_packed_banded_cholesky_lane4(matrix, dst_buf, dst_w, ku);
         transpose_double_block_from_buf(dst_buf, dstp, dst_stride, dst_w);
         dstp += dst_stride * 4;
         srcp += src_stride * 4;
@@ -2231,19 +2286,58 @@ static void descale_width(
             }
             _mm256_store_pd(dst_buf + x * 4, v_acc);
         }
-        LAPACKE_dpbtrs(LAPACK_ROW_MAJOR, 'U', dst_w, ku, tail, matrix, dst_stride, dst_buf, 4);
+        solve_packed_banded_cholesky_lane4(matrix, dst_buf, dst_w, ku);
         transpose_double_block_from_buf_with_tail(dst_buf, dstp, dst_stride, dst_w, tail);
     }
     _mm_sfence();
     _mm_free(dst_buf);
     _mm_free(src_buf);
-    _mm_free(matrix);
+    free(matrix);
     free(row_ptr_tr);
     free(col_idx_tr);
     free(weights_tr);
     free(row_ptr);
     free(col_idx);
     free(weights);
+}
+
+static void solve_packed_banded_cholesky_lane8(double *srcp, double *dstp, int n, int ku) {
+    for (int i = 0; i < n; i++) {
+        int start = VSMAX(0, i - ku);
+        __m256d v_acc_0 = _mm256_load_pd(dstp + i * 8 + 0);
+        __m256d v_acc_1 = _mm256_load_pd(dstp + i * 8 + 4);
+        for (int j = start; j < i; j++) {
+            int row_in_src = ku + j - i;
+            if (row_in_src >= 0) {
+                __m256d pix_0 = _mm256_load_pd(dstp + j * 8 + 0);
+                __m256d pix_1 = _mm256_load_pd(dstp + j * 8 + 4);
+                __m256d v_weight = _mm256_set1_pd(srcp[row_in_src * n + i]);
+                v_acc_0 = _mm256_fnmadd_pd(pix_0, v_weight, v_acc_0);
+                v_acc_1 = _mm256_fnmadd_pd(pix_1, v_weight, v_acc_1);
+            }
+        }
+        __m256d v_div = _mm256_set1_pd(srcp[ku * n + i]);
+        _mm256_store_pd(dstp + i * 8 + 0, _mm256_div_pd(v_acc_0, v_div));
+        _mm256_store_pd(dstp + i * 8 + 4, _mm256_div_pd(v_acc_1, v_div));
+    }
+    for (int i = n - 1; i >= 0; i--) {
+        int end = VSMIN(n - 1, i + ku);
+        __m256d v_acc_0 = _mm256_load_pd(dstp + i * 8 + 0);
+        __m256d v_acc_1 = _mm256_load_pd(dstp + i * 8 + 4);
+        for (int j = i + 1; j <= end; j++) {
+            int row_in_src = ku + i - j;
+            if (row_in_src >= 0) {
+                __m256d pix_0 = _mm256_load_pd(dstp + j * 8 + 0);
+                __m256d pix_1 = _mm256_load_pd(dstp + j * 8 + 4);
+                __m256d v_weight = _mm256_set1_pd(srcp[row_in_src * n + j]);
+                v_acc_0 = _mm256_fnmadd_pd(pix_0, v_weight, v_acc_0);
+                v_acc_1 = _mm256_fnmadd_pd(pix_1, v_weight, v_acc_1);
+            }
+        }
+        __m256d v_div = _mm256_set1_pd(srcp[ku * n + i]);
+        _mm256_store_pd(dstp + i * 8 + 0, _mm256_div_pd(v_acc_0, v_div));
+        _mm256_store_pd(dstp + i * 8 + 4, _mm256_div_pd(v_acc_1, v_div));
+    }
 }
 
 static void descale_height(
@@ -2302,13 +2396,12 @@ static void descale_height(
     
     ptrdiff_t dst_stride = (dst_h + 7) / 8 * 8;
     
-    double *matrix = (double *)_mm_malloc(sizeof(double) * dst_stride * kt, 64);
-    memset(matrix, 0, sizeof(double) * dst_stride * kt);
-    banded_packed_gramian_from_csr(matrix, weights, col_idx, row_ptr, dst_stride, src_h, ku);
+    double *matrix = (double *)calloc(dst_h * kt, sizeof(double));
+    packed_banded_gramian_from_csr(matrix, weights, col_idx, row_ptr, dst_h, src_h, ku);
     
-    for (int i = dst_stride * ku; i < dst_stride * kt; i++) matrix[i] += lambda;
+    for (int i = dst_h * ku; i < dst_h * kt; i++) matrix[i] += lambda;
     
-    LAPACKE_dpbtrf(LAPACK_ROW_MAJOR, 'U', dst_h, ku, matrix, dst_stride);
+    packed_banded_cholesky_from_gramian(matrix, dst_h, ku);
     
     double *restrict dst_buf = (double *)_mm_malloc(sizeof(double) * dst_stride * 8, 64);
     
@@ -2325,7 +2418,7 @@ static void descale_height(
             _mm256_store_pd(dst_buf + y * 8 + 0, v_acc_0);
             _mm256_store_pd(dst_buf + y * 8 + 4, v_acc_1);
         }
-        LAPACKE_dpbtrs(LAPACK_ROW_MAJOR, 'U', dst_h, ku, 8, matrix, dst_stride, dst_buf, 8);
+        solve_packed_banded_cholesky_lane8(matrix, dst_buf, dst_h, ku);
         for (int y = 0; y < dst_h; y++) {
             __m128 pix0 = _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + y * 8 + 0));
             __m128 pix1 = _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + y * 8 + 4));
@@ -2347,7 +2440,7 @@ static void descale_height(
             _mm256_store_pd(dst_buf + y * 8 + 0, v_acc_0);
             _mm256_store_pd(dst_buf + y * 8 + 4, v_acc_1);
         }
-        LAPACKE_dpbtrs(LAPACK_ROW_MAJOR, 'U', dst_h, ku, tail, matrix, dst_stride, dst_buf, 8);
+        solve_packed_banded_cholesky_lane8(matrix, dst_buf, dst_h, ku);
         for (int y = 0; y < dst_h; y++) {
             __m128 pix0 = _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + y * 8 + 0));
             __m128 pix1 = _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + y * 8 + 4));
@@ -2356,7 +2449,7 @@ static void descale_height(
     }
     _mm_sfence();
     _mm_free(dst_buf);
-    _mm_free(matrix);
+    free(matrix);
     free(row_ptr_tr);
     free(col_idx_tr);
     free(weights_tr);
@@ -2565,11 +2658,11 @@ static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData UNUS
     
     d.lambda = vsapi->mapGetFloat(in, "lambda", 0, &err);
     if (err) {
-        d.lambda = 1e-3;
+        d.lambda = 1e-4;
     }
     
-    if (d.lambda <= 0.0 || d.lambda >= 1.0) {
-        vsapi->mapSetError(out, "Resize: \"lambda\" must be between 0 and 1");
+    if (d.lambda < 1e-12 || d.lambda >= 1.0) {
+        vsapi->mapSetError(out, "Resize: \"lambda\" must be between 1e-12 and 1");
         vsapi->freeNode(d.node);
         return;
     }
@@ -3253,7 +3346,7 @@ static void VS_CC BitDepthCreate(
 }
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
-    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(13, 0), VAPOURSYNTH_API_VERSION, 0, plugin);
+    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(14, 0), VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction("Resize",
                              "clip:vnode;"
                              "width:int;"
