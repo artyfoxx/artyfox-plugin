@@ -2,15 +2,21 @@
     "tasks": [
         {
             "type": "cppbuild",
-            "label": "C/C++: gcc.exe сборка активного файла",
-            "command": "C:/msys64/ucrt64/bin/gcc.exe",
+            "label": "C/C++: clang.exe сборка активного файла",
+            "command": "C:/msys64/ucrt64/bin/clang.exe",
             "args": [
                 "-shared",
+                "-static",
                 "-O2",
+                "-mavx2",
+                "-mfma",
                 "-ffast-math",
+                "-flto",
+                "-fuse-ld=lld",
                 "-Wall",
                 "-Wextra",
                 "-I\"C:\\Program Files\\VapourSynth\\sdk\\include\\vapoursynth\"",
+                "-I\"C:\\msys64\\home\\artyfox\\install\\include\"",
                 "${file}",
                 "-o",
                 "${fileDirname}\\${fileBasenameNoExtension}.dll"
@@ -21,53 +27,11 @@
             "problemMatcher": [
                 "$gcc"
             ],
-            "group": "build",
-            "detail": "Собрать GCC"
-        },
-		{
-            "type": "cppbuild",
-            "label": "C/C++: icx.exe сборка активного файла",
-            "command": "C:/Program Files (x86)/Intel/oneAPI/compiler/2025.3/bin/icx.exe",
-            "args": [
-                "-LD",
-                "-O2",
-                "-mavx2",
-                "-mfma",
-                "-ffast-math",
-                "-Qimf-precision=high:_mm256_pow_ps",
-				"-flto",
-                "-fuse-ld=lld",
-                "-Wall",
-                "-Wextra",
-                "-I\"C:\\Program Files\\VapourSynth\\sdk\\include\\vapoursynth\"",
-                "${file}",
-                "-o",
-                "${fileDirname}\\${fileBasenameNoExtension}.dll",
-                "-link",
-                "-LIBPATH:\"C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2025.3\\lib\"",
-                "-NOIMPLIB",
-                "-NOEXP"
-            ],
-            "options": {
-                "cwd": "C:/Program Files (x86)/Intel/oneAPI/compiler/2025.3/bin"
-            },
-            "problemMatcher": {
-                "owner": "cpp",
-                "fileLocation": ["absolute"],
-                "pattern": {
-                    "regexp": "^(.*)\\((\\d+),(\\d+)\\): (warning|error): (.*)$",
-                    "file": 1,
-                    "line": 2,
-                    "column": 3,
-                    "severity": 4,
-                    "message": 5
-                }
-            },
             "group": {
                 "kind": "build",
                 "isDefault": true
             },
-            "detail": "Собрать Intel oneAPI"
+            "detail": "Собрать Clang"
         }
     ],
     "version": "2.0.0"

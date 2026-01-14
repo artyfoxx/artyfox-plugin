@@ -1,9 +1,7 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdlib.h>
-#ifdef __AVX2__
 #include <immintrin.h>
-#endif
 #include <math.h>
 #include "VapourSynth4.h"
 #include "VSHelper4.h"
@@ -22,7 +20,19 @@ typedef struct {
 } kernel_t;
 
 typedef struct {
-    float gamma, thr_to, thr_from, corr, div;
+    int col_n, row_n, nnz;
+    double *values;
+    int *col_idx, *row_ptr;
+} csr_t;
+
+typedef struct {
+    int col_n, row_n, ku;
+    double *values;
+} banded_t;
+
+typedef struct {
+    double gamma;
+    float thr_to, thr_from, corr, div;
     bool strict;
 } GammaData;
 
@@ -35,6 +45,7 @@ typedef struct {
     GammaData gamma;
     float sharp;
     bool linear, process_w, process_h;
+    csr_t luma_w, luma_h;
 } ResizeData;
 
 typedef struct {
@@ -357,7 +368,48 @@ static double gauss_kernel(double x, void *ctx) {
     return 0.0;
 }
 
-#if defined(__AVX2__) && defined(__FMA__)
+// exp2(log2(x) * y); 0.5 ulp
+static __m256 crazy_pow(__m256 x, __m256d y) {
+    __m256i i = _mm256_castps_si256(x);
+    __m256d one = _mm256_set1_pd(1.0);
+    __m256i exp = _mm256_sub_epi32(_mm256_srli_epi32(_mm256_and_si256(i, _mm256_set1_epi32(0x7f800000)), 23), _mm256_set1_epi32(127));
+    __m256 mant = _mm256_or_ps(_mm256_castsi256_ps(_mm256_and_si256(i, _mm256_set1_epi32(0x007fffff))), _mm256_set1_ps(1.0f));
+    __m256d m0 = _mm256_cvtps_pd(_mm256_extractf128_ps(mant, 0));
+    __m256d m1 = _mm256_cvtps_pd(_mm256_extractf128_ps(mant, 1));
+    __m256d temp = _mm256_set1_pd(0.0029290200848161477), p0 = temp, p1 = temp;
+    temp = _mm256_set1_pd(-0.048633183278885168), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
+    temp = _mm256_set1_pd(0.36573319077073368), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
+    temp = _mm256_set1_pd(-1.6454916622598008), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
+    temp = _mm256_set1_pd(4.9271656462993851), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
+    temp = _mm256_set1_pd(-10.331415641012363), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
+    temp = _mm256_set1_pd(15.540128043817649), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
+    temp = _mm256_set1_pd(-16.905304327891724), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
+    temp = _mm256_set1_pd(13.296487881230806), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
+    temp = _mm256_set1_pd(-7.6638533210657123), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
+    temp = _mm256_set1_pd(3.9049493931218771), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
+    p0 = _mm256_fmadd_pd(p0, _mm256_sub_pd(m0, one), _mm256_cvtepi32_pd(_mm256_extractf128_ps(exp, 0)));
+    p1 = _mm256_fmadd_pd(p1, _mm256_sub_pd(m1, one), _mm256_cvtepi32_pd(_mm256_extractf128_ps(exp, 1)));
+    p0 = _mm256_mul_pd(p0, y), p1 = _mm256_mul_pd(p1, y);
+    temp = _mm256_set1_pd(127.0), p0 = _mm256_min_pd(p0, temp), p1 = _mm256_min_pd(p1, temp);
+    temp = _mm256_set1_pd(-127.0), p0 = _mm256_max_pd(p0, temp), p1 = _mm256_max_pd(p1, temp);
+    __m256d i0 = _mm256_floor_pd(p0), i1 = _mm256_floor_pd(p1);
+    __m256d f0 = _mm256_sub_pd(p0, i0), f1 = _mm256_sub_pd(p1, i1);
+    __m128i bias = _mm_set1_epi32(127);
+    __m256d ei0 = _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_add_epi32(_mm256_cvttpd_epi32(i0), bias), 23)));
+    __m256d ei1 = _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_add_epi32(_mm256_cvttpd_epi32(i1), bias), 23)));
+    temp = _mm256_set1_pd(1.0150336705309649e-07), p0 = temp, p1 = temp;
+    temp = _mm256_set1_pd(1.3259405609345135e-06), p0 = _mm256_fmadd_pd(p0, f0, temp), p1 = _mm256_fmadd_pd(p1, f1, temp);
+    temp = _mm256_set1_pd(1.5252984838653427e-05), p0 = _mm256_fmadd_pd(p0, f0, temp), p1 = _mm256_fmadd_pd(p1, f1, temp);
+    temp = _mm256_set1_pd(0.00015403434948071791), p0 = _mm256_fmadd_pd(p0, f0, temp), p1 = _mm256_fmadd_pd(p1, f1, temp);
+    temp = _mm256_set1_pd(0.0013333557617604443), p0 = _mm256_fmadd_pd(p0, f0, temp), p1 = _mm256_fmadd_pd(p1, f1, temp);
+    temp = _mm256_set1_pd(0.0096181291920672454), p0 = _mm256_fmadd_pd(p0, f0, temp), p1 = _mm256_fmadd_pd(p1, f1, temp);
+    temp = _mm256_set1_pd(0.05550410866868561), p0 = _mm256_fmadd_pd(p0, f0, temp), p1 = _mm256_fmadd_pd(p1, f1, temp);
+    temp = _mm256_set1_pd(0.24022650695649653), p0 = _mm256_fmadd_pd(p0, f0, temp), p1 = _mm256_fmadd_pd(p1, f1, temp);
+    temp = _mm256_set1_pd(0.69314718055987101), p0 = _mm256_fmadd_pd(p0, f0, temp), p1 = _mm256_fmadd_pd(p1, f1, temp);
+    temp = _mm256_set1_pd(1.0000000000000127), p0 = _mm256_fmadd_pd(p0, f0, temp), p1 = _mm256_fmadd_pd(p1, f1, temp);
+    p0 = _mm256_mul_pd(ei0, p0), p1 = _mm256_mul_pd(ei1, p1);
+    return _mm256_setr_m128(_mm256_cvtpd_ps(p0), _mm256_cvtpd_ps(p1));
+}
 
 static void to_linear(
     const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h, GammaData d
@@ -372,7 +424,7 @@ static void to_linear(
     __m256 v_thr = _mm256_set1_ps(d.thr_to);
     __m256 v_corr = _mm256_set1_ps(d.corr);
     __m256 v_corr_one = _mm256_set1_ps(1.0f + d.corr);
-    __m256 v_gamma = _mm256_set1_ps(d.gamma);
+    __m256d v_gamma = _mm256_set1_pd(d.gamma);
     __m256 v_div = _mm256_set1_ps(d.div);
     __m256 v_abs = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
     
@@ -383,7 +435,7 @@ static void to_linear(
                 __m256 pix = _mm256_load_ps(srcp + x);
                 __m256 pix_abs = _mm256_and_ps(pix, v_abs);
                 __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
-                __m256 branch_0 = _mm256_pow_ps(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
+                __m256 branch_0 = crazy_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
                 __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
                 __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
                 _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
@@ -392,7 +444,7 @@ static void to_linear(
                 __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
                 __m256 pix_abs = _mm256_and_ps(pix, v_abs);
                 __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
-                __m256 branch_0 = _mm256_pow_ps(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
+                __m256 branch_0 = crazy_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
                 __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
                 __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
                 _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
@@ -408,7 +460,7 @@ static void to_linear(
                 __m256 pix = _mm256_load_ps(srcp + x);
                 __m256 pix_abs = _mm256_and_ps(pix, v_abs);
                 __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
-                __m256 branch_0 = _mm256_pow_ps(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
+                __m256 branch_0 = crazy_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
                 __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
                 __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
                 _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
@@ -417,7 +469,7 @@ static void to_linear(
                 __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
                 __m256 pix_abs = _mm256_and_ps(pix, v_abs);
                 __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
-                __m256 branch_0 = _mm256_pow_ps(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
+                __m256 branch_0 = crazy_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
                 __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
                 __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
                 _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
@@ -442,7 +494,7 @@ static void from_linear(
     __m256 v_thr = _mm256_set1_ps(d.thr_from);
     __m256 v_corr = _mm256_set1_ps(d.corr);
     __m256 v_corr_one = _mm256_set1_ps(1.0f + d.corr);
-    __m256 v_gamma = _mm256_set1_ps(1.0f / d.gamma);
+    __m256d v_gamma = _mm256_set1_pd(1.0 / d.gamma);
     __m256 v_div = _mm256_set1_ps(d.div);
     __m256 v_abs = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
     
@@ -453,7 +505,7 @@ static void from_linear(
                 __m256 pix = _mm256_load_ps(srcp + x);
                 __m256 pix_abs = _mm256_and_ps(pix, v_abs);
                 __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
-                __m256 branch_0 = _mm256_fmsub_ps(_mm256_pow_ps(pix_abs, v_gamma), v_corr_one, v_corr);
+                __m256 branch_0 = _mm256_fmsub_ps(crazy_pow(pix_abs, v_gamma), v_corr_one, v_corr);
                 __m256 branch_1 = _mm256_mul_ps(pix_abs, v_div);
                 __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
                 _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
@@ -462,7 +514,7 @@ static void from_linear(
                 __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
                 __m256 pix_abs = _mm256_and_ps(pix, v_abs);
                 __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
-                __m256 branch_0 = _mm256_fmsub_ps(_mm256_pow_ps(pix_abs, v_gamma), v_corr_one, v_corr);
+                __m256 branch_0 = _mm256_fmsub_ps(crazy_pow(pix_abs, v_gamma), v_corr_one, v_corr);
                 __m256 branch_1 = _mm256_mul_ps(pix_abs, v_div);
                 __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
                 _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
@@ -478,7 +530,7 @@ static void from_linear(
                 __m256 pix = _mm256_load_ps(srcp + x);
                 __m256 pix_abs = _mm256_and_ps(pix, v_abs);
                 __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
-                __m256 branch_0 = _mm256_fmsub_ps(_mm256_pow_ps(pix_abs, v_gamma), v_corr_one, v_corr);
+                __m256 branch_0 = _mm256_fmsub_ps(crazy_pow(pix_abs, v_gamma), v_corr_one, v_corr);
                 __m256 branch_1 = _mm256_mul_ps(pix_abs, v_div);
                 __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
                 _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
@@ -487,7 +539,7 @@ static void from_linear(
                 __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
                 __m256 pix_abs = _mm256_and_ps(pix, v_abs);
                 __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
-                __m256 branch_0 = _mm256_fmsub_ps(_mm256_pow_ps(pix_abs, v_gamma), v_corr_one, v_corr);
+                __m256 branch_0 = _mm256_fmsub_ps(crazy_pow(pix_abs, v_gamma), v_corr_one, v_corr);
                 __m256 branch_1 = _mm256_mul_ps(pix_abs, v_div);
                 __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
                 _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
@@ -918,6 +970,53 @@ static void sharp_height(
     }
 }
 
+static csr_t csr_get_weights(kernel_t kernel, int src_n, int dst_n, double start_n, double real_n) {
+    double factor = dst_n / real_n;
+    double scale = fmin(factor, 1.0);
+    int min_n = (int)floor(start_n);
+    int max_n = (int)ceil(real_n + start_n) - 1;
+    int border = src_n - 1;
+    double radius = kernel.radius / scale;
+    int step = (int)ceil(radius * 2.0) + 2;
+    double *weights = (double *)malloc(sizeof(double) * step * dst_n);
+    int *col_idx = (int *)malloc(sizeof(int) * step * dst_n);
+    int *row_ptr = (int *)malloc(sizeof(int) * (dst_n + 1));
+    row_ptr[0] = 0;
+    int nnz = 0;
+    
+    for (int i = 0; i < dst_n; i++) {
+        double center = (i + 0.5) / factor - 0.5 + start_n;
+        int low = VSMAX((int)floor(center - radius), min_n);
+        int high = VSMIN((int)ceil(center + radius), max_n);
+        double norm = 0.0;
+        for (int j = low; j <= high; j++) {
+            double temp_val = kernel.f((j - center) * scale, kernel.ctx);
+            if (temp_val == 0.0) continue;
+            norm += temp_val;
+            int temp_idx = CLAMP(j, 0, border);
+            if (row_ptr[i] != nnz && temp_idx == col_idx[nnz - 1]) {
+                weights[nnz - 1] += temp_val;
+                continue;
+            }
+            weights[nnz] = temp_val;
+            col_idx[nnz] = temp_idx;
+            nnz++;
+        }
+        for (int j = row_ptr[i]; j < nnz; j++) {
+            weights[j] /= norm;
+        }
+        row_ptr[i + 1] = nnz;
+    }
+    
+    return (csr_t){src_n, dst_n, nnz, weights, col_idx, row_ptr};
+}
+
+static void csr_free(csr_t csr) {
+    free(csr.row_ptr);
+    free(csr.col_idx);
+    free(csr.values);
+}
+
 static void _mm256_transpose8_lane4_ps(__m256 *row0, __m256 *row1, __m256 *row2, __m256 *row3) {
     __m256 t0 = _mm256_unpacklo_ps(*row0, *row2);
     __m256 t1 = _mm256_unpackhi_ps(*row0, *row2);
@@ -1021,45 +1120,8 @@ static void transpose_block_from_buf_with_tail(
 
 static void resize_width(
     const float *restrict srcp, float *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, int dst_w, double start_w, double real_w, kernel_t kernel
+    int src_w, int src_h, int dst_w, csr_t weights
 ) {
-    double factor = dst_w / real_w;
-    double scale = (factor < 1.0) ? factor : 1.0;
-    int min_w = (int)floor(start_w);
-    int max_w = (int)ceil(real_w + start_w) - 1;
-    int border = src_w - 1;
-    double radius = kernel.radius / scale;
-    int step = (int)ceil(radius * 2.0) + 2;
-    double *weights = (double *)malloc(sizeof(double) * step * dst_w);
-    int64_t *col_idx = (int64_t *)malloc(sizeof(int64_t) * step * dst_w);
-    int *row_ptr = (int *)malloc(sizeof(int) * (dst_w + 1));
-    row_ptr[0] = 0;
-    int nnz = 0;
-    
-    for (int x = 0; x < dst_w; x++) {
-        double center = (x + 0.5) / factor - 0.5 + start_w;
-        int low = VSMAX((int)floor(center - radius), min_w);
-        int high = VSMIN((int)ceil(center + radius), max_w);
-        double norm = 0.0;
-        for (int i = low; i <= high; i++) {
-            double temp_val = kernel.f((i - center) * scale, kernel.ctx);
-            if (temp_val == 0.0) continue;
-            norm += temp_val;
-            int64_t temp_idx = CLAMP(i, 0, border) * 4;
-            if (row_ptr[x] != nnz && temp_idx == col_idx[nnz - 1]) {
-                weights[nnz - 1] += temp_val;
-                continue;
-            }
-            weights[nnz] = temp_val;
-            col_idx[nnz] = temp_idx;
-            nnz++;
-        }
-        for (int i = row_ptr[x]; i < nnz; i++) {
-            weights[i] /= norm;
-        }
-        row_ptr[x + 1] = nnz;
-    }
-    
     float *restrict src_buf = (float *)_mm_malloc(sizeof(float) * src_stride * 4, 64);
     float *restrict dst_buf = (float *)_mm_malloc(sizeof(float) * dst_stride * 4, 64);
     
@@ -1070,9 +1132,9 @@ static void resize_width(
         transpose_block_into_buf(srcp, src_buf, src_stride, src_w);
         for (int x = 0; x < dst_w; x++) {
             __m256d v_acc = _mm256_setzero_pd();
-            for (int i = row_ptr[x]; i < row_ptr[x + 1]; i++) {
-                __m128 pix = _mm_load_ps(src_buf + col_idx[i]);
-                __m256d v_weight = _mm256_set1_pd(weights[i]);
+            for (int i = weights.row_ptr[x]; i < weights.row_ptr[x + 1]; i++) {
+                __m128 pix = _mm_load_ps(src_buf + weights.col_idx[i] * 4);
+                __m256d v_weight = _mm256_set1_pd(weights.values[i]);
                 v_acc = _mm256_fmadd_pd(_mm256_cvtps_pd(pix), v_weight, v_acc);
             }
             _mm_store_ps(dst_buf + x * 4, _mm256_cvtpd_ps(v_acc));
@@ -1085,9 +1147,9 @@ static void resize_width(
         transpose_block_into_buf_with_tail(srcp, src_buf, src_stride, src_w, tail);
         for (int x = 0; x < dst_w; x++) {
             __m256d v_acc = _mm256_setzero_pd();
-            for (int i = row_ptr[x]; i < row_ptr[x + 1]; i++) {
-                __m128 pix = _mm_load_ps(src_buf + col_idx[i]);
-                __m256d v_weight = _mm256_set1_pd(weights[i]);
+            for (int i = weights.row_ptr[x]; i < weights.row_ptr[x + 1]; i++) {
+                __m128 pix = _mm_load_ps(src_buf + weights.col_idx[i] * 4);
+                __m256d v_weight = _mm256_set1_pd(weights.values[i]);
                 v_acc = _mm256_fmadd_pd(_mm256_cvtps_pd(pix), v_weight, v_acc);
             }
             _mm_store_ps(dst_buf + x * 4, _mm256_cvtpd_ps(v_acc));
@@ -1097,14 +1159,11 @@ static void resize_width(
     _mm_sfence();
     _mm_free(dst_buf);
     _mm_free(src_buf);
-    free(row_ptr);
-    free(col_idx);
-    free(weights);
 }
 
 static void resize_height(
     const float *restrict srcp, float *restrict dstp, ptrdiff_t dst_stride,
-    int src_w, int src_h, int dst_h, double start_h, double real_h, kernel_t kernel
+    int src_w, int src_h UNUSED, int dst_h, csr_t weights
 ) {
     int tail = src_w % 8;
     int mod8_w = src_w - tail;
@@ -1113,45 +1172,14 @@ static void resize_height(
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
     __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
     
-    double factor = dst_h / real_h;
-    double scale = (factor < 1.0) ? factor : 1.0;
-    int min_h = (int)floor(start_h);
-    int max_h = (int)ceil(real_h + start_h) - 1;
-    int border = src_h - 1;
-    double radius = kernel.radius / scale;
-    int step = (int)ceil(radius * 2.0) + 2;
-    double *weights = (double *)malloc(sizeof(double) * step);
-    int64_t *col_idx = (int64_t *)malloc(sizeof(int64_t) * step);
-    
     for (int y = 0; y < dst_h; y++) {
-        double center = (y + 0.5) / factor - 0.5 + start_h;
-        int low = VSMAX((int)floor(center - radius), min_h);
-        int high = VSMIN((int)ceil(center + radius), max_h);
-        int nnz = 0;
-        double norm = 0.0;
-        for (int i = low; i <= high; i++) {
-            double temp_val = kernel.f((i - center) * scale, kernel.ctx);
-            if (temp_val == 0.0) continue;
-            norm += temp_val;
-            int64_t temp_idx = CLAMP(i, 0, border) * dst_stride;
-            if (nnz && temp_idx == col_idx[nnz - 1]) {
-                weights[nnz - 1] += temp_val;
-                continue;
-            }
-            weights[nnz] = temp_val;
-            col_idx[nnz] = temp_idx;
-            nnz++;
-        }
-        for (int i = 0; i < nnz; i++) {
-            weights[i] /= norm;
-        }
         int x = 0;
         for (; x < mod8_w; x += 8) {
             __m256d v_acc_0 = _mm256_setzero_pd();
             __m256d v_acc_1 = _mm256_setzero_pd();
-            for (int i = 0; i < nnz; i++) {
-                __m256 pix = _mm256_load_ps(srcp + col_idx[i] + x);
-                __m256d v_weight = _mm256_set1_pd(weights[i]);
+            for (int i = weights.row_ptr[y]; i < weights.row_ptr[y + 1]; i++) {
+                __m256 pix = _mm256_load_ps(srcp + weights.col_idx[i] * dst_stride + x);
+                __m256d v_weight = _mm256_set1_pd(weights.values[i]);
                 v_acc_0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), v_weight, v_acc_0);
                 v_acc_1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), v_weight, v_acc_1);
             }
@@ -1160,9 +1188,9 @@ static void resize_height(
         if (tail) {
             __m256d v_acc_0 = _mm256_setzero_pd();
             __m256d v_acc_1 = _mm256_setzero_pd();
-            for (int i = 0; i < nnz; i++) {
-                __m256 pix = _mm256_maskload_ps(srcp + col_idx[i] + x, tail_mask);
-                __m256d v_weight = _mm256_set1_pd(weights[i]);
+            for (int i = weights.row_ptr[y]; i < weights.row_ptr[y + 1]; i++) {
+                __m256 pix = _mm256_maskload_ps(srcp + weights.col_idx[i] * dst_stride + x, tail_mask);
+                __m256d v_weight = _mm256_set1_pd(weights.values[i]);
                 v_acc_0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), v_weight, v_acc_0);
                 v_acc_1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), v_weight, v_acc_1);
             }
@@ -1171,345 +1199,7 @@ static void resize_height(
         dstp += dst_stride;
     }
     _mm_sfence();
-    free(col_idx);
-    free(weights);
 }
-
-#else
-
-static void to_linear(
-    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h, GammaData d
-) {
-    if (d.strict) {
-        for (int y = 0; y < src_h; y++) {
-            for (int x = 0; x < src_w; x++) {
-                float pix = fabsf(srcp[x]);
-                float dst;
-                if (pix > d.thr_to) {
-                    dst = powf((pix + d.corr) / (d.corr + 1.0f), d.gamma);
-                }
-                else {
-                    dst = pix / d.div;
-                }
-                dstp[x] = copysignf(dst, srcp[x]);
-            }
-            srcp += stride;
-            dstp += stride;
-        }
-    }
-    else {
-        for (int y = 0; y < src_h; y++) {
-            for (int x = 0; x < src_w; x++) {
-                float pix = fabsf(srcp[x]);
-                float dst;
-                if (pix >= d.thr_to) {
-                    dst = powf((pix + d.corr) / (d.corr + 1.0f), d.gamma);
-                }
-                else {
-                    dst = pix / d.div;
-                }
-                dstp[x] = copysignf(dst, srcp[x]);
-            }
-            srcp += stride;
-            dstp += stride;
-        }
-    }
-}
-
-static void from_linear(
-    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h, GammaData d
-) {
-    if (d.strict) {
-        for (int y = 0; y < src_h; y++) {
-            for (int x = 0; x < src_w; x++) {
-                float pix = fabsf(srcp[x]);
-                float dst;
-                if (pix > d.thr_from) {
-                    dst = powf(pix, 1.0f / d.gamma) * (d.corr + 1.0f) - d.corr;
-                }
-                else {
-                    dst = pix * d.div;
-                }
-                dstp[x] = copysignf(dst, srcp[x]);
-            }
-            srcp += stride;
-            dstp += stride;
-        }
-    }
-    else {
-        for (int y = 0; y < src_h; y++) {
-            for (int x = 0; x < src_w; x++) {
-                float pix = fabsf(srcp[x]);
-                float dst;
-                if (pix >= d.thr_from) {
-                    dst = powf(pix, 1.0f / d.gamma) * (d.corr + 1.0f) - d.corr;
-                }
-                else {
-                    dst = pix * d.div;
-                }
-                dstp[x] = copysignf(dst, srcp[x]);
-            }
-            srcp += stride;
-            dstp += stride;
-        }
-    }
-}
-
-static void uint8_to_uint16(
-    const uint8_t *restrict srcp, uint16_t *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, int bits
-) {
-    for (int y = 0; y < src_h; y++) {
-        for (int x = 0; x < src_w; x++) {
-            dstp[x] = (int)srcp[x] << (bits - 8);
-        }
-        srcp += src_stride;
-        dstp += dst_stride;
-    }
-}
-
-static void uint8_to_float(
-    const uint8_t *restrict srcp, float *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, bool chroma, bool range
-) {
-    float low, high;
-    if (range) {
-        low = (chroma ? 128.0f : 16.0f);
-        high = (chroma ? 224.0f : 219.0f);
-    }
-    else {
-        low = (chroma ? 128.0f : 0.0f);
-        high = (chroma ? 256.0f : 255.0f);
-    }
-    for (int y = 0; y < src_h; y++) {
-        for (int x = 0; x < src_w; x++) {
-            dstp[x] = ((float)srcp[x] - low) / high;
-        }
-        srcp += src_stride;
-        dstp += dst_stride;
-    }
-}
-
-static void uint16_to_uint8(
-    const uint16_t *restrict srcp, uint8_t *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, int bits
-) {
-    for (int y = 0; y < src_h; y++) {
-        for (int x = 0; x < src_w; x++) {
-            dstp[x] = fminf((float)srcp[x] / (1 << (bits - 8)) + 0.5f, 255.0f);
-        }
-        srcp += src_stride;
-        dstp += dst_stride;
-    }
-}
-
-static void uint16_to_uint16(
-    const uint16_t *restrict srcp, uint16_t *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, int src_bits, int dst_bits
-) {
-    if (src_bits < dst_bits) {
-        for (int y = 0; y < src_h; y++) {
-            for (int x = 0; x < src_w; x++) {
-                dstp[x] = (int)srcp[x] << (dst_bits - src_bits);
-            }
-            srcp += src_stride;
-            dstp += dst_stride;
-        }
-    }
-    else {
-        float full = (1 << dst_bits) - 1;
-        for (int y = 0; y < src_h; y++) {
-            for (int x = 0; x < src_w; x++) {
-                dstp[x] = fminf((float)srcp[x] / (1 << (src_bits - dst_bits)) + 0.5f, full);
-            }
-            srcp += src_stride;
-            dstp += dst_stride;
-        }
-    }
-}
-
-static void uint16_to_float(
-    const uint16_t *restrict srcp, float *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, bool chroma, bool range, int bits
-) {
-    float low, high;
-    if (range) {
-        low = (chroma ? 128 : 16) << (bits - 8);
-        high = (chroma ? 224 : 219) << (bits - 8);
-    }
-    else {
-        low = (chroma ? 128 << (bits - 8) : 0);
-        high = (chroma ? 1 << bits : (1 << bits) - 1);
-    }
-    for (int y = 0; y < src_h; y++) {
-        for (int x = 0; x < src_w; x++) {
-            dstp[x] = ((float)srcp[x] - low) / high;
-        }
-        srcp += src_stride;
-        dstp += dst_stride;
-    }
-}
-
-static void float_to_uint8(
-    const float *restrict srcp, uint8_t *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, bool chroma, bool range
-) {
-    float low, high;
-    if (range) {
-        low = (chroma ? 128.0f : 16.0f);
-        high = (chroma ? 224.0f : 219.0f);
-    }
-    else {
-        low = (chroma ? 128.0f : 0.0f);
-        high = (chroma ? 256.0f : 255.0f);
-    }
-    for (int y = 0; y < src_h; y++) {
-        for (int x = 0; x < src_w; x++) {
-            dstp[x] = fmaxf(fminf(srcp[x] * high + low + 0.5f, 255.0f), 0.0f);
-        }
-        srcp += src_stride;
-        dstp += dst_stride;
-    }
-}
-
-static void float_to_uint16(
-    const float *restrict srcp, uint16_t *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, bool chroma, bool range, int bits
-) {
-    float full = (1 << bits) - 1;
-    float low, high;
-    if (range) {
-        low = (chroma ? 128 : 16) << (bits - 8);
-        high = (chroma ? 224 : 219) << (bits - 8);
-    }
-    else {
-        low = (chroma ? 128 << (bits - 8) : 0);
-        high = (chroma ? 1 << bits : full);
-    }
-    for (int y = 0; y < src_h; y++) {
-        for (int x = 0; x < src_w; x++) {
-            dstp[x] = fmaxf(fminf(srcp[x] * high + low + 0.5f, full), 0.0f);
-        }
-        srcp += src_stride;
-        dstp += dst_stride;
-    }
-}
-
-static void sharp_width(
-    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h, float sharp
-) {
-    int border = src_w - 1;
-    for (int y = 0; y < src_h; y++) {
-        for (int x = 0; x < src_w; x++) {
-            dstp[x] = srcp[x] * sharp + (1.0f - sharp) * (srcp[VSMAX(x - 1, 0)] + srcp[x] + srcp[VSMIN(x + 1, border)]) / 3.0f;
-        }
-        dstp += stride;
-        srcp += stride;
-    }
-}
-
-static void sharp_height(
-    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h, float sharp
-) {
-    int border = src_h - 1;
-    for (int y = 0; y < src_h; y++) {
-        for (int x = 0; x < src_w; x++) {
-            dstp[x] = srcp[x] * sharp + (1.0f - sharp) * (srcp[(y > 0) ? (x - stride) : x] + srcp[x] + srcp[(y < border) ? (x + stride) : x]) / 3.0f;
-        }
-        dstp += stride;
-        srcp += stride;
-    }
-}
-
-static void resize_width(
-    const float *restrict srcp, float *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, int dst_w, double start_w, double real_w, kernel_t kernel
-) {
-    double factor = dst_w / real_w;
-    double scale = (factor < 1.0) ? factor : 1.0;
-    int min_w = (int)floor(start_w);
-    int max_w = (int)ceil(real_w + start_w) - 1;
-    int border = src_w - 1;
-    double radius = kernel.radius / scale;
-	int step = (int)ceil(radius * 2.0) + 2;
-    int64_t *counts = (int64_t *)malloc(sizeof(int64_t) * dst_w * step);
-    double *weights = (double *)malloc(sizeof(double) * dst_w * step);
-    int *lengths = (int *)malloc(sizeof(int) * dst_w);
-    
-    for (int x = 0; x < dst_w; x++) {
-        double center = (x + 0.5) / factor - 0.5 + start_w;
-        int low = VSMAX((int)floor(center - radius), min_w);
-        int high = VSMIN((int)ceil(center + radius), max_w);
-        lengths[x] = high - low + 1;
-        double norm = 0.0;
-        for (int i = 0; i < lengths[x]; i++) {
-            counts[x * step + i] = CLAMP(i + low, 0, border);
-            weights[x * step + i] = kernel.f((i + low - center) * scale, kernel.ctx);
-            norm += weights[x * step + i];
-        }
-        for (int i = 0; i < lengths[x]; i++) {
-            weights[x * step + i] /= norm;
-        }
-    }
-    
-    for (int y = 0; y < src_h; y++) {
-        for (int x = 0; x < dst_w; x++) {
-            double acc = 0.0;
-            for (int i = 0; i < lengths[x]; i++) {
-                acc += (double)srcp[counts[x * step + i]] * weights[x * step + i];
-            }
-            dstp[x] = (float)acc;
-        }
-        dstp += dst_stride;
-        srcp += src_stride;
-    }
-    free(counts);
-    free(weights);
-    free(lengths);
-}
-
-static void resize_height(
-    const float *restrict srcp, float *restrict dstp, ptrdiff_t dst_stride,
-    int src_w, int src_h, int dst_h, double start_h, double real_h, kernel_t kernel
-) {
-    double factor = dst_h / real_h;
-    double scale = (factor < 1.0) ? factor : 1.0;
-    int min_h = (int)floor(start_h);
-    int max_h = (int)ceil(real_h + start_h) - 1;
-    int border = src_h - 1;
-    double radius = kernel.radius / scale;
-	int step = (int)ceil(radius * 2.0) + 2;
-    int64_t *counts = (int64_t *)malloc(sizeof(int64_t) * step);
-    double *weights = (double *)malloc(sizeof(double) * step);
-    
-    for (int y = 0; y < dst_h; y++) {
-        double center = (y + 0.5) / factor - 0.5 + start_h;
-        int low = VSMAX((int)floor(center - radius), min_h);
-        int high = VSMIN((int)ceil(center + radius), max_h);
-        int length = high - low + 1;
-        double norm = 0.0;
-        for (int i = 0; i < length; i++) {
-            counts[i] = CLAMP(i + low, 0, border) * dst_stride;
-            weights[i] = kernel.f((i + low - center) * scale, kernel.ctx);
-            norm += weights[i];
-        }
-        for (int i = 0; i < length; i++) {
-            weights[i] /= norm;
-        }
-        for (int x = 0; x < src_w; x++) {
-            double acc = 0.0;
-            for (int i = 0; i < length; i++) {
-                acc += (double)srcp[counts[i] + x] * weights[i];
-            }
-            dstp[x] = (float)acc;
-        }
-        dstp += dst_stride;
-    }
-	free(counts);
-    free(weights);
-}
-
-#endif
 
 static const VSFrame *VS_CC ResizeGetFrame(
     int n, int activationReason, void *instanceData, void **frameData UNUSED,
@@ -1535,6 +1225,41 @@ static const VSFrame *VS_CC ResizeGetFrame(
         int range = vsapi->mapGetIntSaturated(props, "_ColorRange", 0, &err);
         if (err || range < 0 || range > 1) {
             range = (fi->colorFamily == cfRGB) ? 0 : 1;
+        }
+        
+        csr_t chroma_w, chroma_h;
+        if (d->process_w && fi->subSamplingW) {
+            int chroma_src_w = d->vi.width >> fi->subSamplingW;
+            int chroma_dst_w = d->dst_width >> fi->subSamplingW;
+            double start_w = d->start_w / (1 << fi->subSamplingW);
+            double real_w = d->real_w / (1 << fi->subSamplingW);
+            if (~chromaloc & 1) {// left allign
+                double offset = ((1 << fi->subSamplingW) - 1) / 2.0;
+                start_w += offset / (1 << fi->subSamplingW) - offset * real_w / d->dst_width;
+            }
+            chroma_w = csr_get_weights(d->kernel_w, chroma_src_w, chroma_dst_w, start_w, real_w);
+        }
+        else {
+            chroma_w = (csr_t){0, 0, 0, NULL, NULL, NULL};
+        }
+        
+        if (d->process_h && fi->subSamplingH) {
+            int chroma_src_h = d->vi.height >> fi->subSamplingH;
+            int chroma_dst_h = d->dst_height >> fi->subSamplingH;
+            double start_h = d->start_h / (1 << fi->subSamplingH);
+            double real_h = d->real_h / (1 << fi->subSamplingH);
+            if (chromaloc & 2) {// top allign
+                double offset = ((1 << fi->subSamplingH) - 1) / 2.0;
+                start_h += offset / (1 << fi->subSamplingH) - offset * real_h / d->dst_height;
+            }
+            else if (chromaloc & 4) {// bottom allign
+                double offset = ((1 << fi->subSamplingH) - 1) / 2.0;
+                start_h -= offset / (1 << fi->subSamplingH) - offset * real_h / d->dst_height;
+            }
+            chroma_h = csr_get_weights(d->kernel_h, chroma_src_h, chroma_dst_h, start_h, real_h);
+        }
+        else {
+            chroma_h = (csr_t){0, 0, 0, NULL, NULL, NULL};
         }
         
         VSFrame *bcu = NULL;
@@ -1574,35 +1299,9 @@ static const VSFrame *VS_CC ResizeGetFrame(
             int src_h = vsapi->getFrameHeight(src, plane);
             int dst_w = vsapi->getFrameWidth(dst, plane);
             int dst_h = vsapi->getFrameHeight(dst, plane);
-            
-            double start_w = d->start_w;
-            double start_h = d->start_h;
-            double real_w = d->real_w;
-            double real_h = d->real_h;
             bool chroma = plane && (fi->colorFamily == cfYUV);
-            
-            if (chroma) {
-                if (fi->subSamplingW) {
-                    start_w /= 1 << fi->subSamplingW;
-                    real_w /= 1 << fi->subSamplingW;
-                    if (~chromaloc & 1) {// left allign
-                        double offset = ((1 << fi->subSamplingW) - 1) / 2.0;
-                        start_w += offset / (1 << fi->subSamplingW) - offset * real_w / (dst_w << fi->subSamplingW);
-                    }
-                }
-                if (fi->subSamplingH) {
-                    start_h /= 1 << fi->subSamplingH;
-                    real_h /= 1 << fi->subSamplingH;
-                    if (chromaloc & 2) {// top allign
-                        double offset = ((1 << fi->subSamplingH) - 1) / 2.0;
-                        start_h += offset / (1 << fi->subSamplingH) - offset * real_h / (dst_h << fi->subSamplingH);
-                    }
-                    else if (chromaloc & 4) {// bottom allign
-                        double offset = ((1 << fi->subSamplingH) - 1) / 2.0;
-                        start_h -= offset / (1 << fi->subSamplingH) - offset * real_h / (dst_h << fi->subSamplingH);
-                    }
-                }
-            }
+            bool sub_w = plane && fi->subSamplingW;
+            bool sub_h = plane && fi->subSamplingH;
             
             if (bit_convert) {
                 float *restrict bcup = (float *)vsapi->getWritePtr(bcu, plane);
@@ -1632,14 +1331,14 @@ static const VSFrame *VS_CC ResizeGetFrame(
             
             if (d->process_w && d->process_h) {
                 float *restrict tmpp = (float *)vsapi->getWritePtr(tmp, plane);
-                resize_width(srcp, tmpp, src_stride, dst_stride, src_w, src_h, dst_w, start_w, real_w, d->kernel_w);
-                resize_height(tmpp, dstp, dst_stride, dst_w, src_h, dst_h, start_h, real_h, d->kernel_h);
+                resize_width(srcp, tmpp, src_stride, dst_stride, src_w, src_h, dst_w, sub_w ? chroma_w : d->luma_w);
+                resize_height(tmpp, dstp, dst_stride, dst_w, src_h, dst_h, sub_h ? chroma_h : d->luma_h);
             }
             else if (d->process_w) {
-                resize_width(srcp, dstp, src_stride, dst_stride, src_w, src_h, dst_w, start_w, real_w, d->kernel_w);
+                resize_width(srcp, dstp, src_stride, dst_stride, src_w, src_h, dst_w, sub_w ? chroma_w : d->luma_w);
             }
             else if (d->process_h) {
-                resize_height(srcp, dstp, dst_stride, dst_w, src_h, dst_h, start_h, real_h, d->kernel_h);
+                resize_height(srcp, dstp, dst_stride, dst_w, src_h, dst_h, sub_h ? chroma_h : d->luma_h);
             }
             else {
                 vsh_bitblt(dstp, sizeof(float) * dst_stride, srcp, sizeof(float) * src_stride, sizeof(float) * src_w, src_h);
@@ -1678,6 +1377,9 @@ static const VSFrame *VS_CC ResizeGetFrame(
         vsapi->freeFrame(bcu);
         vsapi->freeFrame(src);
         
+        csr_free(chroma_h);
+        csr_free(chroma_w);
+        
         return dst;
     }
     return NULL;
@@ -1694,6 +1396,9 @@ static void VS_CC ResizeFree(void *instanceData, VSCore *core UNUSED, const VSAP
         free(d->kernel_w.ctx);
         free(d->kernel_h.ctx);
     }
+    
+    csr_free(d->luma_w);
+    csr_free(d->luma_h);
     
     free(d);
 }
@@ -1799,26 +1504,26 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData UNUSE
     const char *gamma = vsapi->mapGetData(in, "gamma", 0, &err);
     if (err) {
         if (d.vi.format.colorFamily == cfRGB) {
-            d.gamma = (GammaData){2.4f, 0.04045f, 0.0031308f, 0.055f, 12.92f, true};
+            d.gamma = (GammaData){2.4, 0.04045f, 0.0031308f, 0.055f, 12.92f, true};
         }
         else {
-            d.gamma = (GammaData){1.0f / 0.45f, 0.081f, 0.018f, 0.099f, 4.5f, false};
+            d.gamma = (GammaData){1.0 / 0.45, 0.081f, 0.018f, 0.099f, 4.5f, false};
         }
     }
     else if (!strcmp(gamma, "srgb")) {
-        d.gamma = (GammaData){2.4f, 0.04045f, 0.0031308f, 0.055f, 12.92f, true};
+        d.gamma = (GammaData){2.4, 0.04045f, 0.0031308f, 0.055f, 12.92f, true};
     }
     else if (!strcmp(gamma, "smpte170m")) {
-        d.gamma = (GammaData){1.0f / 0.45f, 0.081f, 0.018f, 0.099f, 4.5f, false};
+        d.gamma = (GammaData){1.0 / 0.45, 0.081f, 0.018f, 0.099f, 4.5f, false};
     }
     else if (!strcmp(gamma, "adobe")) {
-        d.gamma = (GammaData){2.19921875f, 0.0f, 0.0f, 0.0f, 1.0f, false};
+        d.gamma = (GammaData){2.19921875, 0.0f, 0.0f, 0.0f, 1.0f, false};
     }
     else if (!strcmp(gamma, "dcip3")) {
-        d.gamma = (GammaData){2.6f, 0.0f, 0.0f, 0.0f, 1.0f, false};
+        d.gamma = (GammaData){2.6, 0.0f, 0.0f, 0.0f, 1.0f, false};
     }
     else if (!strcmp(gamma, "smpte240m")) {
-        d.gamma = (GammaData){1.0f / 0.45f, 0.0913f, 0.0228f, 0.1115f, 4.0f, false};
+        d.gamma = (GammaData){1.0 / 0.45, 0.0913f, 0.0228f, 0.1115f, 4.0f, false};
     }
     else if (!strcmp(gamma, "none")) {
         d.linear = false;
@@ -1998,6 +1703,20 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData UNUSE
     d.process_w = (d.dst_width == d.vi.width && d.real_w == d.vi.width && d.start_w == 0.0) ? false : true;
     d.process_h = (d.dst_height == d.vi.height && d.real_h == d.vi.height && d.start_h == 0.0) ? false : true;
     
+    if (d.process_w) {
+        d.luma_w = csr_get_weights(d.kernel_w, d.vi.width, d.dst_width, d.start_w, d.real_w);
+    }
+    else {
+        d.luma_w = (csr_t){0, 0, 0, NULL, NULL, NULL};
+    }
+    
+    if (d.process_h) {
+        d.luma_h = csr_get_weights(d.kernel_h, d.vi.height, d.dst_height, d.start_h, d.real_h);
+    }
+    else {
+        d.luma_h = (csr_t){0, 0, 0, NULL, NULL, NULL};
+    }
+    
     ResizeData *data = (ResizeData *)malloc(sizeof d);
     *data = d;
     
@@ -2019,42 +1738,46 @@ typedef struct {
     double start_w, start_h, real_w, real_h, lambda;
     kernel_t kernel_w, kernel_h;
     bool process_w, process_h;
+    csr_t luma_w, luma_h;
+    banded_t luma_b_w, luma_b_h;
 } DescaleData;
 
-static void transpose_csr(
-    double *restrict values, int *restrict col_idx, int *restrict row_ptr,
-    double *restrict values_tr, int *restrict col_idx_tr, int *restrict row_ptr_tr,
-    int nnz, int x, int y
-) {
-    int *col_count = calloc(x, sizeof(int));
-    for (int i = 0; i < nnz; i++) col_count[col_idx[i]]++;
+static csr_t csr_transpose(csr_t csr) {
+    double *values = (double *)malloc(sizeof(double) * csr.nnz);
+    int *col_idx = (int *)malloc(sizeof(int) * csr.nnz);
+    int *row_ptr = (int *)malloc(sizeof(int) * (csr.col_n + 1));
+    int *col_count = calloc(csr.col_n, sizeof(int));
     
-    row_ptr_tr[0] = 0;
-    for (int i = 0; i < x; i++) row_ptr_tr[i + 1] = row_ptr_tr[i] + col_count[i];
+    for (int i = 0; i < csr.nnz; i++) col_count[csr.col_idx[i]]++;
     
-    int *next = malloc(sizeof(int) * x);
-    memcpy(next, row_ptr_tr, sizeof(int) * x);
+    row_ptr[0] = 0;
+    for (int i = 0; i < csr.col_n; i++) row_ptr[i + 1] = row_ptr[i] + col_count[i];
     
-    for (int i = 0; i < y; i++) {
-        for (int j = row_ptr[i]; j < row_ptr[i + 1]; j++) {
-            int dst = next[col_idx[j]]++;
-            col_idx_tr[dst] = i;
-            values_tr[dst] = values[j];
+    int *next = malloc(sizeof(int) * csr.col_n);
+    memcpy(next, row_ptr, sizeof(int) * csr.col_n);
+    
+    for (int i = 0; i < csr.row_n; i++) {
+        for (int j = csr.row_ptr[i]; j < csr.row_ptr[i + 1]; j++) {
+            int dst = next[csr.col_idx[j]]++;
+            col_idx[dst] = i;
+            values[dst] = csr.values[j];
         }
     }
     
     free(next);
     free(col_count);
+    
+    return (csr_t){csr.row_n, csr.col_n, csr.nnz, values, col_idx, row_ptr};
 }
 
-static int get_ku_from_csr(int *restrict col_idx, int *restrict row_ptr, int y) {
+static int get_ku_from_csr(csr_t csr) {
     int ku = 0;
     
-    for (int i = 0; i < y; i++) {
-        int p0 = row_ptr[i];
-        int p1 = row_ptr[i + 1];
-        int c_min = col_idx[p0];
-        int c_max = col_idx[p1 - 1];
+    for (int i = 0; i < csr.row_n; i++) {
+        int p0 = csr.row_ptr[i];
+        int p1 = csr.row_ptr[i + 1];
+        int c_min = csr.col_idx[p0];
+        int c_max = csr.col_idx[p1 - 1];
         int w = c_max - c_min;
         if (w > ku) ku = w;
     }
@@ -2062,80 +1785,93 @@ static int get_ku_from_csr(int *restrict col_idx, int *restrict row_ptr, int y) 
     return ku;
 }
 
-static void packed_banded_gramian_from_csr(
-    double *restrict dst, double *restrict values, int *restrict col_idx, int *restrict row_ptr, int x, int y, int ku
-) {
-    for (int i = 0; i < y; i++) {
-        int p0 = row_ptr[i];
-        int p1 = row_ptr[i + 1];
+static banded_t banded_gramian_from_csr(csr_t csr, double lambda) {
+    int ku = get_ku_from_csr(csr);
+    int kf = ku + 1;
+    
+    double *banded = (double *)calloc(csr.col_n * kf, sizeof(double));
+    
+    for (int i = 0; i < csr.row_n; i++) {
+        int p0 = csr.row_ptr[i];
+        int p1 = csr.row_ptr[i + 1];
         
         for (int j = p0; j < p1; j++) {
-            int cj = col_idx[j];
-            double vj = values[j];
+            int cj = csr.col_idx[j];
+            double vj = csr.values[j];
             
             for (int k = j; k < p1; k++) {
-                int ck = col_idx[k];
-                double vk = values[k];
+                int ck = csr.col_idx[k];
+                double vk = csr.values[k];
                 int col = ku + cj - ck;
-                dst[col * x + ck] += vj * vk;
+                banded[col * csr.col_n + ck] += vj * vk;
             }
         }
     }
+    
+    for (int i = csr.col_n * ku; i < csr.col_n * kf; i++) {
+        banded[i] += lambda;
+    }
+    
+    return (banded_t){csr.col_n, kf, ku, banded};
 }
 
-static void packed_banded_cholesky_from_gramian(double *restrict srcp, int x, int ku) {
-    for (int i = 0; i < x; i++) {
-        int j_start = VSMAX(i - ku, 0);
+static void banded_free(banded_t banded) {
+    free(banded.values);
+}
+
+static void banded_cholesky_from_gramian(banded_t banded) {
+    for (int i = 0; i < banded.col_n; i++) {
+        int j_start = VSMAX(i - banded.ku, 0);
         for (int j = j_start; j < i; j++) {
             double acc = 0.0;
-            int k_start = VSMAX(j - ku, j_start);
+            int k_start = VSMAX(j - banded.ku, j_start);
             for (int k = k_start; k < j; k++) {
-                int idx_jk = (ku + k - j) * x + j;
-                int idx_ik = (ku + k - i) * x + i;
-                acc += srcp[idx_jk] * srcp[idx_ik];
+                int idx_jk = (banded.ku + k - j) * banded.col_n + j;
+                int idx_ik = (banded.ku + k - i) * banded.col_n + i;
+                acc += banded.values[idx_jk] * banded.values[idx_ik];
             }
-            int idx_ij = (ku + j - i) * x + i;
-            int idx_jj = ku * x + j;
-            srcp[idx_ij] = (srcp[idx_ij] - acc) / srcp[idx_jj];
+            int idx_ij = (banded.ku + j - i) * banded.col_n + i;
+            int idx_jj = banded.ku * banded.col_n + j;
+            banded.values[idx_ij] = (banded.values[idx_ij] - acc) / banded.values[idx_jj];
         }
         double acc = 0.0;
         for (int j = j_start; j < i; j++) {
-            int idx_ik = (ku + j - i) * x + i;
-            double lik = srcp[idx_ik];
+            int idx_ik = (banded.ku + j - i) * banded.col_n + i;
+            double lik = banded.values[idx_ik];
             acc += lik * lik;
         }
-        int idx_ii = ku * x + i;
-        srcp[idx_ii] = sqrt(srcp[idx_ii] - acc);
+        int idx_ii = banded.ku * banded.col_n + i;
+        banded.values[idx_ii] = sqrt(banded.values[idx_ii] - acc);
     }
 }
 
-static void solve_packed_banded_cholesky_lane4(double *srcp, double *dstp, int n, int ku) {
-    for (int i = 0; i < n; i++) {
-        int start = VSMAX(0, i - ku);
+static void solve_banded_cholesky_lane4(banded_t srcp, double *dstp) {
+    for (int i = 0; i < srcp.col_n; i++) {
+        int start = VSMAX(0, i - srcp.ku);
         __m256d v_acc = _mm256_load_pd(dstp + i * 4);
         for (int j = start; j < i; j++) {
-            int row_in_src = ku + j - i;
+            int row_in_src = srcp.ku + j - i;
             if (row_in_src >= 0) {
                 __m256d pix = _mm256_load_pd(dstp + j * 4);
-                __m256d v_weight = _mm256_set1_pd(srcp[row_in_src * n + i]);
+                __m256d v_weight = _mm256_set1_pd(srcp.values[row_in_src * srcp.col_n + i]);
                 v_acc = _mm256_fnmadd_pd(pix, v_weight, v_acc);
             }
         }
-        __m256d v_div = _mm256_set1_pd(srcp[ku * n + i]);
+        __m256d v_div = _mm256_set1_pd(srcp.values[srcp.ku * srcp.col_n + i]);
         _mm256_store_pd(dstp + i * 4, _mm256_div_pd(v_acc, v_div));
     }
-    for (int i = n - 1; i >= 0; i--) {
-        int end = VSMIN(n - 1, i + ku);
+    for (int i = srcp.col_n - 1; i >= 0; i--) {
+        int end = VSMIN(srcp.col_n - 1, i + srcp.ku);
         __m256d v_acc = _mm256_load_pd(dstp + i * 4);
         for (int j = i + 1; j <= end; j++) {
-            int row_in_src = ku + i - j;
+            int row_in_src = srcp.ku + i - j;
             if (row_in_src >= 0) {
                 __m256d pix = _mm256_load_pd(dstp + j * 4);
-                __m256d v_weight = _mm256_set1_pd(srcp[row_in_src * n + j]);
+                __m256d v_weight = _mm256_set1_pd(srcp.values[row_in_src * srcp.col_n + j]);
                 v_acc = _mm256_fnmadd_pd(pix, v_weight, v_acc);
             }
         }
-        __m256d v_div = _mm256_set1_pd(srcp[ku * n + i]);
+        __m256d v_div = _mm256_set1_pd(srcp.values[srcp.ku * srcp.col_n + i]);
         _mm256_store_pd(dstp + i * 4, _mm256_div_pd(v_acc, v_div));
     }
 }
@@ -2201,76 +1937,26 @@ static void transpose_double_block_from_buf_with_tail(
 
 static void descale_width(
     const float *restrict srcp, float *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, int dst_w, double start_w, double real_w, double lambda, kernel_t kernel
+    int src_w, int src_h, int dst_w, csr_t weights, banded_t banded
 ) {
-    double factor = src_w / real_w;
-    int min_w = (int)floor(start_w);
-    int max_w = (int)ceil(real_w + start_w) - 1;
-    int border = dst_w - 1;
-    int step = (int)ceil(kernel.radius * 2) + 2;
-    double *weights = malloc(sizeof(double) * step * src_w);
-    int *col_idx = malloc(sizeof(int) * step * src_w);
-    int *row_ptr = malloc(sizeof(int) * (src_w + 1));
-    row_ptr[0] = 0;
-    int nnz = 0;
-    
-    for (int x = 0; x < src_w; x++) {
-        double center = (x + 0.5) / factor - 0.5 + start_w;
-        int low = VSMAX((int)floor(center - kernel.radius), min_w);
-        int high = VSMIN((int)ceil(center + kernel.radius), max_w);
-        double norm = 0.0;
-        for (int i = low; i <= high; i++) {
-            double temp_val = kernel.f(i - center, kernel.ctx);
-            if (temp_val == 0.0) continue;
-            norm += temp_val;
-            int temp_idx = CLAMP(i, 0, border);
-            if (row_ptr[x] != nnz && temp_idx == col_idx[nnz - 1]) {
-                weights[nnz - 1] += temp_val;
-                continue;
-            }
-            weights[nnz] = temp_val;
-            col_idx[nnz] = temp_idx;
-            nnz++;
-        }
-        for (int i = row_ptr[x]; i < nnz; i++) {
-            weights[i] /= norm;
-        }
-        row_ptr[x + 1] = nnz;
-    }
-    
-    double *weights_tr = malloc(sizeof(double) * nnz);
-    int *col_idx_tr = malloc(sizeof(int) * nnz);
-    int *row_ptr_tr = malloc(sizeof(int) * (dst_w + 1));
-    transpose_csr(weights, col_idx, row_ptr, weights_tr, col_idx_tr, row_ptr_tr, nnz, dst_w, src_w);
-    
-    int ku = get_ku_from_csr(col_idx, row_ptr, src_w);
-    int kt = ku + 1;
-    
-    double *matrix = (double *)calloc(dst_w * kt, sizeof(double));
-    packed_banded_gramian_from_csr(matrix, weights, col_idx, row_ptr, dst_w, src_w, ku);
-    
-    for (int i = dst_w * ku; i < dst_w * kt; i++) matrix[i] += lambda;
-    
-    packed_banded_cholesky_from_gramian(matrix, dst_w, ku);
+    int tail = src_h % 4;
+    int mod4_h = src_h - tail;
     
     float *restrict src_buf = (float *)_mm_malloc(sizeof(float) * src_stride * 4, 64);
     double *restrict dst_buf = (double *)_mm_malloc(sizeof(double) * dst_stride * 4, 64);
-    
-    int tail = src_h % 4;
-    int mod4_h = src_h - tail;
     
     for (int y = 0; y < mod4_h; y += 4) {
         transpose_block_into_buf(srcp, src_buf, src_stride, src_w);
         for (int x = 0; x < dst_w; x++) {
             __m256d v_acc = _mm256_setzero_pd();
-            for (int i = row_ptr_tr[x]; i < row_ptr_tr[x + 1]; i++) {
-                __m128 pix = _mm_load_ps(src_buf + col_idx_tr[i] * 4);
-                __m256d v_weight = _mm256_set1_pd(weights_tr[i]);
+            for (int i = weights.row_ptr[x]; i < weights.row_ptr[x + 1]; i++) {
+                __m128 pix = _mm_load_ps(src_buf + weights.col_idx[i] * 4);
+                __m256d v_weight = _mm256_set1_pd(weights.values[i]);
                 v_acc = _mm256_fmadd_pd(_mm256_cvtps_pd(pix), v_weight, v_acc);
             }
             _mm256_store_pd(dst_buf + x * 4, v_acc);
         }
-        solve_packed_banded_cholesky_lane4(matrix, dst_buf, dst_w, ku);
+        solve_banded_cholesky_lane4(banded, dst_buf);
         transpose_double_block_from_buf(dst_buf, dstp, dst_stride, dst_w);
         dstp += dst_stride * 4;
         srcp += src_stride * 4;
@@ -2279,62 +1965,55 @@ static void descale_width(
         transpose_block_into_buf_with_tail(srcp, src_buf, src_stride, src_w, tail);
         for (int x = 0; x < dst_w; x++) {
             __m256d v_acc = _mm256_setzero_pd();
-            for (int i = row_ptr_tr[x]; i < row_ptr_tr[x + 1]; i++) {
-                __m128 pix = _mm_load_ps(src_buf + col_idx_tr[i] * 4);
-                __m256d v_weight = _mm256_set1_pd(weights_tr[i]);
+            for (int i = weights.row_ptr[x]; i < weights.row_ptr[x + 1]; i++) {
+                __m128 pix = _mm_load_ps(src_buf + weights.col_idx[i] * 4);
+                __m256d v_weight = _mm256_set1_pd(weights.values[i]);
                 v_acc = _mm256_fmadd_pd(_mm256_cvtps_pd(pix), v_weight, v_acc);
             }
             _mm256_store_pd(dst_buf + x * 4, v_acc);
         }
-        solve_packed_banded_cholesky_lane4(matrix, dst_buf, dst_w, ku);
+        solve_banded_cholesky_lane4(banded, dst_buf);
         transpose_double_block_from_buf_with_tail(dst_buf, dstp, dst_stride, dst_w, tail);
     }
     _mm_sfence();
     _mm_free(dst_buf);
     _mm_free(src_buf);
-    free(matrix);
-    free(row_ptr_tr);
-    free(col_idx_tr);
-    free(weights_tr);
-    free(row_ptr);
-    free(col_idx);
-    free(weights);
 }
 
-static void solve_packed_banded_cholesky_lane8(double *srcp, double *dstp, int n, int ku) {
-    for (int i = 0; i < n; i++) {
-        int start = VSMAX(0, i - ku);
+static void solve_banded_cholesky_lane8(banded_t srcp, double *dstp) {
+    for (int i = 0; i < srcp.col_n; i++) {
+        int start = VSMAX(0, i - srcp.ku);
         __m256d v_acc_0 = _mm256_load_pd(dstp + i * 8 + 0);
         __m256d v_acc_1 = _mm256_load_pd(dstp + i * 8 + 4);
         for (int j = start; j < i; j++) {
-            int row_in_src = ku + j - i;
+            int row_in_src = srcp.ku + j - i;
             if (row_in_src >= 0) {
                 __m256d pix_0 = _mm256_load_pd(dstp + j * 8 + 0);
                 __m256d pix_1 = _mm256_load_pd(dstp + j * 8 + 4);
-                __m256d v_weight = _mm256_set1_pd(srcp[row_in_src * n + i]);
+                __m256d v_weight = _mm256_set1_pd(srcp.values[row_in_src * srcp.col_n + i]);
                 v_acc_0 = _mm256_fnmadd_pd(pix_0, v_weight, v_acc_0);
                 v_acc_1 = _mm256_fnmadd_pd(pix_1, v_weight, v_acc_1);
             }
         }
-        __m256d v_div = _mm256_set1_pd(srcp[ku * n + i]);
+        __m256d v_div = _mm256_set1_pd(srcp.values[srcp.ku * srcp.col_n + i]);
         _mm256_store_pd(dstp + i * 8 + 0, _mm256_div_pd(v_acc_0, v_div));
         _mm256_store_pd(dstp + i * 8 + 4, _mm256_div_pd(v_acc_1, v_div));
     }
-    for (int i = n - 1; i >= 0; i--) {
-        int end = VSMIN(n - 1, i + ku);
+    for (int i = srcp.col_n - 1; i >= 0; i--) {
+        int end = VSMIN(srcp.col_n - 1, i + srcp.ku);
         __m256d v_acc_0 = _mm256_load_pd(dstp + i * 8 + 0);
         __m256d v_acc_1 = _mm256_load_pd(dstp + i * 8 + 4);
         for (int j = i + 1; j <= end; j++) {
-            int row_in_src = ku + i - j;
+            int row_in_src = srcp.ku + i - j;
             if (row_in_src >= 0) {
                 __m256d pix_0 = _mm256_load_pd(dstp + j * 8 + 0);
                 __m256d pix_1 = _mm256_load_pd(dstp + j * 8 + 4);
-                __m256d v_weight = _mm256_set1_pd(srcp[row_in_src * n + j]);
+                __m256d v_weight = _mm256_set1_pd(srcp.values[row_in_src * srcp.col_n + j]);
                 v_acc_0 = _mm256_fnmadd_pd(pix_0, v_weight, v_acc_0);
                 v_acc_1 = _mm256_fnmadd_pd(pix_1, v_weight, v_acc_1);
             }
         }
-        __m256d v_div = _mm256_set1_pd(srcp[ku * n + i]);
+        __m256d v_div = _mm256_set1_pd(srcp.values[srcp.ku * srcp.col_n + i]);
         _mm256_store_pd(dstp + i * 8 + 0, _mm256_div_pd(v_acc_0, v_div));
         _mm256_store_pd(dstp + i * 8 + 4, _mm256_div_pd(v_acc_1, v_div));
     }
@@ -2342,7 +2021,7 @@ static void solve_packed_banded_cholesky_lane8(double *srcp, double *dstp, int n
 
 static void descale_height(
     const float *restrict srcp, float *restrict dstp, ptrdiff_t src_stride,
-    int src_w, int src_h, int dst_h, double start_h, double real_h, double lambda, kernel_t kernel
+    int src_w, int src_h UNUSED, int dst_h, csr_t weights, banded_t banded
 ) {
     int tail = src_w % 8;
     int mod8_w = src_w - tail;
@@ -2351,74 +2030,22 @@ static void descale_height(
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
     __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
     
-    double factor = src_h / real_h;
-    int min_h = (int)floor(start_h);
-    int max_h = (int)ceil(real_h + start_h) - 1;
-    int border = dst_h - 1;
-    int step = (int)ceil(kernel.radius * 2) + 2;
-    double *weights = malloc(sizeof(double) * step * src_h);
-    int *col_idx = malloc(sizeof(int) * step * src_h);
-    int *row_ptr = malloc(sizeof(int) * (src_h + 1));
-    row_ptr[0] = 0;
-    int nnz = 0;
-    
-    for (int y = 0; y < src_h; y++) {
-        double center = (y + 0.5) / factor - 0.5 + start_h;
-        int low = VSMAX((int)floor(center - kernel.radius), min_h);
-        int high = VSMIN((int)ceil(center + kernel.radius), max_h);
-        double norm = 0.0;
-        for (int i = low; i <= high; i++) {
-            double temp_val = kernel.f(i - center, kernel.ctx);
-            if (temp_val == 0.0) continue;
-            norm += temp_val;
-            int temp_idx = CLAMP(i, 0, border);
-            if (row_ptr[y] != nnz && temp_idx == col_idx[nnz - 1]) {
-                weights[nnz - 1] += temp_val;
-                continue;
-            }
-            weights[nnz] = temp_val;
-            col_idx[nnz] = temp_idx;
-            nnz++;
-        }
-        for (int i = row_ptr[y]; i < nnz; i++) {
-            weights[i] /= norm;
-        }
-        row_ptr[y + 1] = nnz;
-    }
-    
-    double *weights_tr = malloc(sizeof(double) * nnz);
-    int *col_idx_tr = malloc(sizeof(int) * nnz);
-    int *row_ptr_tr = malloc(sizeof(int) * (dst_h + 1));
-    transpose_csr(weights, col_idx, row_ptr, weights_tr, col_idx_tr, row_ptr_tr, nnz, dst_h, src_h);
-    
-    int ku = get_ku_from_csr(col_idx, row_ptr, src_h);
-    int kt = ku + 1;
-    
-    ptrdiff_t dst_stride = (dst_h + 7) / 8 * 8;
-    
-    double *matrix = (double *)calloc(dst_h * kt, sizeof(double));
-    packed_banded_gramian_from_csr(matrix, weights, col_idx, row_ptr, dst_h, src_h, ku);
-    
-    for (int i = dst_h * ku; i < dst_h * kt; i++) matrix[i] += lambda;
-    
-    packed_banded_cholesky_from_gramian(matrix, dst_h, ku);
-    
-    double *restrict dst_buf = (double *)_mm_malloc(sizeof(double) * dst_stride * 8, 64);
+    double *restrict dst_buf = (double *)_mm_malloc(sizeof(double) * dst_h * 8, 64);
     
     for (int x = 0; x < mod8_w; x += 8) {
         for (int y = 0; y < dst_h; y++) {
             __m256d v_acc_0 = _mm256_setzero_pd();
             __m256d v_acc_1 = _mm256_setzero_pd();
-            for (int i = row_ptr_tr[y]; i < row_ptr_tr[y + 1]; i++) {
-                __m256 pix = _mm256_load_ps(srcp + col_idx_tr[i] * src_stride);
-                __m256d v_weight = _mm256_set1_pd(weights_tr[i]);
+            for (int i = weights.row_ptr[y]; i < weights.row_ptr[y + 1]; i++) {
+                __m256 pix = _mm256_load_ps(srcp + weights.col_idx[i] * src_stride);
+                __m256d v_weight = _mm256_set1_pd(weights.values[i]);
                 v_acc_0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), v_weight, v_acc_0);
                 v_acc_1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), v_weight, v_acc_1);
             }
             _mm256_store_pd(dst_buf + y * 8 + 0, v_acc_0);
             _mm256_store_pd(dst_buf + y * 8 + 4, v_acc_1);
         }
-        solve_packed_banded_cholesky_lane8(matrix, dst_buf, dst_h, ku);
+        solve_banded_cholesky_lane8(banded, dst_buf);
         for (int y = 0; y < dst_h; y++) {
             __m128 pix0 = _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + y * 8 + 0));
             __m128 pix1 = _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + y * 8 + 4));
@@ -2431,16 +2058,16 @@ static void descale_height(
         for (int y = 0; y < dst_h; y++) {
             __m256d v_acc_0 = _mm256_setzero_pd();
             __m256d v_acc_1 = _mm256_setzero_pd();
-            for (int i = row_ptr_tr[y]; i < row_ptr_tr[y + 1]; i++) {
-                __m256 pix = _mm256_maskload_ps(srcp + col_idx_tr[i] * src_stride, tail_mask);
-                __m256d v_weight = _mm256_set1_pd(weights_tr[i]);
+            for (int i = weights.row_ptr[y]; i < weights.row_ptr[y + 1]; i++) {
+                __m256 pix = _mm256_maskload_ps(srcp + weights.col_idx[i] * src_stride, tail_mask);
+                __m256d v_weight = _mm256_set1_pd(weights.values[i]);
                 v_acc_0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), v_weight, v_acc_0);
                 v_acc_1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), v_weight, v_acc_1);
             }
             _mm256_store_pd(dst_buf + y * 8 + 0, v_acc_0);
             _mm256_store_pd(dst_buf + y * 8 + 4, v_acc_1);
         }
-        solve_packed_banded_cholesky_lane8(matrix, dst_buf, dst_h, ku);
+        solve_banded_cholesky_lane8(banded, dst_buf);
         for (int y = 0; y < dst_h; y++) {
             __m128 pix0 = _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + y * 8 + 0));
             __m128 pix1 = _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + y * 8 + 4));
@@ -2449,13 +2076,6 @@ static void descale_height(
     }
     _mm_sfence();
     _mm_free(dst_buf);
-    free(matrix);
-    free(row_ptr_tr);
-    free(col_idx_tr);
-    free(weights_tr);
-    free(row_ptr);
-    free(col_idx);
-    free(weights);
 }
 
 static const VSFrame *VS_CC DescaleGetFrame(
@@ -2478,6 +2098,52 @@ static const VSFrame *VS_CC DescaleGetFrame(
             chromaloc = 0;
         }
         
+        csr_t chroma_w, chroma_h;
+        banded_t chroma_b_w, chroma_b_h;
+        if (d->process_w && fi->subSamplingW) {
+            int chroma_src_w = d->vi.width >> fi->subSamplingW;
+            int chroma_dst_w = d->dst_width >> fi->subSamplingW;
+            double start_w = d->start_w / (1 << fi->subSamplingW);
+            double real_w = d->real_w / (1 << fi->subSamplingW);
+            if (~chromaloc & 1) {// left allign
+                double offset = ((1 << fi->subSamplingW) - 1) / 2.0;
+                start_w += offset / (1 << fi->subSamplingW) - offset * real_w / d->vi.width;
+            }
+            csr_t temp = csr_get_weights(d->kernel_w, chroma_dst_w, chroma_src_w, start_w, real_w);
+            chroma_w = csr_transpose(temp);
+            chroma_b_w = banded_gramian_from_csr(temp, d->lambda);
+            banded_cholesky_from_gramian(chroma_b_w);
+            csr_free(temp);
+        }
+        else {
+            chroma_w = (csr_t){0, 0, 0, NULL, NULL, NULL};
+            chroma_b_w = (banded_t){0, 0, 0, NULL};
+        }
+        
+        if (d->process_h && fi->subSamplingH) {
+            int chroma_src_h = d->vi.height >> fi->subSamplingH;
+            int chroma_dst_h = d->dst_height >> fi->subSamplingH;
+            double start_h = d->start_h / (1 << fi->subSamplingH);
+            double real_h = d->real_h / (1 << fi->subSamplingH);
+            if (chromaloc & 2) {// top allign
+                double offset = ((1 << fi->subSamplingH) - 1) / 2.0;
+                start_h += offset / (1 << fi->subSamplingH) - offset * real_h / d->vi.height;
+            }
+            else if (chromaloc & 4) {// bottom allign
+                double offset = ((1 << fi->subSamplingH) - 1) / 2.0;
+                start_h -= offset / (1 << fi->subSamplingH) - offset * real_h / d->vi.height;
+            }
+            csr_t temp = csr_get_weights(d->kernel_h, chroma_dst_h, chroma_src_h, start_h, real_h);
+            chroma_h = csr_transpose(temp);
+            chroma_b_h = banded_gramian_from_csr(temp, d->lambda);
+            banded_cholesky_from_gramian(chroma_b_h);
+            csr_free(temp);
+        }
+        else {
+            chroma_h = (csr_t){0, 0, 0, NULL, NULL, NULL};
+            chroma_b_h = (banded_t){0, 0, 0, NULL};
+        }
+        
         VSFrame *tmp = NULL;
         if (d->process_w && d->process_h) {
             tmp = vsapi->newVideoFrame(fi, d->dst_width, d->vi.height, NULL, core);
@@ -2496,45 +2162,19 @@ static const VSFrame *VS_CC DescaleGetFrame(
             int src_h = vsapi->getFrameHeight(src, plane);
             int dst_w = vsapi->getFrameWidth(dst, plane);
             int dst_h = vsapi->getFrameHeight(dst, plane);
-            
-            double start_w = d->start_w;
-            double start_h = d->start_h;
-            double real_w = d->real_w;
-            double real_h = d->real_h;
-            
-            if (plane && (fi->colorFamily == cfYUV)) {
-                if (fi->subSamplingW) {
-                    start_w /= 1 << fi->subSamplingW;
-                    real_w /= 1 << fi->subSamplingW;
-                    if (~chromaloc & 1) {// left allign
-                        double offset = ((1 << fi->subSamplingW) - 1) / 2.0;
-                        start_w += offset / (1 << fi->subSamplingW) - offset * real_w / (src_w << fi->subSamplingW);
-                    }
-                }
-                if (fi->subSamplingH) {
-                    start_h /= 1 << fi->subSamplingH;
-                    real_h /= 1 << fi->subSamplingH;
-                    if (chromaloc & 2) {// top allign
-                        double offset = ((1 << fi->subSamplingH) - 1) / 2.0;
-                        start_h += offset / (1 << fi->subSamplingH) - offset * real_h / (src_h << fi->subSamplingH);
-                    }
-                    else if (chromaloc & 4) {// bottom allign
-                        double offset = ((1 << fi->subSamplingH) - 1) / 2.0;
-                        start_h -= offset / (1 << fi->subSamplingH) - offset * real_h / (src_h << fi->subSamplingH);
-                    }
-                }
-            }
+            bool sub_w = plane && fi->subSamplingW;
+            bool sub_h = plane && fi->subSamplingH;
             
             if (d->process_w && d->process_h) {
                 float *restrict tmpp = (float *)vsapi->getWritePtr(tmp, plane);
-                descale_width(srcp, tmpp, src_stride, dst_stride, src_w, src_h, dst_w, start_w, real_w, d->lambda, d->kernel_w);
-                descale_height(tmpp, dstp, dst_stride, dst_w, src_h, dst_h, start_h, real_h, d->lambda, d->kernel_h);
+                descale_width(srcp, tmpp, src_stride, dst_stride, src_w, src_h, dst_w, sub_w ? chroma_w : d->luma_w, sub_w ? chroma_b_w : d->luma_b_w);
+                descale_height(tmpp, dstp, dst_stride, dst_w, src_h, dst_h, sub_h ? chroma_h : d->luma_h, sub_h ? chroma_b_h : d->luma_b_h);
             }
             else if (d->process_w) {
-                descale_width(srcp, dstp, src_stride, dst_stride, src_w, src_h, dst_w, start_w, real_w, d->lambda, d->kernel_w);
+                descale_width(srcp, dstp, src_stride, dst_stride, src_w, src_h, dst_w, sub_w ? chroma_w : d->luma_w, sub_w ? chroma_b_w : d->luma_b_w);
             }
             else if (d->process_h) {
-                descale_height(srcp, dstp, dst_stride, dst_w, src_h, dst_h, start_h, real_h, d->lambda, d->kernel_h);
+                descale_height(srcp, dstp, dst_stride, dst_w, src_h, dst_h, sub_h ? chroma_h : d->luma_h, sub_h ? chroma_b_h : d->luma_b_h);
             }
             else {
                 vsh_bitblt(dstp, sizeof(float) * dst_stride, srcp, sizeof(float) * src_stride, sizeof(float) * src_w, src_h);
@@ -2543,6 +2183,11 @@ static const VSFrame *VS_CC DescaleGetFrame(
         
         vsapi->freeFrame(tmp);
         vsapi->freeFrame(src);
+        
+        banded_free(chroma_b_h);
+        banded_free(chroma_b_w);
+        csr_free(chroma_h);
+        csr_free(chroma_w);
         
         return dst;
     }
@@ -2560,6 +2205,11 @@ static void VS_CC DescaleFree(void *instanceData, VSCore *core UNUSED, const VSA
         free(d->kernel_w.ctx);
         free(d->kernel_h.ctx);
     }
+    
+    csr_free(d->luma_w);
+    csr_free(d->luma_h);
+    banded_free(d->luma_b_w);
+    banded_free(d->luma_b_h);
     
     free(d);
 }
@@ -2819,6 +2469,30 @@ static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData UNUS
     d.process_w = (d.dst_width == d.vi.width && d.real_w == d.dst_width && d.start_w == 0.0) ? false : true;
     d.process_h = (d.dst_height == d.vi.height && d.real_h == d.dst_height && d.start_h == 0.0) ? false : true;
     
+    if (d.process_w) {
+        csr_t temp = csr_get_weights(d.kernel_w, d.dst_width, d.vi.width, d.start_w, d.real_w);
+        d.luma_w = csr_transpose(temp);
+        d.luma_b_w = banded_gramian_from_csr(temp, d.lambda);
+        banded_cholesky_from_gramian(d.luma_b_w);
+        csr_free(temp);
+    }
+    else {
+        d.luma_w = (csr_t){0, 0, 0, NULL, NULL, NULL};
+        d.luma_b_w = (banded_t){0, 0, 0, NULL};
+    }
+    
+    if (d.process_h) {
+        csr_t temp = csr_get_weights(d.kernel_h, d.dst_height, d.vi.height, d.start_h, d.real_h);
+        d.luma_h = csr_transpose(temp);
+        d.luma_b_h = banded_gramian_from_csr(temp, d.lambda);
+        banded_cholesky_from_gramian(d.luma_b_h);
+        csr_free(temp);
+    }
+    else {
+        d.luma_h = (csr_t){0, 0, 0, NULL, NULL, NULL};
+        d.luma_b_h = (banded_t){0, 0, 0, NULL};
+    }
+    
     DescaleData *data = (DescaleData *)malloc(sizeof d);
     *data = d;
     
@@ -2834,7 +2508,6 @@ typedef struct {
     VSNode *node1;
 } RelativeErrorData;
 
-#if defined(__AVX2__) && defined(__FMA__)
 static double get_relative_error(
     const float *restrict srcp0, const float *restrict srcp1, int src_w, int src_h, ptrdiff_t stride
 ) {
@@ -2889,25 +2562,6 @@ static double get_relative_error(
     
     return sqrt(_mm_cvtsd_f64(acc4)) / fmax(sqrt(_mm_cvtsd_f64(acc5)), 1e-16);
 }
-#else
-static double get_relative_error(
-    const float *restrict srcp0, const float *restrict srcp1, int src_w, int src_h, ptrdiff_t stride
-) {
-    double acc0 = 0.0;
-    double acc1 = 0.0;
-    
-    for (int y = 0; y < src_h; y++) {
-        for (int x = 0; x < src_w; x++) {
-            acc0 += pow((double)srcp0[x] - (double)srcp1[x], 2);
-            acc1 += pow((double)srcp0[x], 2);
-        }
-        srcp0 += stride;
-        srcp1 += stride;
-    }
-    
-    return sqrt(acc0) / fmax(sqrt(acc1), 1e-16);
-}
-#endif
 
 static const VSFrame *VS_CC RelativeErrorGetFrame(
     int n, int activationReason, void *instanceData, void **frameData UNUSED,
@@ -3045,26 +2699,26 @@ static void VS_CC LinearizeCreate(
     const char *gamma = vsapi->mapGetData(in, "gamma", 0, &err);
     if (err) {
         if (d.vi.format.colorFamily == cfRGB) {
-            d.gamma = (GammaData){2.4f, 0.04045f, 0.0031308f, 0.055f, 12.92f, true};
+            d.gamma = (GammaData){2.4, 0.04045f, 0.0031308f, 0.055f, 12.92f, true};
         }
         else {
-            d.gamma = (GammaData){1.0f / 0.45f, 0.081f, 0.018f, 0.099f, 4.5f, false};
+            d.gamma = (GammaData){1.0 / 0.45, 0.081f, 0.018f, 0.099f, 4.5f, false};
         }
     }
     else if (!strcmp(gamma, "srgb")) {
-        d.gamma = (GammaData){2.4f, 0.04045f, 0.0031308f, 0.055f, 12.92f, true};
+        d.gamma = (GammaData){2.4, 0.04045f, 0.0031308f, 0.055f, 12.92f, true};
     }
     else if (!strcmp(gamma, "smpte170m")) {
-        d.gamma = (GammaData){1.0f / 0.45f, 0.081f, 0.018f, 0.099f, 4.5f, false};
+        d.gamma = (GammaData){1.0 / 0.45, 0.081f, 0.018f, 0.099f, 4.5f, false};
     }
     else if (!strcmp(gamma, "adobe")) {
-        d.gamma = (GammaData){2.19921875f, 0.0f, 0.0f, 0.0f, 1.0f, false};
+        d.gamma = (GammaData){2.19921875, 0.0f, 0.0f, 0.0f, 1.0f, false};
     }
     else if (!strcmp(gamma, "dcip3")) {
-        d.gamma = (GammaData){2.6f, 0.0f, 0.0f, 0.0f, 1.0f, false};
+        d.gamma = (GammaData){2.6, 0.0f, 0.0f, 0.0f, 1.0f, false};
     }
     else if (!strcmp(gamma, "smpte240m")) {
-        d.gamma = (GammaData){1.0f / 0.45f, 0.0913f, 0.0228f, 0.1115f, 4.0f, false};
+        d.gamma = (GammaData){1.0 / 0.45, 0.0913f, 0.0228f, 0.1115f, 4.0f, false};
     }
     else {
         vsapi->mapSetError(out, "Linearize: invalid gamma specified");
@@ -3162,26 +2816,26 @@ static void VS_CC GammaCorrCreate(
     const char *gamma = vsapi->mapGetData(in, "gamma", 0, &err);
     if (err) {
         if (d.vi.format.colorFamily == cfRGB) {
-            d.gamma = (GammaData){2.4f, 0.04045f, 0.0031308f, 0.055f, 12.92f, true};
+            d.gamma = (GammaData){2.4, 0.04045f, 0.0031308f, 0.055f, 12.92f, true};
         }
         else {
-            d.gamma = (GammaData){1.0f / 0.45f, 0.081f, 0.018f, 0.099f, 4.5f, false};
+            d.gamma = (GammaData){1.0 / 0.45, 0.081f, 0.018f, 0.099f, 4.5f, false};
         }
     }
     else if (!strcmp(gamma, "srgb")) {
-        d.gamma = (GammaData){2.4f, 0.04045f, 0.0031308f, 0.055f, 12.92f, true};
+        d.gamma = (GammaData){2.4, 0.04045f, 0.0031308f, 0.055f, 12.92f, true};
     }
     else if (!strcmp(gamma, "smpte170m")) {
-        d.gamma = (GammaData){1.0f / 0.45f, 0.081f, 0.018f, 0.099f, 4.5f, false};
+        d.gamma = (GammaData){1.0 / 0.45, 0.081f, 0.018f, 0.099f, 4.5f, false};
     }
     else if (!strcmp(gamma, "adobe")) {
-        d.gamma = (GammaData){2.19921875f, 0.0f, 0.0f, 0.0f, 1.0f, false};
+        d.gamma = (GammaData){2.19921875, 0.0f, 0.0f, 0.0f, 1.0f, false};
     }
     else if (!strcmp(gamma, "dcip3")) {
-        d.gamma = (GammaData){2.6f, 0.0f, 0.0f, 0.0f, 1.0f, false};
+        d.gamma = (GammaData){2.6, 0.0f, 0.0f, 0.0f, 1.0f, false};
     }
     else if (!strcmp(gamma, "smpte240m")) {
-        d.gamma = (GammaData){1.0f / 0.45f, 0.0913f, 0.0228f, 0.1115f, 4.0f, false};
+        d.gamma = (GammaData){1.0 / 0.45, 0.0913f, 0.0228f, 0.1115f, 4.0f, false};
     }
     else {
         vsapi->mapSetError(out, "GammaCorr: invalid gamma specified");
@@ -3346,7 +3000,7 @@ static void VS_CC BitDepthCreate(
 }
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
-    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(15, 0), VAPOURSYNTH_API_VERSION, 0, plugin);
+    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(16, 0), VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction("Resize",
                              "clip:vnode;"
                              "width:int;"

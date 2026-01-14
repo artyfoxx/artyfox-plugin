@@ -1,6 +1,6 @@
 # artyfox-plugin
 A disjointed set of filters for VapourSynth, I write everything that seems interesting.  
-The library is written using AVX2 intrinsics, with scalar implementations of functions added on a residual basis.
+The library is written using AVX2 intrinsics.
 ## Resize
 `artyfox.Resize(clip clip, int width, int height[, float src_left=0.0, float src_top=0.0, float src_width=clip.width, float src_height=clip.height, str kernel="area", float b=1/3, float c=1/3, int taps=3, str gamma='srgb' or 'smpte170m', float sharp=1.0])`
 
@@ -94,16 +94,3 @@ Converting the bit depth of a clip.
 
 ## License
 This project is licensed under the MIT License - see the LICENSE file for details.
-
-### Note on Intel SVML
-This project may be built using the Intel Compiler (ICX/ICC), which can internally
-use functions from the Intel Short Vector Math Library (SVML) to implement standard
-vector math intrinsics such as `_mm256_pow_ps`, `_mm256_exp_ps`, `_mm256_log_ps`, etc.
-
-No SVML source code or binaries are distributed with this project.
-Any SVML routines that may be embedded in the compiled binary are used solely as
-part of the normal compilation and optimization process provided by the Intel Compiler,
-and remain subject to Intel's compiler runtime license.
-
-The original source code of this project is entirely independent and released
-under the terms of the MIT License.
