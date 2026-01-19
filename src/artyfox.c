@@ -329,15 +329,57 @@ typedef struct {
     double beta, i0_beta;
 } kaiser_ctx;
 
+// https://www.advanpix.com/2015/11/11/rational-approximations-for-the-modified-bessel-function-of-the-first-kind-i0-computations-double-precision/
 static inline double bessel_i0(double x) {
-    double sum = 1.0, y = x * x / 4.0, t = y;
-    int k = 1;
-    while (t > 1e-16 * sum) {
-        sum += t;
-        k++;
-        t *= y / (k * k);
+    // 2.38eps
+    if (x < 7.75) {
+        x /= 2.0;
+        x *= x;
+        double u = 1.1497640034400735733456400e-29;
+        u = u * x + 2.0732014503197852176921968e-27;
+        u = u * x + 5.9203280572170548134753422e-25;
+        u = u * x + 1.3141332422663039834197910e-22;
+        u = u * x + 2.5791926805873898803749321e-20;
+        u = u * x + 4.3583591008893599099577755e-18;
+        u = u * x + 6.2760839879536225394314453e-16;
+        u = u * x + 7.5940582595094190098755663e-14;
+        u = u * x + 7.5940584360755226536109511e-12;
+        u = u * x + 6.1511873265092916275099070e-10;
+        u = u * x + 3.9367598891475388547279760e-08;
+        u = u * x + 1.9290123456788994104574754e-06;
+        u = u * x + 6.9444444444444568581891535e-05;
+        u = u * x + 1.7361111111111110294015271e-03;
+        u = u * x + 2.7777777777777777805664954e-02;
+        u = u * x + 2.4999999999999999999629693e-01;
+        u = u * x + 1.0000000000000000000000801e+00;
+        return u * x + 1.0;
     }
-    return sum;
+    // 0.72eps
+    double x_rec = 1.0 / x;
+    double u = 1.6069467093441596329340754e+16;
+    u = u * x_rec + -2.1363029690365351606041265e+16;
+    u = u * x_rec + 1.3012646806421079076251950e+16;
+    u = u * x_rec + -4.8049082153027457378879746e+15;
+    u = u * x_rec + 1.1989242681178569338129044e+15;
+    u = u * x_rec + -2.1323049786724612220362154e+14;
+    u = u * x_rec + 2.7752144774934763122129261e+13;
+    u = u * x_rec + -2.6632742974569782078420204e+12;
+    u = u * x_rec + 1.8592340458074104721496236e+11;
+    u = u * x_rec + -8.9270060370015930749184222e+09;
+    u = u * x_rec + 2.3518420447411254516178388e+08;
+    u = u * x_rec + 2.6092888649549172879282592e+06;
+    u = u * x_rec + -5.9355022509673600842060002e+05;
+    u = u * x_rec + 3.1275740782277570164423916e+04;
+    u = u * x_rec + -1.0026890180180668595066918e+03;
+    u = u * x_rec + 2.2725199603010833194037016e+01;
+    u = u * x_rec + -1.0699095472110916094973951e-01;
+    u = u * x_rec + 9.4085204199017869159183831e-02;
+    u = u * x_rec + 4.4718622769244715693031735e-02;
+    u = u * x_rec + 2.9219501690198775910219311e-02;
+    u = u * x_rec + 2.8050628884163787533196746e-02;
+    u = u * x_rec + 4.9867785050353992900698488e-02;
+    u = u * x_rec + 3.9894228040143265335649948e-01;
+    return exp(x) * u / sqrt(x);
 }
 
 static double kaiser_kernel(double x, void *ctx) {
@@ -369,9 +411,9 @@ static double gauss_kernel(double x, void *ctx) {
 }
 
 // exp2(log2(x) * y); 0.5 ulp
+// Inspired by: https://jrfonseca.blogspot.com/2008/09/fast-sse2-pow-tables-or-polynomials.html
 static __m256 crazy_pow(__m256 x, __m256d y) {
     __m256i i = _mm256_castps_si256(x);
-    __m256d one = _mm256_set1_pd(1.0);
     __m256i exp = _mm256_sub_epi32(_mm256_srli_epi32(_mm256_and_si256(i, _mm256_set1_epi32(0x7f800000)), 23), _mm256_set1_epi32(127));
     __m256 mant = _mm256_or_ps(_mm256_castsi256_ps(_mm256_and_si256(i, _mm256_set1_epi32(0x007fffff))), _mm256_set1_ps(1.0f));
     __m256d m0 = _mm256_cvtps_pd(_mm256_extractf128_ps(mant, 0));
@@ -387,8 +429,9 @@ static __m256 crazy_pow(__m256 x, __m256d y) {
     temp = _mm256_set1_pd(13.296487881230806), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
     temp = _mm256_set1_pd(-7.6638533210657123), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
     temp = _mm256_set1_pd(3.9049493931218771), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
-    p0 = _mm256_fmadd_pd(p0, _mm256_sub_pd(m0, one), _mm256_cvtepi32_pd(_mm256_extractf128_ps(exp, 0)));
-    p1 = _mm256_fmadd_pd(p1, _mm256_sub_pd(m1, one), _mm256_cvtepi32_pd(_mm256_extractf128_ps(exp, 1)));
+    temp = _mm256_set1_pd(1.0);
+    p0 = _mm256_fmadd_pd(p0, _mm256_sub_pd(m0, temp), _mm256_cvtepi32_pd(_mm256_extractf128_ps(exp, 0)));
+    p1 = _mm256_fmadd_pd(p1, _mm256_sub_pd(m1, temp), _mm256_cvtepi32_pd(_mm256_extractf128_ps(exp, 1)));
     p0 = _mm256_mul_pd(p0, y), p1 = _mm256_mul_pd(p1, y);
     temp = _mm256_set1_pd(127.0), p0 = _mm256_min_pd(p0, temp), p1 = _mm256_min_pd(p1, temp);
     temp = _mm256_set1_pd(-127.0), p0 = _mm256_max_pd(p0, temp), p1 = _mm256_max_pd(p1, temp);
@@ -2311,8 +2354,8 @@ static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData UNUS
         d.lambda = 1e-4;
     }
     
-    if (d.lambda < 1e-12 || d.lambda >= 1.0) {
-        vsapi->mapSetError(out, "Resize: \"lambda\" must be between 1e-12 and 1");
+    if (d.lambda < 1e-16 || d.lambda >= 1.0) {
+        vsapi->mapSetError(out, "Resize: \"lambda\" must be between 1e-16 and 1");
         vsapi->freeNode(d.node);
         return;
     }

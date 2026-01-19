@@ -57,7 +57,7 @@ Descaling via Tikhonov regularization and Cholesky decomposition (U.T @ U). This
 * `b`: The `b` parameter in the `bicubic` kernel. Defaults to 1/3.
 * `c`: The `c` parameter in the `bicubic` kernel. Defaults to 1/3.
 * `taps`: Window radius value for `blackman`, `gauss`, `kaiser`, `lanczos` and `nuttall` kernels. Default is 3.
-* `lambda`: Regularization parameter. Ensures positive definiteness and stability of the solution to the system of equations. Small values ​​can lead to increased noise, quantization artifacts, and ringing. Excessively large values ​​produce a smooth image, suppressing fine details. Default is 1e-4. Valid range: 1e-12 <= `lambda` < 1. Since `lambda` is a Python keyword, you may [append an underscore to the argument’s name when invoking the filter](https://www.vapoursynth.com/doc/pythonreference.html#python-keywords-as-filter-arguments).
+* `lambda`: Regularization parameter. Ensures positive definiteness and stability of the solution to the system of equations. Small values ​​can lead to increased noise, quantization artifacts, and ringing. Excessively large values ​​produce a smooth image, suppressing fine details. Default is 1e-4. Valid range: 1e-16 <= `lambda` < 1. Since `lambda` is a Python keyword, you may [append an underscore to the argument’s name when invoking the filter](https://www.vapoursynth.com/doc/pythonreference.html#python-keywords-as-filter-arguments).
 
 ## RelativeError
 `artyfox.RelativeError(clip clip0, clip clip1)`
