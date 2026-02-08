@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <immintrin.h>
+#define _USE_MATH_DEFINES
 #include <math.h>
 #include "VapourSynth4.h"
 #include "VSHelper4.h"
@@ -9,7 +10,6 @@
 #define ALWAYS_INLINE __attribute__((always_inline))
 #define UNUSED __attribute__((unused))
 #define CLAMP(x, min, max) ((x) > (max) ? (max) : ((x) < (min) ? (min) : (x))) 
-#define M_PI 3.14159265358979323846
 
 typedef double (*kernel_func)(double x, void *ctx);
 
