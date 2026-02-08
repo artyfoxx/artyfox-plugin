@@ -36,6 +36,11 @@ typedef struct {
     bool strict;
 } GammaData;
 
+typedef void (*convert_func)(
+    const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
+    int src_w, int src_h, int src_bits, int dst_bits, bool range, bool chroma
+);
+
 typedef struct {
     VSNode *node;
     VSVideoInfo vi;
@@ -46,6 +51,7 @@ typedef struct {
     float sharp;
     bool linear, process_w, process_h;
     csr_t luma_w, luma_h;
+    convert_func conv_up, conv_down;
 } ResizeData;
 
 typedef struct {
@@ -597,10 +603,12 @@ static void from_linear(
 }
 
 static void uint8_to_uint16(
-    const uint8_t *restrict srcp, uint16_t *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, int bits
+    const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
+    int src_w, int src_h, int src_bits, int dst_bits, bool range UNUSED, bool chroma UNUSED
 ) {
-    int count = bits - 8;
+    const uint8_t *restrict srcp = ptrs;
+    uint16_t *restrict dstp = ptrd;
+    int count = dst_bits - src_bits;
     int tail = src_w % 16;
     int mod16_w = src_w - tail;
     
@@ -627,9 +635,11 @@ static void uint8_to_uint16(
 }
 
 static void uint8_to_float(
-    const uint8_t *restrict srcp, float *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, bool chroma, bool range
+    const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
+    int src_w, int src_h, int src_bits UNUSED, int dst_bits UNUSED, bool range, bool chroma
 ) {
+    const uint8_t *restrict srcp = ptrs;
+    float *restrict dstp = ptrd;
     int tail = src_w % 16;
     int mod16_w = src_w - tail;
     
@@ -680,9 +690,11 @@ static void uint8_to_float(
 }
 
 static void uint16_to_uint8(
-    const uint16_t *restrict srcp, uint8_t *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, int bits
+    const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
+    int src_w, int src_h, int src_bits, int dst_bits, bool range UNUSED, bool chroma UNUSED
 ) {
+    const uint16_t *restrict srcp = ptrs;
+    uint8_t *restrict dstp = ptrd;
     int tail = src_w % 16;
     int mod16_w = src_w - tail;
     
@@ -690,7 +702,7 @@ static void uint16_to_uint8(
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
     __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
     
-    int count = bits - 8;
+    int count = src_bits - dst_bits;
     __m256i v_half = _mm256_set1_epi16(1 << (count - 1));
     
     for (int y = 0; y < src_h; y++) {
@@ -716,9 +728,11 @@ static void uint16_to_uint8(
 }
 
 static void uint16_to_uint16(
-    const uint16_t *restrict srcp, uint16_t *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, int src_bits, int dst_bits
+    const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
+    int src_w, int src_h, int src_bits, int dst_bits, bool range UNUSED, bool chroma UNUSED
 ) {
+    const uint16_t *restrict srcp = ptrs;
+    uint16_t *restrict dstp = ptrd;
     int tail = src_w % 16;
     int mod16_w = src_w - tail;
     
@@ -768,9 +782,11 @@ static void uint16_to_uint16(
 }
 
 static void uint16_to_float(
-    const uint16_t *restrict srcp, float *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, bool chroma, bool range, int bits
+    const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
+    int src_w, int src_h, int src_bits, int dst_bits UNUSED, bool range, bool chroma
 ) {
+    const uint16_t *restrict srcp = ptrs;
+    float *restrict dstp = ptrd;
     int tail = src_w % 8;
     int mod8_w = src_w - tail;
     
@@ -780,12 +796,12 @@ static void uint16_to_float(
     
     __m256 v_low, v_high;
     if (range) {
-        v_low = _mm256_set1_ps((float)((chroma ? 128 : 16) << (bits - 8)));
-        v_high = _mm256_set1_ps((float)((chroma ? 224 : 219) << (bits - 8)));
+        v_low = _mm256_set1_ps((float)((chroma ? 128 : 16) << (src_bits - 8)));
+        v_high = _mm256_set1_ps((float)((chroma ? 224 : 219) << (src_bits - 8)));
     }
     else {
-        v_low = _mm256_set1_ps(chroma ? (float)(128 << (bits - 8)) : 0.0f);
-        v_high = _mm256_set1_ps(chroma ? (float)(1 << bits) : (float)((1 << bits) - 1));
+        v_low = _mm256_set1_ps(chroma ? (float)(128 << (src_bits - 8)) : 0.0f);
+        v_high = _mm256_set1_ps(chroma ? (float)(1 << src_bits) : (float)((1 << src_bits) - 1));
     }
     
     for (int y = 0; y < src_h; y++) {
@@ -809,9 +825,11 @@ static void uint16_to_float(
 }
 
 static void float_to_uint8(
-    const float *restrict srcp, uint8_t *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, bool chroma, bool range
+    const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
+    int src_w, int src_h, int src_bits UNUSED, int dst_bits UNUSED, bool range, bool chroma
 ) {
+    const float *restrict srcp = ptrs;
+    uint8_t *restrict dstp = ptrd;
     int tail = src_w % 16;
     int mod16_w = src_w - tail;
     
@@ -863,9 +881,11 @@ static void float_to_uint8(
 }
 
 static void float_to_uint16(
-    const float *restrict srcp, uint16_t *restrict dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, bool chroma, bool range, int bits
+    const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
+    int src_w, int src_h, int src_bits UNUSED, int dst_bits, bool range, bool chroma
 ) {
+    const float *restrict srcp = ptrs;
+    uint16_t *restrict dstp = ptrd;
     int tail = src_w % 8;
     int mod8_w = src_w - tail;
     
@@ -873,15 +893,15 @@ static void float_to_uint16(
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
     __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
     
-    __m256i v_max = _mm256_set1_epi32((1 << bits) - 1);
+    __m256i v_max = _mm256_set1_epi32((1 << dst_bits) - 1);
     __m256 v_low, v_high;
     if (range) {
-        v_low = _mm256_set1_ps(0.5f + (float)((chroma ? 128 : 16) << (bits - 8)));
-        v_high = _mm256_set1_ps((float)((chroma ? 224 : 219) << (bits - 8)));
+        v_low = _mm256_set1_ps(0.5f + (float)((chroma ? 128 : 16) << (dst_bits - 8)));
+        v_high = _mm256_set1_ps((float)((chroma ? 224 : 219) << (dst_bits - 8)));
     }
     else {
-        v_low = _mm256_set1_ps(chroma ? 0.5f + (float)(128 << (bits - 8)) : 0.5f);
-        v_high = _mm256_set1_ps(chroma ? (float)(1 << bits) : (float)((1 << bits) - 1));
+        v_low = _mm256_set1_ps(chroma ? 0.5f + (float)(128 << (dst_bits - 8)) : 0.5f);
+        v_high = _mm256_set1_ps(chroma ? (float)(1 << dst_bits) : (float)((1 << dst_bits) - 1));
     }
     
     for (int y = 0; y < src_h; y++) {
@@ -1267,9 +1287,12 @@ static const VSFrame *VS_CC ResizeGetFrame(
             chromaloc = 0;
         }
         
-        int range = vsapi->mapGetIntSaturated(props, "_ColorRange", 0, &err);
-        if (err || range < 0 || range > 1) {
-            range = (fi->colorFamily == cfRGB) ? 0 : 1;
+        bool range = !!vsapi->mapGetIntSaturated(props, "_ColorRange", 0, &err);
+        if (bit_convert && !d->linear) {
+            range = false;
+        }
+        else if (err) {
+            range = (fi->colorFamily == cfRGB) ? false : true;
         }
         
         csr_t chroma_w, chroma_h;
@@ -1351,12 +1374,7 @@ static const VSFrame *VS_CC ResizeGetFrame(
             if (bit_convert) {
                 float *restrict bcup = (float *)vsapi->getWritePtr(bcu, plane);
                 ptrdiff_t bcu_stride = vsapi->getStride(bcu, plane) / sizeof(float);
-                if (fi->bytesPerSample == 1) {
-                    uint8_to_float(srcp, bcup, src_stride, bcu_stride, src_w, src_h, chroma, range);
-                }
-                else {
-                    uint16_to_float(srcp, bcup, src_stride, bcu_stride, src_w, src_h, chroma, range, fi->bitsPerSample);
-                }
+                d->conv_up(srcp, bcup, src_stride, bcu_stride, src_w, src_h, fi->bitsPerSample, 32, range, chroma);
                 srcp = bcup;
                 src_stride = bcu_stride;
                 dstp = (void *)vsapi->getWritePtr(bcd, plane);
@@ -1406,12 +1424,7 @@ static const VSFrame *VS_CC ResizeGetFrame(
                 dstp = (void *)vsapi->getWritePtr(dst, plane);
                 ptrdiff_t bcd_stride = dst_stride;
                 dst_stride = vsapi->getStride(dst, plane) / fi->bytesPerSample;
-                if (fi->bytesPerSample == 1) {
-                    float_to_uint8(bcdp, dstp, bcd_stride, dst_stride, dst_w, dst_h, chroma, range);
-                }
-                else {
-                    float_to_uint16(bcdp, dstp, bcd_stride, dst_stride, dst_w, dst_h, chroma, range, fi->bitsPerSample);
-                }
+                d->conv_down(bcdp, dstp, bcd_stride, dst_stride, dst_w, dst_h, 32, fi->bitsPerSample, range, chroma);
             }
         }
         vsapi->freeFrame(shr);
@@ -1773,6 +1786,19 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData UNUSE
     }
     else {
         d.luma_h = (csr_t){0, 0, 0, NULL, NULL, NULL};
+    }
+    
+    if (d.vi.format.bytesPerSample == 1) {
+        d.conv_up = uint8_to_float;
+        d.conv_down = float_to_uint8;
+    }
+    else if (d.vi.format.bytesPerSample == 2) {
+        d.conv_up = uint16_to_float;
+        d.conv_down = float_to_uint16;
+    }
+    else {
+        d.conv_up = NULL;
+        d.conv_down = NULL;
     }
     
     ResizeData *data = (ResizeData *)malloc(sizeof d);
@@ -2948,6 +2974,7 @@ static void VS_CC GammaCorrCreate(
 typedef struct {
     VSNode *node;
     VSVideoInfo vi;
+    convert_func f;
     bool direct;
 } BitDepthData;
 
@@ -2968,13 +2995,12 @@ static const VSFrame *VS_CC BitDepthGetFrame(
         const VSMap *props = vsapi->getFramePropertiesRO(src);
         
         int err;
-        int range = vsapi->mapGetIntSaturated(props, "_ColorRange", 0, &err);
-        
+        bool range = !!vsapi->mapGetIntSaturated(props, "_ColorRange", 0, &err);
         if (d->direct) {
-            range = 0;
+            range = false;
         }
-        else if (err || range < 0 || range > 1) {
-            range = (fi->colorFamily == cfRGB) ? 0 : 1;
+        else if (err) {
+            range = (fi->colorFamily == cfRGB) ? false : true;
         }
         
         for (int plane = 0; plane < fi->numPlanes; plane++) {
@@ -2987,27 +3013,7 @@ static const VSFrame *VS_CC BitDepthGetFrame(
             int src_h = vsapi->getFrameHeight(src, plane);
             bool chroma = plane && (fi->colorFamily == cfYUV);
             
-            if ((fi->bytesPerSample == 1) && (d->vi.format.bytesPerSample == 4)) {
-                uint8_to_float(srcp, dstp, src_stride, dst_stride, src_w, src_h, chroma, range);
-            }
-            else if ((fi->bytesPerSample == 2) && (d->vi.format.bytesPerSample == 4)) {
-                uint16_to_float(srcp, dstp, src_stride, dst_stride, src_w, src_h, chroma, range, fi->bitsPerSample);
-            }
-            else if ((fi->bytesPerSample == 4) && (d->vi.format.bytesPerSample == 1)) {
-                float_to_uint8(srcp, dstp, src_stride, dst_stride, src_w, src_h, chroma, range);
-            }
-            else if ((fi->bytesPerSample == 4) && (d->vi.format.bytesPerSample == 2)) {
-                float_to_uint16(srcp, dstp, src_stride, dst_stride, src_w, src_h, chroma, range, d->vi.format.bitsPerSample);
-            }
-            else if ((fi->bytesPerSample == 1) && (d->vi.format.bytesPerSample == 2)) {
-                uint8_to_uint16(srcp, dstp, src_stride, dst_stride, src_w, src_h, d->vi.format.bitsPerSample);
-            }
-            else if ((fi->bytesPerSample == 2) && (d->vi.format.bytesPerSample == 1)) {
-                uint16_to_uint8(srcp, dstp, src_stride, dst_stride, src_w, src_h, fi->bitsPerSample);
-            }
-            else {
-                uint16_to_uint16(srcp, dstp, src_stride, dst_stride, src_w, src_h, fi->bitsPerSample, d->vi.format.bitsPerSample);
-            }
+            d->f(srcp, dstp, src_stride, dst_stride, src_w, src_h, fi->bitsPerSample, d->vi.format.bitsPerSample, range, chroma);
         }
         vsapi->freeFrame(src);
         return dst;
@@ -3052,6 +3058,30 @@ static void VS_CC BitDepthCreate(
         return;
     }
     
+    int bytes = (bits + 7) / 8;
+    
+    if ((d.vi.format.bytesPerSample == 1) && (bytes == 4)) {
+        d.f = uint8_to_float;
+    }
+    else if ((d.vi.format.bytesPerSample == 2) && (bytes == 4)) {
+        d.f = uint16_to_float;
+    }
+    else if ((d.vi.format.bytesPerSample == 4) && (bytes == 1)) {
+        d.f = float_to_uint8;
+    }
+    else if ((d.vi.format.bytesPerSample == 4) && (bytes == 2)) {
+        d.f = float_to_uint16;
+    }
+    else if ((d.vi.format.bytesPerSample == 1) && (bytes == 2)) {
+        d.f = uint8_to_uint16;
+    }
+    else if ((d.vi.format.bytesPerSample == 2) && (bytes == 1)) {
+        d.f = uint16_to_uint8;
+    }
+    else {
+        d.f = uint16_to_uint16;
+    }
+    
     int err;
     d.direct = !!vsapi->mapGetIntSaturated(in, "direct", 0, &err);
     
@@ -3060,7 +3090,7 @@ static void VS_CC BitDepthCreate(
     }
     
     d.vi.format.bitsPerSample = bits;
-    d.vi.format.bytesPerSample = (bits + 7) / 8;
+    d.vi.format.bytesPerSample = bytes;
     d.vi.format.sampleType = (bits == 32) ? stFloat : stInteger;
     
     BitDepthData *data = (BitDepthData *)malloc(sizeof d);
