@@ -52,6 +52,7 @@ typedef struct {
     double scale;
 } area_ctx;
 
+// Based on: https://entropymine.com/imageworsener/pixelmixing/
 static double area_kernel(double x, void *ctx) {
     area_ctx *ar = (area_ctx *)ctx;
     if (x < 0.0) {
@@ -66,16 +67,17 @@ static double area_kernel(double x, void *ctx) {
     return 0.0;
 }
 
+// Based on: https://johncostella.com/magic/
 static double magic_kernel(double x, void *ctx UNUSED) {
     if (x < 0.0) {
         x = -x;
     }
     if (x < 0.5) {
-        return 0.75 - x * x;
+        return 3.0 / 4.0 - x * x;
     }
     if (x < 1.5) {
         x -= 1.5;
-        return 0.5 * x * x;
+        return 1.0 / 2.0 * (x * x);
     }
     return 0.0;
 }
@@ -85,14 +87,14 @@ static double magic_kernel_2013(double x, void *ctx UNUSED) {
         x = -x;
     }
     if (x < 0.5) {
-        return 1.0625 - 1.75 * x * x;
+        return 17.0 / 16.0 - 7.0 / 4.0 * (x * x);
     }
     if (x < 1.5) {
-        return (1.0 - x) * (1.75 - x);
+        return (1.0 - x) * (7.0 / 4.0 - x);
     }
     if (x < 2.5) {
         x -= 2.5;
-        return -0.125 * x * x;
+        return -1.0 / 8.0 * (x * x);
     }
     return 0.0;
 }
@@ -102,7 +104,7 @@ static double magic_kernel_2021(double x, void *ctx UNUSED) {
         x = -x;
     }
     if (x < 0.5) {
-        return 577.0 / 576.0 - 239.0 / 144.0 * x * x;
+        return 577.0 / 576.0 - 239.0 / 144.0 * (x * x);
     }
     if (x < 1.5) {
         return 35.0 / 36.0 * (x - 1.0) * (x - 239.0 / 140.0);
@@ -111,11 +113,11 @@ static double magic_kernel_2021(double x, void *ctx UNUSED) {
         return 1.0 / 6.0 * (x - 2.0) * (65.0 / 24.0 - x);
     }
     if (x < 3.5) {
-        return 1.0 / 36.0 * (x - 3.0) * (x - 3.75);
+        return 1.0 / 36.0 * (x - 3.0) * (x - 15.0 / 4.0);
     }
     if (x < 4.5) {
         x -= 4.5;
-        return -1.0 / 288.0 * x * x;
+        return -1.0 / 288.0 * (x * x);
     }
     return 0.0;
 }
@@ -134,25 +136,22 @@ typedef struct {
     double b, c;
 } bicubic_ctx;
 
+// Based on: https://entropymine.com/imageworsener/bicubic/
 static double bicubic_kernel(double x, void *ctx) {
     bicubic_ctx *bc = (bicubic_ctx *)ctx;
     if (x < 0.0) {
         x = -x;
     }
     if (x < 1.0) {
-        return (
-            ((12.0 - 9.0 * bc->b - 6.0 * bc->c) * x +
-            (-18.0 + 12.0 * bc->b + 6.0 * bc->c)) * x * x +
-            (6.0 - 2.0 * bc->b)
-        ) / 6.0;
+        double u = (12.0 - 9.0 * bc->b - 6.0 * bc->c) * x;
+        u = (u + (-18.0 + 12.0 * bc->b + 6.0 * bc->c)) * (x * x);
+        return (u + (6.0 - 2.0 * bc->b)) / 6.0;
     }
     if (x < 2.0) {
-        return (
-            (((-bc->b - 6.0 * bc->c) * x +
-            (6.0 * bc->b + 30.0 * bc->c)) * x +
-            (-12.0 * bc->b - 48.0 * bc->c)) * x +
-            (8.0 * bc->b + 24.0 * bc->c)
-        ) / 6.0;
+        double u = (-bc->b - 6.0 * bc->c) * x;
+        u = (u + (6.0 * bc->b + 30.0 * bc->c)) * x;
+        u = (u + (-12.0 * bc->b - 48.0 * bc->c)) * x;
+        return (u + (8.0 * bc->b + 24.0 * bc->c)) / 6.0;
     }
     return 0.0;
 }
@@ -166,7 +165,7 @@ static inline double sinc_function(double x) {
         return 1.0;
     }
     x *= M_PI;
-    return sin(x) / (x);
+    return sin(x) / x;
 }
 
 static double lanczos_kernel(double x, void *ctx) {
@@ -185,11 +184,11 @@ static double spline16_kernel(double x, void *ctx UNUSED) {
         x = -x;
     }
     if (x < 1.0) {
-        return ((x - 1.8) * x - 0.2) * x + 1.0;
+        return ((x - 9.0 / 5.0) * x - 1.0 / 5.0) * x + 1.0;
     }
     if (x < 2.0) {
         x -= 1.0;
-        return ((-1.0 / 3.0 * x + 0.8) * x - 7.0 / 15.0) * x;
+        return ((-1.0 / 3.0 * x + 4.0 / 5.0) * x - 7.0 / 15.0) * x;
     }
     return 0.0;
 }
@@ -329,7 +328,9 @@ typedef struct {
     double beta, i0_beta;
 } kaiser_ctx;
 
-// https://www.advanpix.com/2015/11/11/rational-approximations-for-the-modified-bessel-function-of-the-first-kind-i0-computations-double-precision/
+// Based on: https://www.advanpix.com/2015/11/11/rational-approximations-for-the-modified-bessel-function-of-the-first-kind-i0-computations-double-precision/
+// Works correctly for x < 500.
+// For x >= 500 it is necessary to split exp(x), but since in this case x <= 32, this branch is not implemented.
 static inline double bessel_i0(double x) {
     // 2.38eps
     if (x < 7.75) {
@@ -411,8 +412,11 @@ static double gauss_kernel(double x, void *ctx) {
 }
 
 // exp2(log2(x) * y); 0.5 ulp
-// Inspired by: https://jrfonseca.blogspot.com/2008/09/fast-sse2-pow-tables-or-polynomials.html
-static __m256 crazy_pow(__m256 x, __m256d y) {
+// Based on: https://jrfonseca.blogspot.com/2008/09/fast-sse2-pow-tables-or-polynomials.html
+// All checks are removed because ffast-math is used.
+// x = 0 returns 0, which satisfies the use case.
+// x < 0 and y <= 0 contradict the conditions of the use case and are not processed.
+static __m256 ffast_pow(__m256 x, __m256d y) {
     __m256i i = _mm256_castps_si256(x);
     __m256i exp = _mm256_sub_epi32(_mm256_srli_epi32(_mm256_and_si256(i, _mm256_set1_epi32(0x7f800000)), 23), _mm256_set1_epi32(127));
     __m256 mant = _mm256_or_ps(_mm256_castsi256_ps(_mm256_and_si256(i, _mm256_set1_epi32(0x007fffff))), _mm256_set1_ps(1.0f));
@@ -478,7 +482,7 @@ static void to_linear(
                 __m256 pix = _mm256_load_ps(srcp + x);
                 __m256 pix_abs = _mm256_and_ps(pix, v_abs);
                 __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
-                __m256 branch_0 = crazy_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
+                __m256 branch_0 = ffast_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
                 __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
                 __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
                 _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
@@ -487,7 +491,7 @@ static void to_linear(
                 __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
                 __m256 pix_abs = _mm256_and_ps(pix, v_abs);
                 __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
-                __m256 branch_0 = crazy_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
+                __m256 branch_0 = ffast_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
                 __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
                 __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
                 _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
@@ -503,7 +507,7 @@ static void to_linear(
                 __m256 pix = _mm256_load_ps(srcp + x);
                 __m256 pix_abs = _mm256_and_ps(pix, v_abs);
                 __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
-                __m256 branch_0 = crazy_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
+                __m256 branch_0 = ffast_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
                 __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
                 __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
                 _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
@@ -512,7 +516,7 @@ static void to_linear(
                 __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
                 __m256 pix_abs = _mm256_and_ps(pix, v_abs);
                 __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
-                __m256 branch_0 = crazy_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
+                __m256 branch_0 = ffast_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
                 __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
                 __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
                 _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
@@ -548,7 +552,7 @@ static void from_linear(
                 __m256 pix = _mm256_load_ps(srcp + x);
                 __m256 pix_abs = _mm256_and_ps(pix, v_abs);
                 __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
-                __m256 branch_0 = _mm256_fmsub_ps(crazy_pow(pix_abs, v_gamma), v_corr_one, v_corr);
+                __m256 branch_0 = _mm256_fmsub_ps(ffast_pow(pix_abs, v_gamma), v_corr_one, v_corr);
                 __m256 branch_1 = _mm256_mul_ps(pix_abs, v_div);
                 __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
                 _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
@@ -557,7 +561,7 @@ static void from_linear(
                 __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
                 __m256 pix_abs = _mm256_and_ps(pix, v_abs);
                 __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
-                __m256 branch_0 = _mm256_fmsub_ps(crazy_pow(pix_abs, v_gamma), v_corr_one, v_corr);
+                __m256 branch_0 = _mm256_fmsub_ps(ffast_pow(pix_abs, v_gamma), v_corr_one, v_corr);
                 __m256 branch_1 = _mm256_mul_ps(pix_abs, v_div);
                 __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
                 _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
@@ -573,7 +577,7 @@ static void from_linear(
                 __m256 pix = _mm256_load_ps(srcp + x);
                 __m256 pix_abs = _mm256_and_ps(pix, v_abs);
                 __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
-                __m256 branch_0 = _mm256_fmsub_ps(crazy_pow(pix_abs, v_gamma), v_corr_one, v_corr);
+                __m256 branch_0 = _mm256_fmsub_ps(ffast_pow(pix_abs, v_gamma), v_corr_one, v_corr);
                 __m256 branch_1 = _mm256_mul_ps(pix_abs, v_div);
                 __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
                 _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
@@ -582,7 +586,7 @@ static void from_linear(
                 __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
                 __m256 pix_abs = _mm256_and_ps(pix, v_abs);
                 __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
-                __m256 branch_0 = _mm256_fmsub_ps(crazy_pow(pix_abs, v_gamma), v_corr_one, v_corr);
+                __m256 branch_0 = _mm256_fmsub_ps(ffast_pow(pix_abs, v_gamma), v_corr_one, v_corr);
                 __m256 branch_1 = _mm256_mul_ps(pix_abs, v_div);
                 __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
                 _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
