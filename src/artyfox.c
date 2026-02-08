@@ -2601,9 +2601,2044 @@ static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData UNUS
 }
 
 typedef struct {
+    double frame_mean, frame_min, frame_max;
+} frame_stats;
+
+typedef frame_stats (*mean_func)(const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride);
+
+typedef struct {
+    mean_func f;
+    char name[32];
+} mean_t;
+
+typedef struct {
+    VSNode *node;
+    mean_t mean;
+    int plane;
+    bool norm;
+} MeanData;
+
+#define VCLAMP_PS(v, min, max) _mm256_max_ps(_mm256_min_ps(v, max), min)
+
+static frame_stats get_arithmetic_mean_8(
+    const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride
+) {
+    const uint8_t *restrict ptr = srcp;
+    int tail = src_w % 32;
+    int mod32_w = src_w - tail;
+    
+    int8_t mask_arr[32] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    
+    __m256i vmin = _mm256_setzero_si256();
+    __m256i vmax = _mm256_set1_epi8(-1);
+    __m256i accl = _mm256_set1_epi8(-1);
+    __m256i acch = _mm256_setzero_si256();
+    __m256i acc = _mm256_setzero_si256();
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod32_w; x += 32) {
+            __m256i pix = _mm256_load_si256((__m256i *)(ptr + x));
+            accl = _mm256_min_epu8(accl, pix);
+            acch = _mm256_max_epu8(acch, pix);
+            acc = _mm256_add_epi64(_mm256_sad_epu8(pix, vmin), acc);
+        }
+        if (tail) {
+            __m256i pix = _mm256_and_si256(_mm256_load_si256((__m256i *)(ptr + x)), tail_mask);
+            accl = _mm256_min_epu8(accl, _mm256_blendv_epi8(vmax, pix, tail_mask));
+            acch = _mm256_max_epu8(acch, pix);
+            acc = _mm256_add_epi64(_mm256_sad_epu8(pix, vmin), acc);
+        }
+        ptr += stride;
+    }
+    
+    __m128i acc2 = _mm_add_epi64(_mm256_extracti128_si256(acc, 0), _mm256_extracti128_si256(acc, 1));
+    acc2 = _mm_add_epi64(acc2, _mm_unpackhi_epi64(acc2, acc2));
+    double a_mean = (double)_mm_cvtsi128_si64(acc2) / ((double)src_w * (double)src_h);
+    
+    accl = _mm256_cvtepu8_epi16(_mm_min_epu8(_mm256_extracti128_si256(accl, 0), _mm256_extracti128_si256(accl, 1)));
+    __m128i accl2 = _mm_min_epu16(_mm256_extracti128_si256(accl, 0), _mm256_extracti128_si256(accl, 1));
+    accl2 = _mm_cvtepu16_epi64(_mm_minpos_epu16(accl2));
+    
+    acch = _mm256_cvtepu8_epi16(_mm_max_epu8(_mm256_extracti128_si256(acch, 0), _mm256_extracti128_si256(acch, 1)));
+    __m128i acch2 = _mm_max_epu16(_mm256_extracti128_si256(acch, 0), _mm256_extracti128_si256(acch, 1));
+    __m128i xone = _mm_set1_epi16(-1);
+    acch2 = _mm_cvtepu16_epi64(_mm_xor_si128(_mm_minpos_epu16(_mm_xor_si128(acch2, xone)), xone));
+    
+    return (frame_stats){a_mean, _mm_cvtsi128_si64(accl2), _mm_cvtsi128_si64(acch2)};
+}
+
+static frame_stats get_arithmetic_mean_16(
+    const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride
+) {
+    const uint16_t *restrict ptr = srcp;
+    int tail = src_w % 16;
+    int mod16_w = src_w - tail;
+    
+    int16_t mask_arr[16] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    
+    __m256i vmax = _mm256_set1_epi16(-1);
+    __m256i accl = _mm256_set1_epi16(-1);
+    __m256i acch = _mm256_setzero_si256();
+    __m256i acc = _mm256_setzero_si256();
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod16_w; x += 16) {
+            __m256i pix = _mm256_load_si256((__m256i *)(ptr + x));
+            accl = _mm256_min_epu16(accl, pix);
+            acch = _mm256_max_epu16(acch, pix);
+            __m256i temp0 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 0));
+            temp0 = _mm256_add_epi32(temp0, _mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 1)));
+            __m256i temp1 = _mm256_cvtepi32_epi64(_mm256_extracti128_si256(temp0, 0));
+            temp1 = _mm256_add_epi64(temp1, _mm256_cvtepi32_epi64(_mm256_extracti128_si256(temp0, 1)));
+            acc = _mm256_add_epi64(temp1, acc);
+        }
+        if (tail) {
+            __m256i pix = _mm256_and_si256(_mm256_load_si256((__m256i *)(ptr + x)), tail_mask);
+            accl = _mm256_min_epu16(accl, _mm256_blendv_epi8(vmax, pix, tail_mask));
+            acch = _mm256_max_epu16(acch, pix);
+            __m256i temp0 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 0));
+            temp0 = _mm256_add_epi32(temp0, _mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 1)));
+            __m256i temp1 = _mm256_cvtepi32_epi64(_mm256_extracti128_si256(temp0, 0));
+            temp1 = _mm256_add_epi64(temp1, _mm256_cvtepi32_epi64(_mm256_extracti128_si256(temp0, 1)));
+            acc = _mm256_add_epi64(temp1, acc);
+        }
+        ptr += stride;
+    }
+    
+    __m128i acc2 = _mm_add_epi64(_mm256_extracti128_si256(acc, 0), _mm256_extracti128_si256(acc, 1));
+    acc2 = _mm_add_epi64(acc2, _mm_unpackhi_epi64(acc2, acc2));
+    double a_mean = (double)_mm_cvtsi128_si64(acc2) / ((double)src_w * (double)src_h);
+    
+    __m128i accl2 = _mm_min_epu16(_mm256_extracti128_si256(accl, 0), _mm256_extracti128_si256(accl, 1));
+    accl2 = _mm_cvtepu16_epi64(_mm_minpos_epu16(accl2));
+    
+    __m128i acch2 = _mm_max_epu16(_mm256_extracti128_si256(acch, 0), _mm256_extracti128_si256(acch, 1));
+    __m128i xone = _mm_set1_epi16(-1);
+    acch2 = _mm_cvtepu16_epi64(_mm_xor_si128(_mm_minpos_epu16(_mm_xor_si128(acch2, xone)), xone));
+    
+    return (frame_stats){a_mean, _mm_cvtsi128_si64(accl2), _mm_cvtsi128_si64(acch2)};
+}
+
+static frame_stats get_arithmetic_mean_32(
+    const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride
+) {
+    const float *restrict ptr = srcp;
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    
+    __m256 vmin = _mm256_setzero_ps();
+    __m256 vmax = _mm256_set1_ps(1.0f);
+    __m256 accl = _mm256_set1_ps(1.0f);
+    __m256 acch = _mm256_setzero_ps();
+    __m256d acc0 = _mm256_setzero_pd();
+    __m256d acc1 = _mm256_setzero_pd();
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m256 pix = VCLAMP_PS(_mm256_load_ps(ptr + x), vmin, vmax);
+            accl = _mm256_min_ps(accl, pix);
+            acch = _mm256_max_ps(acch, pix);
+            acc0 = _mm256_add_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), acc0);
+            acc1 = _mm256_add_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), acc1);
+        }
+        if (tail) {
+            __m256 pix = VCLAMP_PS(_mm256_maskload_ps(ptr + x, tail_mask), vmin, vmax);
+            accl = _mm256_min_ps(accl, _mm256_blendv_ps(vmax, pix, _mm256_castsi256_ps(tail_mask)));
+            acch = _mm256_max_ps(acch, pix);
+            acc0 = _mm256_add_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), acc0);
+            acc1 = _mm256_add_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), acc1);
+        }
+        ptr += stride;
+    }
+    
+    acc0 = _mm256_add_pd(acc0, acc1);
+    __m128d acc2 = _mm_add_pd(_mm256_extractf128_pd(acc0, 0), _mm256_extractf128_pd(acc0, 1));
+    acc2 = _mm_add_sd(acc2, _mm_unpackhi_pd(acc2, acc2));
+    double a_mean = _mm_cvtsd_f64(acc2) / ((double)src_w * (double)src_h);
+    
+    __m256d accl2 = _mm256_cvtps_pd(_mm_min_ps(_mm256_extractf128_ps(accl, 0), _mm256_extractf128_ps(accl, 1)));
+    __m128d accl3 = _mm_min_pd(_mm256_extractf128_pd(accl2, 0), _mm256_extractf128_pd(accl2, 1));
+    accl3 = _mm_min_sd(accl3, _mm_unpackhi_pd(accl3, accl3));
+    
+    __m256d acch2 = _mm256_cvtps_pd(_mm_max_ps(_mm256_extractf128_ps(acch, 0), _mm256_extractf128_ps(acch, 1)));
+    __m128d acch3 = _mm_max_pd(_mm256_extractf128_pd(acch2, 0), _mm256_extractf128_pd(acch2, 1));
+    acch3 = _mm_max_sd(acch3, _mm_unpackhi_pd(acch3, acch3));
+    
+    return (frame_stats){a_mean, _mm_cvtsd_f64(accl3), _mm_cvtsd_f64(acch3)};
+}
+
+// Based on: https://github.com/vectorclass/version2/blob/f4617df57e17efcd754f5bbe0ec87883e0ed9ce6/vectormath_exp.h#L947
+// All checks are removed because ffast-math is used.
+// x = 0 returns -709.0895657128241, which satisfies the use case.
+// x < 0 contradict the conditions of the use case and are not processed.
+static __m256d ffast_log(__m256d x) {
+    __m256d mask_mant = _mm256_castsi256_pd(_mm256_set1_epi64x(0x000fffffffffffff));
+    __m256d mask_bias = _mm256_castsi256_pd(_mm256_set1_epi64x(0x3fe0000000000000));
+    __m256d mant = _mm256_or_pd(_mm256_and_pd(x, mask_mant), mask_bias);
+    __m256d mask_exp = _mm256_set1_pd(4503599627370496.0);
+    __m256d bias = _mm256_set1_pd(1023.0);
+    __m256d exp = _mm256_or_pd(_mm256_castsi256_pd(_mm256_srli_epi64(_mm256_castpd_si256(x), 52)), mask_exp);
+    exp = _mm256_sub_pd(exp, _mm256_add_pd(mask_exp, bias));
+    __m256d mask_range = _mm256_cmp_pd(mant, _mm256_set1_pd(M_SQRT1_2), _CMP_GT_OQ);
+    __m256d one = _mm256_set1_pd(1.0);
+    mant = _mm256_sub_pd(_mm256_add_pd(_mm256_andnot_pd(mask_range, mant), mant), one);
+    exp = _mm256_add_pd(_mm256_and_pd(mask_range, one), exp);
+    __m256d p0 = _mm256_set1_pd(7.70838733755885391666e0);
+    __m256d p1 = _mm256_set1_pd(1.79368678507819816313e1);
+    __m256d p2 = _mm256_set1_pd(1.44989225341610930846e1);
+    __m256d p3 = _mm256_set1_pd(4.70579119878881725854e0);
+    __m256d p4 = _mm256_set1_pd(4.97494994976747001425e-1);
+    __m256d p5 = _mm256_set1_pd(1.01875663804580931796e-4);
+    __m256d mant2 = _mm256_mul_pd(mant, mant);
+    __m256d mant3 = _mm256_mul_pd(mant, mant2);
+    __m256d mant4 = _mm256_mul_pd(mant2, mant2);
+    __m256d p = _mm256_fmadd_pd(_mm256_fmadd_pd(p5, mant, p4), mant4, _mm256_fmadd_pd(p1, mant, p0));
+    p = _mm256_mul_pd(_mm256_fmadd_pd(_mm256_fmadd_pd(p3, mant, p2), mant2, p), mant3);
+    __m256d q0 = _mm256_set1_pd(2.31251620126765340583e1);
+    __m256d q1 = _mm256_set1_pd(7.11544750618563894466e1);
+    __m256d q2 = _mm256_set1_pd(8.29875266912776603211e1);
+    __m256d q3 = _mm256_set1_pd(4.52279145837532221105e1);
+    __m256d q4 = _mm256_set1_pd(1.12873587189167450590e1);
+    __m256d q = _mm256_fmadd_pd(_mm256_add_pd(q4, mant), mant4, _mm256_fmadd_pd(q1, mant, q0));
+    q = _mm256_fmadd_pd(_mm256_fmadd_pd(q3, mant, q2), mant2, q);
+    __m256d hi = _mm256_set1_pd(0.693359375);
+    __m256d lo = _mm256_set1_pd(-2.121944400546905827679e-4);
+    __m256d half = _mm256_set1_pd(0.5);
+    p = _mm256_add_pd(_mm256_fmadd_pd(exp, lo, _mm256_div_pd(p, q)), _mm256_fnmadd_pd(mant2, half, mant));
+    return _mm256_fmadd_pd(exp, hi, p);
+}
+
+static frame_stats get_geometric_mean_8(
+    const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride
+) {
+    const uint8_t *restrict ptr = srcp;
+    int tail = src_w % 32;
+    int mod32_w = src_w - tail;
+    
+    int8_t mask_arr[32] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    
+    __m256i vmax = _mm256_set1_epi8(-1);
+    __m256i accl = _mm256_set1_epi8(-1);
+    __m256i acch = _mm256_setzero_si256();
+    __m256i vone = _mm256_set1_epi8(1);
+    __m256d acc0 = _mm256_setzero_pd();
+    __m256d acc1 = _mm256_setzero_pd();
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod32_w; x += 32) {
+            __m256i pix = _mm256_load_si256((__m256i *)(ptr + x));
+            accl = _mm256_min_epu8(accl, pix);
+            acch = _mm256_max_epu8(acch, pix);
+            __m128i pix0 = _mm256_extracti128_si256(pix, 0);
+            __m128i pix1 = _mm256_extracti128_si256(pix, 1);
+            __m256i pix0_0 = _mm256_cvtepu8_epi32(pix0);
+            __m256i pix0_1 = _mm256_cvtepu8_epi32(_mm_shuffle_epi32(pix0, _MM_SHUFFLE(1, 0, 3, 2)));
+            __m256i pix1_0 = _mm256_cvtepu8_epi32(pix1);
+            __m256i pix1_1 = _mm256_cvtepu8_epi32(_mm_shuffle_epi32(pix1, _MM_SHUFFLE(1, 0, 3, 2)));
+            acc0 = _mm256_add_pd(ffast_log(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_0, 0))), acc0);
+            acc0 = _mm256_add_pd(ffast_log(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_0, 1))), acc0);
+            acc0 = _mm256_add_pd(ffast_log(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_1, 0))), acc0);
+            acc0 = _mm256_add_pd(ffast_log(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_1, 1))), acc0);
+            acc1 = _mm256_add_pd(ffast_log(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_0, 0))), acc1);
+            acc1 = _mm256_add_pd(ffast_log(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_0, 1))), acc1);
+            acc1 = _mm256_add_pd(ffast_log(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_1, 0))), acc1);
+            acc1 = _mm256_add_pd(ffast_log(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_1, 1))), acc1);
+        }
+        if (tail) {
+            __m256i pix = _mm256_and_si256(_mm256_load_si256((__m256i *)(ptr + x)), tail_mask);
+            accl = _mm256_min_epu8(accl, _mm256_blendv_epi8(vmax, pix, tail_mask));
+            acch = _mm256_max_epu8(acch, pix);
+            pix = _mm256_blendv_epi8(vone, pix, tail_mask);
+            __m128i pix0 = _mm256_extracti128_si256(pix, 0);
+            __m128i pix1 = _mm256_extracti128_si256(pix, 1);
+            __m256i pix0_0 = _mm256_cvtepu8_epi32(pix0);
+            __m256i pix0_1 = _mm256_cvtepu8_epi32(_mm_shuffle_epi32(pix0, _MM_SHUFFLE(1, 0, 3, 2)));
+            __m256i pix1_0 = _mm256_cvtepu8_epi32(pix1);
+            __m256i pix1_1 = _mm256_cvtepu8_epi32(_mm_shuffle_epi32(pix1, _MM_SHUFFLE(1, 0, 3, 2)));
+            acc0 = _mm256_add_pd(ffast_log(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_0, 0))), acc0);
+            acc0 = _mm256_add_pd(ffast_log(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_0, 1))), acc0);
+            acc0 = _mm256_add_pd(ffast_log(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_1, 0))), acc0);
+            acc0 = _mm256_add_pd(ffast_log(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_1, 1))), acc0);
+            acc1 = _mm256_add_pd(ffast_log(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_0, 0))), acc1);
+            acc1 = _mm256_add_pd(ffast_log(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_0, 1))), acc1);
+            acc1 = _mm256_add_pd(ffast_log(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_1, 0))), acc1);
+            acc1 = _mm256_add_pd(ffast_log(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_1, 1))), acc1);
+        }
+        ptr += stride;
+    }
+    
+    acc0 = _mm256_add_pd(acc0, acc1);
+    __m128d acc2 = _mm_add_pd(_mm256_extractf128_pd(acc0, 0), _mm256_extractf128_pd(acc0, 1));
+    acc2 = _mm_add_sd(acc2, _mm_unpackhi_pd(acc2, acc2));
+    double g_mean = exp(_mm_cvtsd_f64(acc2) / ((double)src_w * (double)src_h));
+    
+    accl = _mm256_cvtepu8_epi16(_mm_min_epu8(_mm256_extracti128_si256(accl, 0), _mm256_extracti128_si256(accl, 1)));
+    __m128i accl2 = _mm_min_epu16(_mm256_extracti128_si256(accl, 0), _mm256_extracti128_si256(accl, 1));
+    accl2 = _mm_cvtepu16_epi64(_mm_minpos_epu16(accl2));
+    
+    acch = _mm256_cvtepu8_epi16(_mm_max_epu8(_mm256_extracti128_si256(acch, 0), _mm256_extracti128_si256(acch, 1)));
+    __m128i acch2 = _mm_max_epu16(_mm256_extracti128_si256(acch, 0), _mm256_extracti128_si256(acch, 1));
+    __m128i xone = _mm_set1_epi16(-1);
+    acch2 = _mm_cvtepu16_epi64(_mm_xor_si128(_mm_minpos_epu16(_mm_xor_si128(acch2, xone)), xone));
+    
+    return (frame_stats){g_mean, _mm_cvtsi128_si64(accl2), _mm_cvtsi128_si64(acch2)};
+}
+
+static frame_stats get_geometric_mean_16(
+    const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride
+) {
+    const uint16_t *restrict ptr = srcp;
+    int tail = src_w % 16;
+    int mod16_w = src_w - tail;
+    
+    int16_t mask_arr[16] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    
+    __m256i vmax = _mm256_set1_epi16(-1);
+    __m256i accl = _mm256_set1_epi16(-1);
+    __m256i acch = _mm256_setzero_si256();
+    __m256i vone = _mm256_set1_epi16(1);
+    __m256d acc0 = _mm256_setzero_pd();
+    __m256d acc1 = _mm256_setzero_pd();
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod16_w; x += 16) {
+            __m256i pix = _mm256_load_si256((__m256i *)(ptr + x));
+            accl = _mm256_min_epu16(accl, pix);
+            acch = _mm256_max_epu16(acch, pix);
+            __m256i pix0 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 0));
+            __m256i pix1 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 1));
+            acc0 = _mm256_add_pd(ffast_log(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0, 0))), acc0);
+            acc0 = _mm256_add_pd(ffast_log(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0, 1))), acc0);
+            acc1 = _mm256_add_pd(ffast_log(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1, 0))), acc1);
+            acc1 = _mm256_add_pd(ffast_log(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1, 1))), acc1);
+        }
+        if (tail) {
+            __m256i pix = _mm256_and_si256(_mm256_load_si256((__m256i *)(ptr + x)), tail_mask);
+            accl = _mm256_min_epu16(accl, _mm256_blendv_epi8(vmax, pix, tail_mask));
+            acch = _mm256_max_epu16(acch, pix);
+            pix = _mm256_blendv_epi8(vone, pix, tail_mask);
+            __m256i pix0 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 0));
+            __m256i pix1 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 1));
+            acc0 = _mm256_add_pd(ffast_log(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0, 0))), acc0);
+            acc0 = _mm256_add_pd(ffast_log(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0, 1))), acc0);
+            acc1 = _mm256_add_pd(ffast_log(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1, 0))), acc1);
+            acc1 = _mm256_add_pd(ffast_log(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1, 1))), acc1);
+        }
+        ptr += stride;
+    }
+    
+    acc0 = _mm256_add_pd(acc0, acc1);
+    __m128d acc2 = _mm_add_pd(_mm256_extractf128_pd(acc0, 0), _mm256_extractf128_pd(acc0, 1));
+    acc2 = _mm_add_sd(acc2, _mm_unpackhi_pd(acc2, acc2));
+    double g_mean = exp(_mm_cvtsd_f64(acc2) / ((double)src_w * (double)src_h));
+    
+    __m128i accl2 = _mm_min_epu16(_mm256_extracti128_si256(accl, 0), _mm256_extracti128_si256(accl, 1));
+    accl2 = _mm_cvtepu16_epi64(_mm_minpos_epu16(accl2));
+    
+    __m128i acch2 = _mm_max_epu16(_mm256_extracti128_si256(acch, 0), _mm256_extracti128_si256(acch, 1));
+    __m128i xone = _mm_set1_epi16(-1);
+    acch2 = _mm_cvtepu16_epi64(_mm_xor_si128(_mm_minpos_epu16(_mm_xor_si128(acch2, xone)), xone));
+    
+    return (frame_stats){g_mean, _mm_cvtsi128_si64(accl2), _mm_cvtsi128_si64(acch2)};
+}
+
+static frame_stats get_geometric_mean_32(
+    const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride
+) {
+    const float *restrict ptr = srcp;
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    
+    __m256 vmin = _mm256_setzero_ps();
+    __m256 vmax = _mm256_set1_ps(1.0f);
+    __m256 accl = _mm256_set1_ps(1.0f);
+    __m256 acch = _mm256_setzero_ps();
+    __m256d acc0 = _mm256_setzero_pd();
+    __m256d acc1 = _mm256_setzero_pd();
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m256 pix = VCLAMP_PS(_mm256_load_ps(ptr + x), vmin, vmax);
+            accl = _mm256_min_ps(accl, pix);
+            acch = _mm256_max_ps(acch, pix);
+            acc0 = _mm256_add_pd(ffast_log(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0))), acc0);
+            acc1 = _mm256_add_pd(ffast_log(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1))), acc1);
+        }
+        if (tail) {
+            __m256 pix = VCLAMP_PS(_mm256_maskload_ps(ptr + x, tail_mask), vmin, vmax);
+            acch = _mm256_max_ps(acch, pix);
+            pix = _mm256_blendv_ps(vmax, pix, _mm256_castsi256_ps(tail_mask));
+            accl = _mm256_min_ps(accl, pix);
+            acc0 = _mm256_add_pd(ffast_log(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0))), acc0);
+            acc1 = _mm256_add_pd(ffast_log(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1))), acc1);
+        }
+        ptr += stride;
+    }
+    
+    acc0 = _mm256_add_pd(acc0, acc1);
+    __m128d acc2 = _mm_add_pd(_mm256_extractf128_pd(acc0, 0), _mm256_extractf128_pd(acc0, 1));
+    acc2 = _mm_add_sd(acc2, _mm_unpackhi_pd(acc2, acc2));
+    double g_mean = exp(_mm_cvtsd_f64(acc2) / ((double)src_w * (double)src_h));
+    
+    __m256d accl2 = _mm256_cvtps_pd(_mm_min_ps(_mm256_extractf128_ps(accl, 0), _mm256_extractf128_ps(accl, 1)));
+    __m128d accl3 = _mm_min_pd(_mm256_extractf128_pd(accl2, 0), _mm256_extractf128_pd(accl2, 1));
+    accl3 = _mm_min_sd(accl3, _mm_unpackhi_pd(accl3, accl3));
+    
+    __m256d acch2 = _mm256_cvtps_pd(_mm_max_ps(_mm256_extractf128_ps(acch, 0), _mm256_extractf128_ps(acch, 1)));
+    __m128d acch3 = _mm_max_pd(_mm256_extractf128_pd(acch2, 0), _mm256_extractf128_pd(acch2, 1));
+    acch3 = _mm_max_sd(acch3, _mm_unpackhi_pd(acch3, acch3));
+    
+    return (frame_stats){g_mean, _mm_cvtsd_f64(accl3), _mm_cvtsd_f64(acch3)};
+}
+
+// Complete elliptic integral of the first kind
+// Based on: "Fast computation of complete elliptic integrals and Jacobian elliptic functions" by Toshio Fukushima, 2009
+// 0.0 is used instead of inf and nan.
+static double ellipk(double x) {
+    if (x < 0.0) {
+        return ellipk(x / (x - 1.0)) / sqrt(1.0 - x);
+    }
+    if (x == 0.0) {
+        return M_PI_2;
+    }
+    if (x < 0.1) {
+        x -= 0.05;
+        double u = 0.081541118718303215;
+        u = u * x + 0.085842591595413900;
+        u = u * x + 0.091439629201749751;
+        u = u * x + 0.098853409871592910;
+        u = u * x + 0.108938811574293531;
+        u = u * x + 0.123200993312427711;
+        u = u * x + 0.144556057087555150;
+        u = u * x + 0.179481482914906162;
+        u = u * x + 0.245791514264103415;
+        u = u * x + 0.416000743991786912;
+        return u * x + 1.591003453790792180;
+    }
+    if (x < 0.2) {
+        x -= 0.15;
+        double u = 0.266363809892617521;
+        u = u * x + 0.248557682972264071;
+        u = u * x + 0.234180501294209925;
+        u = u * x + 0.223255831633057896;
+        u = u * x + 0.216029124605188282;
+        u = u * x + 0.213108771877348910;
+        u = u * x + 0.215774446729585976;
+        u = u * x + 0.226725623219684650;
+        u = u * x + 0.252208311773135699;
+        u = u * x + 0.309728410831499587;
+        u = u * x + 0.471190626148732291;
+        return u * x + 1.635256732264579992;
+    }
+    if (x < 0.3) {
+        x -= 0.25;
+        double u = 1.057652872753547036;
+        u = u * x + 0.871013847709812357;
+        u = u * x + 0.724263522282908870;
+        u = u * x + 0.609426039204995055;
+        u = u * x + 0.520518947651184205;
+        u = u * x + 0.453294381753999079;
+        u = u * x + 0.405235887085125919;
+        u = u * x + 0.376060715354583645;
+        u = u * x + 0.369642473420889090;
+        u = u * x + 0.401524438390690257;
+        u = u * x + 0.541731848613280329;
+        return u * x + 1.685750354812596043;
+    }
+    if (x < 0.4) {
+        x -= 0.35;
+        double u = 7.224080007363877411;
+        u = u * x + 5.115867135558865806;
+        u = u * x + 3.652109747319039160;
+        u = u * x + 2.632552548331654201;
+        u = u * x + 1.920387183402304829;
+        u = u * x + 1.422091460675497751;
+        u = u * x + 1.073857448247933265;
+        u = u * x + 0.832586590010977199;
+        u = u * x + 0.670295136265406100;
+        u = u * x + 0.571892705193787391;
+        u = u * x + 0.539842564164445538;
+        u = u * x + 0.634864275371935304;
+        return u * x + 1.744350597225613243;
+    }
+    if (x < 0.5) {
+        x -= 0.45;
+        double u = 90.27388602940998849;
+        u = u * x + 53.73749198700554656;
+        u = u * x + 32.20638657246426863;
+        u = u * x + 19.45851374822937738;
+        u = u * x + 11.87151259742530180;
+        u = u * x + 7.330071221881720772;
+        u = u * x + 4.594894405442878062;
+        u = u * x + 2.937509342531378755;
+        u = u * x + 1.928560693477410941;
+        u = u * x + 1.315180671703161215;
+        u = u * x + 0.951074653668427927;
+        u = u * x + 0.761928605321595831;
+        u = u * x + 0.763163245700557246;
+        return u * x + 1.813883936816982644;
+    }
+    if (x < 0.6) {
+        x -= 0.55;
+        double u = 2536.529755382764488;
+        u = u * x + 1228.420013075863451;
+        u = u * x + 598.3851815055010179;
+        u = u * x + 293.4786396308497026;
+        u = u * x + 145.1079577347069102;
+        u = u * x + 72.45292395127771801;
+        u = u * x + 36.61468615273698145;
+        u = u * x + 18.78714868327559562;
+        u = u * x + 9.832485716659979747;
+        u = u * x + 5.285800396121450889;
+        u = u * x + 2.952676812636875180;
+        u = u * x + 1.750239106986300540;
+        u = u * x + 1.151077589959015808;
+        u = u * x + 0.950521794618244435;
+        return u * x + 1.898924910271553526;
+    }
+    if (x < 0.7) {
+        x -= 0.65;
+        double u = 612757.2711915852774;
+        u = u * x + 228672.1890493117096;
+        u = u * x + 85713.07608195964685;
+        u = u * x + 32290.17809718320818;
+        u = u * x + 12235.76246813664335;
+        u = u * x + 4668.381716790389910;
+        u = u * x + 1795.716014500247129;
+        u = u * x + 697.5598008606326163;
+        u = u * x + 274.2779548232413480;
+        u = u * x + 109.5092054309498377;
+        u = u * x + 44.60392484291437063;
+        u = u * x + 18.66572130873555361;
+        u = u * x + 8.119944554932045802;
+        u = u * x + 3.751289640087587680;
+        u = u * x + 1.926234657076479729;
+        u = u * x + 1.248457231212347337;
+        return u * x + 2.007598398424376302;
+    }
+    if (x < 0.8) {
+        x -= 0.75;
+        double u = 7208915015.330103756;
+        u = u * x + 1901975729.538660119;
+        u = u * x + 503352186.6866284541;
+        u = u * x + 133669298.4612040871;
+        u = u * x + 35634927.44218076174;
+        u = u * x + 9541921.966748386322;
+        u = u * x + 2567994.048255284686;
+        u = u * x + 695184.5762413896145;
+        u = u * x + 189493.6591462156887;
+        u = u * x + 52076.66107599404803;
+        u = u * x + 14454.00184034344795;
+        u = u * x + 4060.990742193632092;
+        u = u * x + 1158.707930567827917;
+        u = u * x + 337.3268282632272897;
+        u = u * x + 100.9237039498695416;
+        u = u * x + 31.40331405468070290;
+        u = u * x + 10.38672468363797208;
+        u = u * x + 3.826751287465713147;
+        u = u * x + 1.791805641849463243;
+        return u * x + 2.156515647499643235;
+    }
+    if (x < 0.85) {
+        x -= 0.825;
+        double u = 7515687935.373774627;
+        u = u * x + 1408862325.028702687;
+        u = u * x + 265444188.6527127967;
+        u = u * x + 50307677.08502366879;
+        u = u * x + 9600515.416049214109;
+        u = u * x + 1847238.263723971684;
+        u = u * x + 358977.2665825309926;
+        u = u * x + 70621.44088156540229;
+        u = u * x + 14110.51991915180325;
+        u = u * x + 2877.024617809972641;
+        u = u * x + 602.9847637356491617;
+        u = u * x + 131.4869365523528456;
+        u = u * x + 30.50239715446672327;
+        u = u * x + 7.897935075731355823;
+        u = u * x + 2.616920150291232841;
+        return u * x + 2.318122621712510589;
+    }
+    if (x < 0.9) {
+        x -= 0.875;
+        double u = 37859743397240299.20;
+        u = u * x + 499488053713388.7989;
+        u = u * x + 66101242752484.95041;
+        u = u * x + 8777948323668.937971;
+        u = u * x + 1170222242422.439893;
+        u = u * x + 156699833947.7902014;
+        u = u * x + 21090077038.76684053;
+        u = u * x + 2855288351.100810619;
+        u = u * x + 389249886.9948708474;
+        u = u * x + 53503839.67558661151;
+        u = u * x + 7427974.817042038995;
+        u = u * x + 1043999.331089990839;
+        u = u * x + 149037.0451890932766;
+        u = u * x + 21713.24241957434256;
+        u = u * x + 3252.277058145123644;
+        u = u * x + 506.9818197040613935;
+        u = u * x + 84.12850842805887747;
+        u = u * x + 15.60739303554930496;
+        u = u * x + 3.727624244118099310;
+        return u * x + 2.473596173751343912;
+    }
+    if (x < 1.0) {
+        x = 1.0 - x;
+        double u = 17652604545791.0 / 4503599627370496.0;
+        u = u * x + 9569130097211.0 / 2251799813685248.0;
+        u = u * x + 40784671953.0 / 8796093022208.0;
+        u = u * x + 22417045555.0 / 4398046511104.0;
+        u = u * x + 776957575.0 / 137438953472.0;
+        u = u * x + 435506703.0 / 68719476736.0;
+        u = u * x + 483127.0 / 67108864.0;
+        u = u * x + 279025.0 / 33554432.0;
+        u = u * x + 10293.0 / 1048576.0;
+        u = u * x + 6257.0 / 524288.0;
+        u = u * x + 31.0 / 2048.0;
+        u = u * x + 21.0 / 1024.0;
+        u = u * x + 1.0 / 32.0;
+        u = u * x + 1.0 / 16.0;
+        return -log(u * x) * (ellipk(x) * M_1_PI);
+    }
+    // if (x == 1.0) {
+    //     return __builtin_inf();
+    // }
+    // return __builtin_nan("");
+    return 0.0;
+}
+
+static frame_stats get_arithmetic_geometric_mean_8(
+    const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride
+) {
+    frame_stats a = get_arithmetic_mean_8(srcp, src_w, src_h, stride);
+    frame_stats g = get_geometric_mean_8(srcp, src_w, src_h, stride);
+    double agp = a.frame_mean + g.frame_mean;
+    double agn = a.frame_mean - g.frame_mean;
+    double ag_mean = M_PI_4 * agp / ellipk((agn * agn) / (agp * agp));
+    return (frame_stats){ag_mean, a.frame_min, a.frame_max};
+}
+
+static frame_stats get_arithmetic_geometric_mean_16(
+    const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride
+) {
+    frame_stats a = get_arithmetic_mean_16(srcp, src_w, src_h, stride);
+    frame_stats g = get_geometric_mean_16(srcp, src_w, src_h, stride);
+    double agp = a.frame_mean + g.frame_mean;
+    double agn = a.frame_mean - g.frame_mean;
+    double ag_mean = M_PI_4 * agp / ellipk((agn * agn) / (agp * agp));
+    return (frame_stats){ag_mean, a.frame_min, a.frame_max};
+}
+
+static frame_stats get_arithmetic_geometric_mean_32(
+    const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride
+) {
+    frame_stats a = get_arithmetic_mean_32(srcp, src_w, src_h, stride);
+    frame_stats g = get_geometric_mean_32(srcp, src_w, src_h, stride);
+    double agp = a.frame_mean + g.frame_mean;
+    double agn = a.frame_mean - g.frame_mean;
+    double ag_mean = M_PI_4 * agp / ellipk((agn * agn) / (agp * agp));
+    return (frame_stats){ag_mean, a.frame_min, a.frame_max};
+}
+
+static inline __m256d ffast_rcp(__m256d x) {
+    __m256d temp = _mm256_div_pd(_mm256_set1_pd(1.0), _mm256_max_pd(x, _mm256_set1_pd(1e-24)));
+    return _mm256_andnot_pd(_mm256_cmp_pd(x, _mm256_setzero_pd(), _CMP_EQ_OQ), temp);
+}
+
+static frame_stats get_harmonic_mean_8(
+    const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride
+) {
+    const uint8_t *restrict ptr = srcp;
+    int tail = src_w % 32;
+    int mod32_w = src_w - tail;
+    
+    int8_t mask_arr[32] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    
+    __m256i vmax = _mm256_set1_epi8(-1);
+    __m256i accl = _mm256_set1_epi8(-1);
+    __m256i acch = _mm256_setzero_si256();
+    __m256i vlow = _mm256_set1_epi8(1);
+    __m256d acc0 = _mm256_setzero_pd();
+    __m256d acc1 = _mm256_setzero_pd();
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod32_w; x += 32) {
+            __m256i pix = _mm256_load_si256((__m256i *)(ptr + x));
+            accl = _mm256_min_epu8(accl, pix);
+            acch = _mm256_max_epu8(acch, pix);
+            pix = _mm256_max_epu8(pix, vlow);
+            __m128i pix0 = _mm256_extracti128_si256(pix, 0);
+            __m128i pix1 = _mm256_extracti128_si256(pix, 1);
+            __m256i pix0_0 = _mm256_cvtepu8_epi32(pix0);
+            __m256i pix0_1 = _mm256_cvtepu8_epi32(_mm_shuffle_epi32(pix0, _MM_SHUFFLE(1, 0, 3, 2)));
+            __m256i pix1_0 = _mm256_cvtepu8_epi32(pix1);
+            __m256i pix1_1 = _mm256_cvtepu8_epi32(_mm_shuffle_epi32(pix1, _MM_SHUFFLE(1, 0, 3, 2)));
+            acc0 = _mm256_add_pd(ffast_rcp(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_0, 0))), acc0);
+            acc0 = _mm256_add_pd(ffast_rcp(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_0, 1))), acc0);
+            acc0 = _mm256_add_pd(ffast_rcp(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_1, 0))), acc0);
+            acc0 = _mm256_add_pd(ffast_rcp(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_1, 1))), acc0);
+            acc1 = _mm256_add_pd(ffast_rcp(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_0, 0))), acc1);
+            acc1 = _mm256_add_pd(ffast_rcp(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_0, 1))), acc1);
+            acc1 = _mm256_add_pd(ffast_rcp(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_1, 0))), acc1);
+            acc1 = _mm256_add_pd(ffast_rcp(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_1, 1))), acc1);
+        }
+        if (tail) {
+            __m256i pix = _mm256_and_si256(_mm256_load_si256((__m256i *)(ptr + x)), tail_mask);
+            accl = _mm256_min_epu8(accl, _mm256_blendv_epi8(vmax, pix, tail_mask));
+            acch = _mm256_max_epu8(acch, pix);
+            pix = _mm256_and_si256(_mm256_max_epu8(pix, vlow), tail_mask);
+            __m128i pix0 = _mm256_extracti128_si256(pix, 0);
+            __m128i pix1 = _mm256_extracti128_si256(pix, 1);
+            __m256i pix0_0 = _mm256_cvtepu8_epi32(pix0);
+            __m256i pix0_1 = _mm256_cvtepu8_epi32(_mm_shuffle_epi32(pix0, _MM_SHUFFLE(1, 0, 3, 2)));
+            __m256i pix1_0 = _mm256_cvtepu8_epi32(pix1);
+            __m256i pix1_1 = _mm256_cvtepu8_epi32(_mm_shuffle_epi32(pix1, _MM_SHUFFLE(1, 0, 3, 2)));
+            acc0 = _mm256_add_pd(ffast_rcp(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_0, 0))), acc0);
+            acc0 = _mm256_add_pd(ffast_rcp(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_0, 1))), acc0);
+            acc0 = _mm256_add_pd(ffast_rcp(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_1, 0))), acc0);
+            acc0 = _mm256_add_pd(ffast_rcp(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_1, 1))), acc0);
+            acc1 = _mm256_add_pd(ffast_rcp(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_0, 0))), acc1);
+            acc1 = _mm256_add_pd(ffast_rcp(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_0, 1))), acc1);
+            acc1 = _mm256_add_pd(ffast_rcp(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_1, 0))), acc1);
+            acc1 = _mm256_add_pd(ffast_rcp(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_1, 1))), acc1);
+        }
+        ptr += stride;
+    }
+    
+    acc0 = _mm256_add_pd(acc0, acc1);
+    __m128d acc2 = _mm_add_pd(_mm256_extractf128_pd(acc0, 0), _mm256_extractf128_pd(acc0, 1));
+    acc2 = _mm_add_sd(acc2, _mm_unpackhi_pd(acc2, acc2));
+    double h_mean = ((double)src_w * (double)src_h) / _mm_cvtsd_f64(acc2);
+    
+    accl = _mm256_cvtepu8_epi16(_mm_min_epu8(_mm256_extracti128_si256(accl, 0), _mm256_extracti128_si256(accl, 1)));
+    __m128i accl2 = _mm_min_epu16(_mm256_extracti128_si256(accl, 0), _mm256_extracti128_si256(accl, 1));
+    accl2 = _mm_cvtepu16_epi64(_mm_minpos_epu16(accl2));
+    
+    acch = _mm256_cvtepu8_epi16(_mm_max_epu8(_mm256_extracti128_si256(acch, 0), _mm256_extracti128_si256(acch, 1)));
+    __m128i acch2 = _mm_max_epu16(_mm256_extracti128_si256(acch, 0), _mm256_extracti128_si256(acch, 1));
+    __m128i xone = _mm_set1_epi16(-1);
+    acch2 = _mm_cvtepu16_epi64(_mm_xor_si128(_mm_minpos_epu16(_mm_xor_si128(acch2, xone)), xone));
+    
+    return (frame_stats){h_mean, _mm_cvtsi128_si64(accl2), _mm_cvtsi128_si64(acch2)};
+}
+
+static frame_stats get_harmonic_mean_16(
+    const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride
+) {
+    const uint16_t *restrict ptr = srcp;
+    int tail = src_w % 16;
+    int mod16_w = src_w - tail;
+    
+    int16_t mask_arr[16] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    
+    __m256i vmax = _mm256_set1_epi16(-1);
+    __m256i accl = _mm256_set1_epi16(-1);
+    __m256i acch = _mm256_setzero_si256();
+    __m256i vlow = _mm256_set1_epi16(1);
+    __m256d acc0 = _mm256_setzero_pd();
+    __m256d acc1 = _mm256_setzero_pd();
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod16_w; x += 16) {
+            __m256i pix = _mm256_load_si256((__m256i *)(ptr + x));
+            accl = _mm256_min_epu16(accl, pix);
+            acch = _mm256_max_epu16(acch, pix);
+            pix = _mm256_max_epu16(pix, vlow);
+            __m256i pix0 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 0));
+            __m256i pix1 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 1));
+            acc0 = _mm256_add_pd(ffast_rcp(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0, 0))), acc0);
+            acc0 = _mm256_add_pd(ffast_rcp(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0, 1))), acc0);
+            acc1 = _mm256_add_pd(ffast_rcp(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1, 0))), acc1);
+            acc1 = _mm256_add_pd(ffast_rcp(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1, 1))), acc1);
+        }
+        if (tail) {
+            __m256i pix = _mm256_and_si256(_mm256_load_si256((__m256i *)(ptr + x)), tail_mask);
+            accl = _mm256_min_epu16(accl, _mm256_blendv_epi8(vmax, pix, tail_mask));
+            acch = _mm256_max_epu16(acch, pix);
+            pix = _mm256_and_si256(_mm256_max_epu16(pix, vlow), tail_mask);
+            __m256i pix0 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 0));
+            __m256i pix1 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 1));
+            acc0 = _mm256_add_pd(ffast_rcp(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0, 0))), acc0);
+            acc0 = _mm256_add_pd(ffast_rcp(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0, 1))), acc0);
+            acc1 = _mm256_add_pd(ffast_rcp(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1, 0))), acc1);
+            acc1 = _mm256_add_pd(ffast_rcp(_mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1, 1))), acc1);
+        }
+        ptr += stride;
+    }
+    
+    acc0 = _mm256_add_pd(acc0, acc1);
+    __m128d acc2 = _mm_add_pd(_mm256_extractf128_pd(acc0, 0), _mm256_extractf128_pd(acc0, 1));
+    acc2 = _mm_add_sd(acc2, _mm_unpackhi_pd(acc2, acc2));
+    double h_mean = ((double)src_w * (double)src_h) / _mm_cvtsd_f64(acc2);
+    
+    __m128i accl2 = _mm_min_epu16(_mm256_extracti128_si256(accl, 0), _mm256_extracti128_si256(accl, 1));
+    accl2 = _mm_cvtepu16_epi64(_mm_minpos_epu16(accl2));
+    
+    __m128i acch2 = _mm_max_epu16(_mm256_extracti128_si256(acch, 0), _mm256_extracti128_si256(acch, 1));
+    __m128i xone = _mm_set1_epi16(-1);
+    acch2 = _mm_cvtepu16_epi64(_mm_xor_si128(_mm_minpos_epu16(_mm_xor_si128(acch2, xone)), xone));
+    
+    return (frame_stats){h_mean, _mm_cvtsi128_si64(accl2), _mm_cvtsi128_si64(acch2)};
+}
+
+static frame_stats get_harmonic_mean_32(
+    const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride
+) {
+    const float *restrict ptr = srcp;
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    
+    __m256 vmin = _mm256_setzero_ps();
+    __m256 vmax = _mm256_set1_ps(1.0f);
+    __m256 accl = _mm256_set1_ps(1.0f);
+    __m256 acch = _mm256_setzero_ps();
+    __m256 vlow = _mm256_set1_ps(1e-16f);
+    __m256d acc0 = _mm256_setzero_pd();
+    __m256d acc1 = _mm256_setzero_pd();
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m256 pix = VCLAMP_PS(_mm256_load_ps(ptr + x), vmin, vmax);
+            accl = _mm256_min_ps(accl, pix);
+            acch = _mm256_max_ps(acch, pix);
+            pix = _mm256_max_ps(pix, vlow);
+            acc0 = _mm256_add_pd(ffast_rcp(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0))), acc0);
+            acc1 = _mm256_add_pd(ffast_rcp(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1))), acc1);
+        }
+        if (tail) {
+            __m256 pix = VCLAMP_PS(_mm256_maskload_ps(ptr + x, tail_mask), vmin, vmax);
+            accl = _mm256_min_ps(accl, _mm256_blendv_ps(vmax, pix, _mm256_castsi256_ps(tail_mask)));
+            acch = _mm256_max_ps(acch, pix);
+            pix = _mm256_and_ps(_mm256_max_ps(pix, vlow), _mm256_castsi256_ps(tail_mask));
+            acc0 = _mm256_add_pd(ffast_rcp(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0))), acc0);
+            acc1 = _mm256_add_pd(ffast_rcp(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1))), acc1);
+        }
+        ptr += stride;
+    }
+    
+    acc0 = _mm256_add_pd(acc0, acc1);
+    __m128d acc2 = _mm_add_pd(_mm256_extractf128_pd(acc0, 0), _mm256_extractf128_pd(acc0, 1));
+    acc2 = _mm_add_sd(acc2, _mm_unpackhi_pd(acc2, acc2));
+    double h_mean = ((double)src_w * (double)src_h) / _mm_cvtsd_f64(acc2);
+    
+    __m256d accl2 = _mm256_cvtps_pd(_mm_min_ps(_mm256_extractf128_ps(accl, 0), _mm256_extractf128_ps(accl, 1)));
+    __m128d accl3 = _mm_min_pd(_mm256_extractf128_pd(accl2, 0), _mm256_extractf128_pd(accl2, 1));
+    accl3 = _mm_min_sd(accl3, _mm_unpackhi_pd(accl3, accl3));
+    
+    __m256d acch2 = _mm256_cvtps_pd(_mm_max_ps(_mm256_extractf128_ps(acch, 0), _mm256_extractf128_ps(acch, 1)));
+    __m128d acch3 = _mm_max_pd(_mm256_extractf128_pd(acch2, 0), _mm256_extractf128_pd(acch2, 1));
+    acch3 = _mm_max_sd(acch3, _mm_unpackhi_pd(acch3, acch3));
+    
+    return (frame_stats){h_mean, _mm_cvtsd_f64(accl3), _mm_cvtsd_f64(acch3)};
+}
+
+static frame_stats get_contraharmonic_mean_8(
+    const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride
+) {
+    const uint8_t *restrict ptr = srcp;
+    frame_stats a = get_arithmetic_mean_8(srcp, src_w, src_h, stride);
+    int tail = src_w % 32;
+    int mod32_w = src_w - tail;
+    
+    int8_t mask_arr[32] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    
+    __m256d acc0 = _mm256_setzero_pd();
+    __m256d acc1 = _mm256_setzero_pd();
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod32_w; x += 32) {
+            __m256i pix = _mm256_load_si256((__m256i *)(ptr + x));
+            __m128i pix0 = _mm256_extracti128_si256(pix, 0);
+            __m128i pix1 = _mm256_extracti128_si256(pix, 1);
+            __m256i pix0_0 = _mm256_cvtepu8_epi32(pix0);
+            __m256i pix0_1 = _mm256_cvtepu8_epi32(_mm_shuffle_epi32(pix0, _MM_SHUFFLE(1, 0, 3, 2)));
+            __m256i pix1_0 = _mm256_cvtepu8_epi32(pix1);
+            __m256i pix1_1 = _mm256_cvtepu8_epi32(_mm_shuffle_epi32(pix1, _MM_SHUFFLE(1, 0, 3, 2)));
+            __m256d temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_0, 0));
+            acc0 = _mm256_fmadd_pd(temp, temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_0, 1));
+            acc0 = _mm256_fmadd_pd(temp, temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_1, 0));
+            acc0 = _mm256_fmadd_pd(temp, temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_1, 1));
+            acc0 = _mm256_fmadd_pd(temp, temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_0, 0));
+            acc1 = _mm256_fmadd_pd(temp, temp, acc1);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_0, 1));
+            acc1 = _mm256_fmadd_pd(temp, temp, acc1);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_1, 0));
+            acc1 = _mm256_fmadd_pd(temp, temp, acc1);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_1, 1));
+            acc1 = _mm256_fmadd_pd(temp, temp, acc1);
+        }
+        if (tail) {
+            __m256i pix = _mm256_and_si256(_mm256_load_si256((__m256i *)(ptr + x)), tail_mask);
+            __m128i pix0 = _mm256_extracti128_si256(pix, 0);
+            __m128i pix1 = _mm256_extracti128_si256(pix, 1);
+            __m256i pix0_0 = _mm256_cvtepu8_epi32(pix0);
+            __m256i pix0_1 = _mm256_cvtepu8_epi32(_mm_shuffle_epi32(pix0, _MM_SHUFFLE(1, 0, 3, 2)));
+            __m256i pix1_0 = _mm256_cvtepu8_epi32(pix1);
+            __m256i pix1_1 = _mm256_cvtepu8_epi32(_mm_shuffle_epi32(pix1, _MM_SHUFFLE(1, 0, 3, 2)));
+            __m256d temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_0, 0));
+            acc0 = _mm256_fmadd_pd(temp, temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_0, 1));
+            acc0 = _mm256_fmadd_pd(temp, temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_1, 0));
+            acc0 = _mm256_fmadd_pd(temp, temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_1, 1));
+            acc0 = _mm256_fmadd_pd(temp, temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_0, 0));
+            acc1 = _mm256_fmadd_pd(temp, temp, acc1);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_0, 1));
+            acc1 = _mm256_fmadd_pd(temp, temp, acc1);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_1, 0));
+            acc1 = _mm256_fmadd_pd(temp, temp, acc1);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_1, 1));
+            acc1 = _mm256_fmadd_pd(temp, temp, acc1);
+        }
+        ptr += stride;
+    }
+    
+    acc0 = _mm256_add_pd(acc0, acc1);
+    __m128d acc2 = _mm_add_pd(_mm256_extractf128_pd(acc0, 0), _mm256_extractf128_pd(acc0, 1));
+    acc2 = _mm_add_sd(acc2, _mm_unpackhi_pd(acc2, acc2));
+    double ch_mean = _mm_cvtsd_f64(acc2) / ((double)src_w * (double)src_h) / a.frame_mean;
+    
+    return (frame_stats){ch_mean, a.frame_min, a.frame_max};
+}
+
+static frame_stats get_contraharmonic_mean_16(
+    const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride
+) {
+    const uint16_t *restrict ptr = srcp;
+    frame_stats a = get_arithmetic_mean_16(srcp, src_w, src_h, stride);
+    int tail = src_w % 16;
+    int mod16_w = src_w - tail;
+    
+    int16_t mask_arr[16] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    
+    __m256d acc0 = _mm256_setzero_pd();
+    __m256d acc1 = _mm256_setzero_pd();
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod16_w; x += 16) {
+            __m256i pix = _mm256_load_si256((__m256i *)(ptr + x));
+            __m256i pix0 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 0));
+            __m256i pix1 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 1));
+            __m256d temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0, 0));
+            acc0 = _mm256_fmadd_pd(temp, temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0, 1));
+            acc0 = _mm256_fmadd_pd(temp, temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1, 0));
+            acc1 = _mm256_fmadd_pd(temp, temp, acc1);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1, 1));
+            acc1 = _mm256_fmadd_pd(temp, temp, acc1);
+        }
+        if (tail) {
+            __m256i pix = _mm256_and_si256(_mm256_load_si256((__m256i *)(ptr + x)), tail_mask);
+            __m256i pix0 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 0));
+            __m256i pix1 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 1));
+            __m256d temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0, 0));
+            acc0 = _mm256_fmadd_pd(temp, temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0, 1));
+            acc0 = _mm256_fmadd_pd(temp, temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1, 0));
+            acc1 = _mm256_fmadd_pd(temp, temp, acc1);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1, 1));
+            acc1 = _mm256_fmadd_pd(temp, temp, acc1);
+        }
+        ptr += stride;
+    }
+    
+    acc0 = _mm256_add_pd(acc0, acc1);
+    __m128d acc2 = _mm_add_pd(_mm256_extractf128_pd(acc0, 0), _mm256_extractf128_pd(acc0, 1));
+    acc2 = _mm_add_sd(acc2, _mm_unpackhi_pd(acc2, acc2));
+    double ch_mean = _mm_cvtsd_f64(acc2) / ((double)src_w * (double)src_h) / a.frame_mean;
+    
+    return (frame_stats){ch_mean, a.frame_min, a.frame_max};
+}
+
+static frame_stats get_contraharmonic_mean_32(
+    const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride
+) {
+    const float *restrict ptr = srcp;
+    frame_stats a = get_arithmetic_mean_32(srcp, src_w, src_h, stride);
+    
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    
+    __m256 vmin = _mm256_setzero_ps();
+    __m256 vmax = _mm256_set1_ps(1.0f);
+    __m256d acc0 = _mm256_setzero_pd();
+    __m256d acc1 = _mm256_setzero_pd();
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m256 pix = VCLAMP_PS(_mm256_load_ps(ptr + x), vmin, vmax);
+            __m256d temp0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0));
+            __m256d temp1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1));
+            acc0 = _mm256_fmadd_pd(temp0, temp0, acc0);
+            acc1 = _mm256_fmadd_pd(temp1, temp1, acc1);
+        }
+        if (tail) {
+            __m256 pix = VCLAMP_PS(_mm256_maskload_ps(ptr + x, tail_mask), vmin, vmax);
+            __m256d temp0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0));
+            __m256d temp1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1));
+            acc0 = _mm256_fmadd_pd(temp0, temp0, acc0);
+            acc1 = _mm256_fmadd_pd(temp1, temp1, acc1);
+        }
+        ptr += stride;
+    }
+    
+    acc0 = _mm256_add_pd(acc0, acc1);
+    __m128d acc2 = _mm_add_pd(_mm256_extractf128_pd(acc0, 0), _mm256_extractf128_pd(acc0, 1));
+    acc2 = _mm_add_sd(acc2, _mm_unpackhi_pd(acc2, acc2));
+    double ch_mean = _mm_cvtsd_f64(acc2) / ((double)src_w * (double)src_h) / a.frame_mean;
+    
+    return (frame_stats){ch_mean, a.frame_min, a.frame_max};
+}
+
+static frame_stats get_root_mean_square_8(
+    const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride
+) {
+    const uint8_t *restrict ptr = srcp;
+    int tail = src_w % 32;
+    int mod32_w = src_w - tail;
+    
+    int8_t mask_arr[32] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    
+    __m256i vmax = _mm256_set1_epi8(-1);
+    __m256i accl = _mm256_set1_epi8(-1);
+    __m256i acch = _mm256_setzero_si256();
+    __m256d acc0 = _mm256_setzero_pd();
+    __m256d acc1 = _mm256_setzero_pd();
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod32_w; x += 32) {
+            __m256i pix = _mm256_load_si256((__m256i *)(ptr + x));
+            accl = _mm256_min_epu8(accl, pix);
+            acch = _mm256_max_epu8(acch, pix);
+            __m128i pix0 = _mm256_extracti128_si256(pix, 0);
+            __m128i pix1 = _mm256_extracti128_si256(pix, 1);
+            __m256i pix0_0 = _mm256_cvtepu8_epi32(pix0);
+            __m256i pix0_1 = _mm256_cvtepu8_epi32(_mm_shuffle_epi32(pix0, _MM_SHUFFLE(1, 0, 3, 2)));
+            __m256i pix1_0 = _mm256_cvtepu8_epi32(pix1);
+            __m256i pix1_1 = _mm256_cvtepu8_epi32(_mm_shuffle_epi32(pix1, _MM_SHUFFLE(1, 0, 3, 2)));
+            __m256d temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_0, 0));
+            acc0 = _mm256_fmadd_pd(temp, temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_0, 1));
+            acc0 = _mm256_fmadd_pd(temp, temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_1, 0));
+            acc0 = _mm256_fmadd_pd(temp, temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_1, 1));
+            acc0 = _mm256_fmadd_pd(temp, temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_0, 0));
+            acc1 = _mm256_fmadd_pd(temp, temp, acc1);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_0, 1));
+            acc1 = _mm256_fmadd_pd(temp, temp, acc1);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_1, 0));
+            acc1 = _mm256_fmadd_pd(temp, temp, acc1);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_1, 1));
+            acc1 = _mm256_fmadd_pd(temp, temp, acc1);
+        }
+        if (tail) {
+            __m256i pix = _mm256_and_si256(_mm256_load_si256((__m256i *)(ptr + x)), tail_mask);
+            accl = _mm256_min_epu8(accl, _mm256_blendv_epi8(vmax, pix, tail_mask));
+            acch = _mm256_max_epu8(acch, pix);
+            __m128i pix0 = _mm256_extracti128_si256(pix, 0);
+            __m128i pix1 = _mm256_extracti128_si256(pix, 1);
+            __m256i pix0_0 = _mm256_cvtepu8_epi32(pix0);
+            __m256i pix0_1 = _mm256_cvtepu8_epi32(_mm_shuffle_epi32(pix0, _MM_SHUFFLE(1, 0, 3, 2)));
+            __m256i pix1_0 = _mm256_cvtepu8_epi32(pix1);
+            __m256i pix1_1 = _mm256_cvtepu8_epi32(_mm_shuffle_epi32(pix1, _MM_SHUFFLE(1, 0, 3, 2)));
+            __m256d temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_0, 0));
+            acc0 = _mm256_fmadd_pd(temp, temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_0, 1));
+            acc0 = _mm256_fmadd_pd(temp, temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_1, 0));
+            acc0 = _mm256_fmadd_pd(temp, temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_1, 1));
+            acc0 = _mm256_fmadd_pd(temp, temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_0, 0));
+            acc1 = _mm256_fmadd_pd(temp, temp, acc1);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_0, 1));
+            acc1 = _mm256_fmadd_pd(temp, temp, acc1);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_1, 0));
+            acc1 = _mm256_fmadd_pd(temp, temp, acc1);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_1, 1));
+            acc1 = _mm256_fmadd_pd(temp, temp, acc1);
+        }
+        ptr += stride;
+    }
+    
+    acc0 = _mm256_add_pd(acc0, acc1);
+    __m128d acc2 = _mm_add_pd(_mm256_extractf128_pd(acc0, 0), _mm256_extractf128_pd(acc0, 1));
+    acc2 = _mm_add_sd(acc2, _mm_unpackhi_pd(acc2, acc2));
+    double rs_mean = sqrt(_mm_cvtsd_f64(acc2) / ((double)src_w * (double)src_h));
+    
+    accl = _mm256_cvtepu8_epi16(_mm_min_epu8(_mm256_extracti128_si256(accl, 0), _mm256_extracti128_si256(accl, 1)));
+    __m128i accl2 = _mm_min_epu16(_mm256_extracti128_si256(accl, 0), _mm256_extracti128_si256(accl, 1));
+    accl2 = _mm_cvtepu16_epi64(_mm_minpos_epu16(accl2));
+    
+    acch = _mm256_cvtepu8_epi16(_mm_max_epu8(_mm256_extracti128_si256(acch, 0), _mm256_extracti128_si256(acch, 1)));
+    __m128i acch2 = _mm_max_epu16(_mm256_extracti128_si256(acch, 0), _mm256_extracti128_si256(acch, 1));
+    __m128i xone = _mm_set1_epi16(-1);
+    acch2 = _mm_cvtepu16_epi64(_mm_xor_si128(_mm_minpos_epu16(_mm_xor_si128(acch2, xone)), xone));
+    
+    return (frame_stats){rs_mean, _mm_cvtsi128_si64(accl2), _mm_cvtsi128_si64(acch2)};
+}
+
+static frame_stats get_root_mean_square_16(
+    const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride
+) {
+    const uint16_t *restrict ptr = srcp;
+    int tail = src_w % 16;
+    int mod16_w = src_w - tail;
+    
+    int16_t mask_arr[16] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    
+    __m256i vmax = _mm256_set1_epi16(-1);
+    __m256i accl = _mm256_set1_epi16(-1);
+    __m256i acch = _mm256_setzero_si256();
+    __m256d acc0 = _mm256_setzero_pd();
+    __m256d acc1 = _mm256_setzero_pd();
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod16_w; x += 16) {
+            __m256i pix = _mm256_load_si256((__m256i *)(ptr + x));
+            accl = _mm256_min_epu16(accl, pix);
+            acch = _mm256_max_epu16(acch, pix);
+            __m256i pix0 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 0));
+            __m256i pix1 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 1));
+            __m256d temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0, 0));
+            acc0 = _mm256_fmadd_pd(temp, temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0, 1));
+            acc0 = _mm256_fmadd_pd(temp, temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1, 0));
+            acc1 = _mm256_fmadd_pd(temp, temp, acc1);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1, 1));
+            acc1 = _mm256_fmadd_pd(temp, temp, acc1);
+        }
+        if (tail) {
+            __m256i pix = _mm256_and_si256(_mm256_load_si256((__m256i *)(ptr + x)), tail_mask);
+            accl = _mm256_min_epu16(accl, _mm256_blendv_epi8(vmax, pix, tail_mask));
+            acch = _mm256_max_epu16(acch, pix);
+            __m256i pix0 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 0));
+            __m256i pix1 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 1));
+            __m256d temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0, 0));
+            acc0 = _mm256_fmadd_pd(temp, temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0, 1));
+            acc0 = _mm256_fmadd_pd(temp, temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1, 0));
+            acc1 = _mm256_fmadd_pd(temp, temp, acc1);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1, 1));
+            acc1 = _mm256_fmadd_pd(temp, temp, acc1);
+        }
+        ptr += stride;
+    }
+    
+    acc0 = _mm256_add_pd(acc0, acc1);
+    __m128d acc2 = _mm_add_pd(_mm256_extractf128_pd(acc0, 0), _mm256_extractf128_pd(acc0, 1));
+    acc2 = _mm_add_sd(acc2, _mm_unpackhi_pd(acc2, acc2));
+    double rs_mean = sqrt(_mm_cvtsd_f64(acc2) / ((double)src_w * (double)src_h));
+    
+    __m128i accl2 = _mm_min_epu16(_mm256_extracti128_si256(accl, 0), _mm256_extracti128_si256(accl, 1));
+    accl2 = _mm_cvtepu16_epi64(_mm_minpos_epu16(accl2));
+    
+    __m128i acch2 = _mm_max_epu16(_mm256_extracti128_si256(acch, 0), _mm256_extracti128_si256(acch, 1));
+    __m128i xone = _mm_set1_epi16(-1);
+    acch2 = _mm_cvtepu16_epi64(_mm_xor_si128(_mm_minpos_epu16(_mm_xor_si128(acch2, xone)), xone));
+    
+    return (frame_stats){rs_mean, _mm_cvtsi128_si64(accl2), _mm_cvtsi128_si64(acch2)};
+}
+
+static frame_stats get_root_mean_square_32(
+    const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride
+) {
+    const float *restrict ptr = srcp;
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    
+    __m256 vmin = _mm256_setzero_ps();
+    __m256 vmax = _mm256_set1_ps(1.0f);
+    __m256 accl = _mm256_set1_ps(1.0f);
+    __m256 acch = _mm256_setzero_ps();
+    __m256d acc0 = _mm256_setzero_pd();
+    __m256d acc1 = _mm256_setzero_pd();
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m256 pix = VCLAMP_PS(_mm256_load_ps(ptr + x), vmin, vmax);
+            accl = _mm256_min_ps(accl, pix);
+            acch = _mm256_max_ps(acch, pix);
+            __m256d temp0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0));
+            __m256d temp1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1));
+            acc0 = _mm256_fmadd_pd(temp0, temp0, acc0);
+            acc1 = _mm256_fmadd_pd(temp1, temp1, acc1);
+        }
+        if (tail) {
+            __m256 pix = VCLAMP_PS(_mm256_maskload_ps(ptr + x, tail_mask), vmin, vmax);
+            accl = _mm256_min_ps(accl, _mm256_blendv_ps(vmax, pix, _mm256_castsi256_ps(tail_mask)));
+            acch = _mm256_max_ps(acch, pix);
+            __m256d temp0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0));
+            __m256d temp1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1));
+            acc0 = _mm256_fmadd_pd(temp0, temp0, acc0);
+            acc1 = _mm256_fmadd_pd(temp1, temp1, acc1);
+        }
+        ptr += stride;
+    }
+    
+    acc0 = _mm256_add_pd(acc0, acc1);
+    __m128d acc2 = _mm_add_pd(_mm256_extractf128_pd(acc0, 0), _mm256_extractf128_pd(acc0, 1));
+    acc2 = _mm_add_sd(acc2, _mm_unpackhi_pd(acc2, acc2));
+    double rs_mean = sqrt(_mm_cvtsd_f64(acc2) / ((double)src_w * (double)src_h));
+    
+    __m256d accl2 = _mm256_cvtps_pd(_mm_min_ps(_mm256_extractf128_ps(accl, 0), _mm256_extractf128_ps(accl, 1)));
+    __m128d accl3 = _mm_min_pd(_mm256_extractf128_pd(accl2, 0), _mm256_extractf128_pd(accl2, 1));
+    accl3 = _mm_min_sd(accl3, _mm_unpackhi_pd(accl3, accl3));
+    
+    __m256d acch2 = _mm256_cvtps_pd(_mm_max_ps(_mm256_extractf128_ps(acch, 0), _mm256_extractf128_ps(acch, 1)));
+    __m128d acch3 = _mm_max_pd(_mm256_extractf128_pd(acch2, 0), _mm256_extractf128_pd(acch2, 1));
+    acch3 = _mm_max_sd(acch3, _mm_unpackhi_pd(acch3, acch3));
+    
+    return (frame_stats){rs_mean, _mm_cvtsd_f64(accl3), _mm_cvtsd_f64(acch3)};
+}
+
+static frame_stats get_root_mean_cube_8(
+    const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride
+) {
+    const uint8_t *restrict ptr = srcp;
+    int tail = src_w % 32;
+    int mod32_w = src_w - tail;
+    
+    int8_t mask_arr[32] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    
+    __m256i vmax = _mm256_set1_epi8(-1);
+    __m256i accl = _mm256_set1_epi8(-1);
+    __m256i acch = _mm256_setzero_si256();
+    __m256d acc0 = _mm256_setzero_pd();
+    __m256d acc1 = _mm256_setzero_pd();
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod32_w; x += 32) {
+            __m256i pix = _mm256_load_si256((__m256i *)(ptr + x));
+            accl = _mm256_min_epu8(accl, pix);
+            acch = _mm256_max_epu8(acch, pix);
+            __m128i pix0 = _mm256_extracti128_si256(pix, 0);
+            __m128i pix1 = _mm256_extracti128_si256(pix, 1);
+            __m256i pix0_0 = _mm256_cvtepu8_epi32(pix0);
+            __m256i pix0_1 = _mm256_cvtepu8_epi32(_mm_shuffle_epi32(pix0, _MM_SHUFFLE(1, 0, 3, 2)));
+            __m256i pix1_0 = _mm256_cvtepu8_epi32(pix1);
+            __m256i pix1_1 = _mm256_cvtepu8_epi32(_mm_shuffle_epi32(pix1, _MM_SHUFFLE(1, 0, 3, 2)));
+            __m256d temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_0, 0));
+            acc0 = _mm256_fmadd_pd(_mm256_mul_pd(temp, temp), temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_0, 1));
+            acc0 = _mm256_fmadd_pd(_mm256_mul_pd(temp, temp), temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_1, 0));
+            acc0 = _mm256_fmadd_pd(_mm256_mul_pd(temp, temp), temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_1, 1));
+            acc0 = _mm256_fmadd_pd(_mm256_mul_pd(temp, temp), temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_0, 0));
+            acc1 = _mm256_fmadd_pd(_mm256_mul_pd(temp, temp), temp, acc1);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_0, 1));
+            acc1 = _mm256_fmadd_pd(_mm256_mul_pd(temp, temp), temp, acc1);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_1, 0));
+            acc1 = _mm256_fmadd_pd(_mm256_mul_pd(temp, temp), temp, acc1);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_1, 1));
+            acc1 = _mm256_fmadd_pd(_mm256_mul_pd(temp, temp), temp, acc1);
+        }
+        if (tail) {
+            __m256i pix = _mm256_and_si256(_mm256_load_si256((__m256i *)(ptr + x)), tail_mask);
+            accl = _mm256_min_epu8(accl, _mm256_blendv_epi8(vmax, pix, tail_mask));
+            acch = _mm256_max_epu8(acch, pix);
+            __m128i pix0 = _mm256_extracti128_si256(pix, 0);
+            __m128i pix1 = _mm256_extracti128_si256(pix, 1);
+            __m256i pix0_0 = _mm256_cvtepu8_epi32(pix0);
+            __m256i pix0_1 = _mm256_cvtepu8_epi32(_mm_shuffle_epi32(pix0, _MM_SHUFFLE(1, 0, 3, 2)));
+            __m256i pix1_0 = _mm256_cvtepu8_epi32(pix1);
+            __m256i pix1_1 = _mm256_cvtepu8_epi32(_mm_shuffle_epi32(pix1, _MM_SHUFFLE(1, 0, 3, 2)));
+            __m256d temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_0, 0));
+            acc0 = _mm256_fmadd_pd(_mm256_mul_pd(temp, temp), temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_0, 1));
+            acc0 = _mm256_fmadd_pd(_mm256_mul_pd(temp, temp), temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_1, 0));
+            acc0 = _mm256_fmadd_pd(_mm256_mul_pd(temp, temp), temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0_1, 1));
+            acc0 = _mm256_fmadd_pd(_mm256_mul_pd(temp, temp), temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_0, 0));
+            acc1 = _mm256_fmadd_pd(_mm256_mul_pd(temp, temp), temp, acc1);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_0, 1));
+            acc1 = _mm256_fmadd_pd(_mm256_mul_pd(temp, temp), temp, acc1);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_1, 0));
+            acc1 = _mm256_fmadd_pd(_mm256_mul_pd(temp, temp), temp, acc1);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1_1, 1));
+            acc1 = _mm256_fmadd_pd(_mm256_mul_pd(temp, temp), temp, acc1);
+        }
+        ptr += stride;
+    }
+    
+    acc0 = _mm256_add_pd(acc0, acc1);
+    __m128d acc2 = _mm_add_pd(_mm256_extractf128_pd(acc0, 0), _mm256_extractf128_pd(acc0, 1));
+    acc2 = _mm_add_sd(acc2, _mm_unpackhi_pd(acc2, acc2));
+    double rc_mean = cbrt(_mm_cvtsd_f64(acc2) / ((double)src_w * (double)src_h));
+    
+    accl = _mm256_cvtepu8_epi16(_mm_min_epu8(_mm256_extracti128_si256(accl, 0), _mm256_extracti128_si256(accl, 1)));
+    __m128i accl2 = _mm_min_epu16(_mm256_extracti128_si256(accl, 0), _mm256_extracti128_si256(accl, 1));
+    accl2 = _mm_cvtepu16_epi64(_mm_minpos_epu16(accl2));
+    
+    acch = _mm256_cvtepu8_epi16(_mm_max_epu8(_mm256_extracti128_si256(acch, 0), _mm256_extracti128_si256(acch, 1)));
+    __m128i acch2 = _mm_max_epu16(_mm256_extracti128_si256(acch, 0), _mm256_extracti128_si256(acch, 1));
+    __m128i xone = _mm_set1_epi16(-1);
+    acch2 = _mm_cvtepu16_epi64(_mm_xor_si128(_mm_minpos_epu16(_mm_xor_si128(acch2, xone)), xone));
+    
+    return (frame_stats){rc_mean, _mm_cvtsi128_si64(accl2), _mm_cvtsi128_si64(acch2)};
+}
+
+static frame_stats get_root_mean_cube_16(
+    const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride
+) {
+    const uint16_t *restrict ptr = srcp;
+    int tail = src_w % 16;
+    int mod16_w = src_w - tail;
+    
+    int16_t mask_arr[16] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    
+    __m256i vmax = _mm256_set1_epi16(-1);
+    __m256i accl = _mm256_set1_epi16(-1);
+    __m256i acch = _mm256_setzero_si256();
+    __m256d acc0 = _mm256_setzero_pd();
+    __m256d acc1 = _mm256_setzero_pd();
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod16_w; x += 16) {
+            __m256i pix = _mm256_load_si256((__m256i *)(ptr + x));
+            accl = _mm256_min_epu16(accl, pix);
+            acch = _mm256_max_epu16(acch, pix);
+            __m256i pix0 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 0));
+            __m256i pix1 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 1));
+            __m256d temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0, 0));
+            acc0 = _mm256_fmadd_pd(_mm256_mul_pd(temp, temp), temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0, 1));
+            acc0 = _mm256_fmadd_pd(_mm256_mul_pd(temp, temp), temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1, 0));
+            acc1 = _mm256_fmadd_pd(_mm256_mul_pd(temp, temp), temp, acc1);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1, 1));
+            acc1 = _mm256_fmadd_pd(_mm256_mul_pd(temp, temp), temp, acc1);
+        }
+        if (tail) {
+            __m256i pix = _mm256_and_si256(_mm256_load_si256((__m256i *)(ptr + x)), tail_mask);
+            accl = _mm256_min_epu16(accl, _mm256_blendv_epi8(vmax, pix, tail_mask));
+            acch = _mm256_max_epu16(acch, pix);
+            __m256i pix0 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 0));
+            __m256i pix1 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix, 1));
+            __m256d temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0, 0));
+            acc0 = _mm256_fmadd_pd(_mm256_mul_pd(temp, temp), temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix0, 1));
+            acc0 = _mm256_fmadd_pd(_mm256_mul_pd(temp, temp), temp, acc0);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1, 0));
+            acc1 = _mm256_fmadd_pd(_mm256_mul_pd(temp, temp), temp, acc1);
+            temp = _mm256_cvtepi32_pd(_mm256_extracti128_si256(pix1, 1));
+            acc1 = _mm256_fmadd_pd(_mm256_mul_pd(temp, temp), temp, acc1);
+        }
+        ptr += stride;
+    }
+    
+    acc0 = _mm256_add_pd(acc0, acc1);
+    __m128d acc2 = _mm_add_pd(_mm256_extractf128_pd(acc0, 0), _mm256_extractf128_pd(acc0, 1));
+    acc2 = _mm_add_sd(acc2, _mm_unpackhi_pd(acc2, acc2));
+    double rc_mean = cbrt(_mm_cvtsd_f64(acc2) / ((double)src_w * (double)src_h));
+    
+    __m128i accl2 = _mm_min_epu16(_mm256_extracti128_si256(accl, 0), _mm256_extracti128_si256(accl, 1));
+    accl2 = _mm_cvtepu16_epi64(_mm_minpos_epu16(accl2));
+    
+    __m128i acch2 = _mm_max_epu16(_mm256_extracti128_si256(acch, 0), _mm256_extracti128_si256(acch, 1));
+    __m128i xone = _mm_set1_epi16(-1);
+    acch2 = _mm_cvtepu16_epi64(_mm_xor_si128(_mm_minpos_epu16(_mm_xor_si128(acch2, xone)), xone));
+    
+    return (frame_stats){rc_mean, _mm_cvtsi128_si64(accl2), _mm_cvtsi128_si64(acch2)};
+}
+
+static frame_stats get_root_mean_cube_32(
+    const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride
+) {
+    const float *restrict ptr = srcp;
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    
+    __m256 vmin = _mm256_setzero_ps();
+    __m256 vmax = _mm256_set1_ps(1.0f);
+    __m256 accl = _mm256_set1_ps(1.0f);
+    __m256 acch = _mm256_setzero_ps();
+    __m256d acc0 = _mm256_setzero_pd();
+    __m256d acc1 = _mm256_setzero_pd();
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m256 pix = VCLAMP_PS(_mm256_load_ps(ptr + x), vmin, vmax);
+            accl = _mm256_min_ps(accl, pix);
+            acch = _mm256_max_ps(acch, pix);
+            __m256d temp0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0));
+            __m256d temp1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1));
+            acc0 = _mm256_fmadd_pd(_mm256_mul_pd(temp0, temp0), temp0, acc0);
+            acc1 = _mm256_fmadd_pd(_mm256_mul_pd(temp1, temp1), temp1, acc1);
+        }
+        if (tail) {
+            __m256 pix = VCLAMP_PS(_mm256_maskload_ps(ptr + x, tail_mask), vmin, vmax);
+            accl = _mm256_min_ps(accl, _mm256_blendv_ps(vmax, pix, _mm256_castsi256_ps(tail_mask)));
+            acch = _mm256_max_ps(acch, pix);
+            __m256d temp0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0));
+            __m256d temp1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1));
+            acc0 = _mm256_fmadd_pd(_mm256_mul_pd(temp0, temp0), temp0, acc0);
+            acc1 = _mm256_fmadd_pd(_mm256_mul_pd(temp1, temp1), temp1, acc1);
+        }
+        ptr += stride;
+    }
+    
+    acc0 = _mm256_add_pd(acc0, acc1);
+    __m128d acc2 = _mm_add_pd(_mm256_extractf128_pd(acc0, 0), _mm256_extractf128_pd(acc0, 1));
+    acc2 = _mm_add_sd(acc2, _mm_unpackhi_pd(acc2, acc2));
+    double rc_mean = cbrt(_mm_cvtsd_f64(acc2) / ((double)src_w * (double)src_h));
+    
+    __m256d accl2 = _mm256_cvtps_pd(_mm_min_ps(_mm256_extractf128_ps(accl, 0), _mm256_extractf128_ps(accl, 1)));
+    __m128d accl3 = _mm_min_pd(_mm256_extractf128_pd(accl2, 0), _mm256_extractf128_pd(accl2, 1));
+    accl3 = _mm_min_sd(accl3, _mm_unpackhi_pd(accl3, accl3));
+    
+    __m256d acch2 = _mm256_cvtps_pd(_mm_max_ps(_mm256_extractf128_ps(acch, 0), _mm256_extractf128_ps(acch, 1)));
+    __m128d acch3 = _mm_max_pd(_mm256_extractf128_pd(acch2, 0), _mm256_extractf128_pd(acch2, 1));
+    acch3 = _mm_max_sd(acch3, _mm_unpackhi_pd(acch3, acch3));
+    
+    return (frame_stats){rc_mean, _mm_cvtsd_f64(accl3), _mm_cvtsd_f64(acch3)};
+}
+
+// Based on: https://habr.com/ru/articles/771010/
+static frame_stats get_median_8(
+    const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride
+) {
+    uint8_t accl = 0xff, acch = 0;
+    uint64_t *hist = (uint64_t *)calloc(256, sizeof(uint64_t));
+    const uint8_t *restrict ptr = srcp;
+    
+    for (int y = 0; y < src_h; y++) {
+        for (int x = 0; x < src_w; x++) {
+            uint8_t idx = ptr[x];
+            if (idx < accl) accl = idx;
+            if (idx > acch) acch = idx;
+            hist[idx]++;
+        }
+        ptr += stride;
+    }
+    
+    double median = 0.0;
+    uint64_t size = (uint64_t)src_w * (uint64_t)src_h, median_pos = (size + 1) / 2, count = 0;
+    uint32_t median_val = 0;
+    
+    for (uint32_t i = 0; i < 256; i++) {
+        count += hist[i];
+        if (count >= median_pos) {
+            median_val = i;
+            break;
+        }
+    }
+    
+    if (!(size & 1) && count == median_pos) {
+        uint32_t median_next = median_val;
+        while (!hist[++median_next]);
+        median = (double)(median_val + median_next) / 2.0;
+    }
+    else {
+        median = (double)median_val;
+    }
+    
+    free(hist);
+    return (frame_stats){median, accl, acch};
+}
+
+static frame_stats get_median_16(
+    const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride
+) {
+    uint16_t accl = 0xffff, acch = 0;
+    uint64_t *hist = (uint64_t *)calloc(65536, sizeof(uint64_t));
+    const uint16_t *restrict ptr = srcp;
+    
+    for (int y = 0; y < src_h; y++) {
+        for (int x = 0; x < src_w; x++) {
+            uint16_t idx = ptr[x];
+            if (idx < accl) accl = idx;
+            if (idx > acch) acch = idx;
+            hist[idx]++;
+        }
+        ptr += stride;
+    }
+    
+    double median = 0.0;
+    uint64_t size = (uint64_t)src_w * (uint64_t)src_h, median_pos = (size + 1) / 2, count = 0;
+    uint32_t median_val = 0;
+    
+    for (uint32_t i = 0; i < 65536; i++) {
+        count += hist[i];
+        if (count >= median_pos) {
+            median_val = i;
+            break;
+        }
+    }
+    
+    if (!(size & 1) && count == median_pos) {
+        uint32_t median_next = median_val;
+        while (!hist[++median_next]);
+        median = (double)(median_val + median_next) / 2.0;
+    }
+    else {
+        median = (double)median_val;
+    }
+    
+    free(hist);
+    return (frame_stats){median, accl, acch};
+}
+
+static float castuf32(uint32_t x) {
+    union {
+        uint32_t u;
+        float f;
+    } uf32;
+    uf32.u = x;
+    return uf32.f;
+}
+
+static frame_stats get_median_32(
+    const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride
+) {
+    uint32_t accl = 0x3f800000, acch = 0;
+    uint64_t *hist = (uint64_t *)calloc(65536, sizeof(uint64_t));
+    const uint32_t *restrict ptr = srcp;
+    
+    for (int y = 0; y < src_h; y++) {
+        for (int x = 0; x < src_w; x++) {
+            uint32_t idx = ptr[x];
+            if (idx & 0x80000000) idx = 0;
+            if (idx > 0x3f800000) idx = 0x3f800000;
+            if (idx < accl) accl = idx;
+            if (idx > acch) acch = idx;
+            hist[(idx & 0xffff0000) >> 16]++;
+        }
+        ptr += stride;
+    }
+    
+    ptr = srcp;
+    double median = 0.0;
+    uint64_t size = (uint64_t)src_w * (uint64_t)src_h, median_pos = (size + 1) / 2, count = 0;
+    uint32_t median_high = 0;
+    
+    for (uint32_t i = 0; i < 65536; i++) {
+        count += hist[i];
+        if (count >= median_pos) {
+            median_high = i;
+            break;
+        }
+    }
+    
+    if (!(size & 1) && count == median_pos) {
+        uint32_t median_next = median_high, median_min = 65535, median_max = 0;
+        while (!hist[++median_next]);
+        median_high <<= 16;
+        median_next <<= 16;
+        
+        for (int y = 0; y < src_h; y++) {
+            for (int x = 0; x < src_w; x++) {
+                uint32_t idx = ptr[x];
+                if (idx & 0x80000000) idx = 0;
+                if (idx > 0x3f800000) idx = 0x3f800000;
+                uint32_t idx_high = idx & 0xffff0000, idx_low = idx & 0x0000ffff;
+                if (median_high == idx_high && median_max < idx_low) median_max = idx_low;
+                if (median_next == idx_high && median_min > idx_low) median_min = idx_low;
+            }
+            ptr += stride;
+        }
+        
+        median = ((double)castuf32(median_high | median_max) + (double)castuf32(median_next | median_min)) / 2.0;
+    }
+    else {
+        memset(hist, 0, sizeof(uint64_t) * 65536);
+        median_high <<= 16;
+        count = 0;
+        
+        for (int y = 0; y < src_h; y++) {
+            for (int x = 0; x < src_w; x++) {
+                uint32_t idx = ptr[x];
+                if (idx & 0x80000000) idx = 0;
+                if (idx > 0x3f800000) idx = 0x3f800000;
+                uint32_t idx_high = idx & 0xffff0000, idx_low = idx & 0x0000ffff;
+                if (median_high == idx_high) hist[idx_low]++;
+                if (median_high > idx) count++;
+            }
+            ptr += stride;
+        }
+        
+        uint32_t median_low = 0;
+        
+        for (uint32_t i = 0; i < 65536; i++) {
+            count += hist[i];
+            if (count >= median_pos) {
+                median_low = i;
+                break;
+            }
+        }
+        
+        if (!(size & 1) && count == median_pos) {
+            uint32_t median_next = median_low;
+            while (!hist[++median_next]);
+            median = ((double)castuf32(median_high | median_low) + (double)castuf32(median_high | median_next)) / 2.0;
+        }
+        else {
+            median = (double)castuf32(median_high | median_low);
+        }
+    }
+    
+    free(hist);
+    return (frame_stats){median, castuf32(accl), castuf32(acch)};
+}
+
+static frame_stats get_linear_interp_msad_8(
+    const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride
+) {
+    const uint8_t *restrict ptr = srcp;
+    int tail = src_w % 32;
+    int mod32_w = src_w - tail;
+    
+    int8_t mask_arr[32] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    __m256i sub_mask0 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(tail_mask, 0));
+    __m256i sub_mask1 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(tail_mask, 1));
+    
+    __m256i vmax = _mm256_set1_epi16(-1);
+    __m256i accl = _mm256_set1_epi16(-1);
+    __m256i acch = _mm256_setzero_si256();
+    __m256i acc = _mm256_setzero_si256();
+    
+    for (int y = 0; y < src_h - 2; y++) {
+        int x = 0;
+        for (; x < mod32_w; x += 32) {
+            __m256i pix0 = _mm256_load_si256((__m256i *)(ptr + stride * 0 + x));
+            __m256i pix1 = _mm256_load_si256((__m256i *)(ptr + stride * 1 + x));
+            __m256i pix2 = _mm256_load_si256((__m256i *)(ptr + stride * 2 + x));
+            __m256i temp = _mm256_avg_epu8(pix0, pix2);
+            __m256i temp0 = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(temp, 0));
+            __m256i temp1 = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(temp, 1));
+            temp0 = _mm256_abs_epi16(_mm256_sub_epi16(temp0, _mm256_cvtepu8_epi16(_mm256_extracti128_si256(pix1, 0))));
+            temp1 = _mm256_abs_epi16(_mm256_sub_epi16(temp1, _mm256_cvtepu8_epi16(_mm256_extracti128_si256(pix1, 1))));
+            accl = _mm256_min_epu16(temp0, accl);
+            accl = _mm256_min_epu16(temp1, accl);
+            acch = _mm256_max_epu16(temp0, acch);
+            acch = _mm256_max_epu16(temp1, acch);
+            acc = _mm256_add_epi64(_mm256_sad_epu8(temp, pix1), acc);
+        }
+        if (tail) {
+            __m256i pix0 = _mm256_and_si256(_mm256_load_si256((__m256i *)(ptr + stride * 0 + x)), tail_mask);
+            __m256i pix1 = _mm256_and_si256(_mm256_load_si256((__m256i *)(ptr + stride * 1 + x)), tail_mask);
+            __m256i pix2 = _mm256_and_si256(_mm256_load_si256((__m256i *)(ptr + stride * 2 + x)), tail_mask);
+            __m256i temp = _mm256_avg_epu8(pix0, pix2);
+            __m256i temp0 = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(temp, 0));
+            __m256i temp1 = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(temp, 1));
+            temp0 = _mm256_abs_epi16(_mm256_sub_epi16(temp0, _mm256_cvtepu8_epi16(_mm256_extracti128_si256(pix1, 0))));
+            temp1 = _mm256_abs_epi16(_mm256_sub_epi16(temp1, _mm256_cvtepu8_epi16(_mm256_extracti128_si256(pix1, 1))));
+            accl = _mm256_min_epu16(_mm256_blendv_epi8(vmax, temp0, sub_mask0), accl);
+            accl = _mm256_min_epu16(_mm256_blendv_epi8(vmax, temp1, sub_mask1), accl);
+            acch = _mm256_max_epu16(temp0, acch);
+            acch = _mm256_max_epu16(temp1, acch);
+            acc = _mm256_add_epi64(_mm256_sad_epu8(temp, pix1), acc);
+        }
+        ptr += stride;
+    }
+    
+    __m128i acc2 = _mm_add_epi64(_mm256_extracti128_si256(acc, 0), _mm256_extracti128_si256(acc, 1));
+    acc2 = _mm_add_epi64(acc2, _mm_unpackhi_epi64(acc2, acc2));
+    double li_msad = (double)_mm_cvtsi128_si64(acc2) / ((double)src_w * (double)(src_h - 2));
+    
+    __m128i accl2 = _mm_min_epu16(_mm256_extracti128_si256(accl, 0), _mm256_extracti128_si256(accl, 1));
+    accl2 = _mm_cvtepu16_epi64(_mm_minpos_epu16(accl2));
+    
+    __m128i acch2 = _mm_max_epu16(_mm256_extracti128_si256(acch, 0), _mm256_extracti128_si256(acch, 1));
+    __m128i xone = _mm_set1_epi16(-1);
+    acch2 = _mm_cvtepu16_epi64(_mm_xor_si128(_mm_minpos_epu16(_mm_xor_si128(acch2, xone)), xone));
+    
+    return (frame_stats){li_msad, _mm_cvtsi128_si64(accl2), _mm_cvtsi128_si64(acch2)};
+}
+
+static frame_stats get_linear_interp_msad_16(
+    const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride
+) {
+    const uint16_t *restrict ptr = srcp;
+    int tail = src_w % 16;
+    int mod16_w = src_w - tail;
+    
+    int16_t mask_arr[16] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    __m256i sub_mask0 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(tail_mask, 0));
+    __m256i sub_mask1 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(tail_mask, 1));
+    
+    __m256i vmax = _mm256_set1_epi32(-1);
+    __m256i accl = _mm256_set1_epi32(-1);
+    __m256i acch = _mm256_setzero_si256();
+    __m256i acc = _mm256_setzero_si256();
+    
+    for (int y = 0; y < src_h - 2; y++) {
+        int x = 0;
+        for (; x < mod16_w; x += 16) {
+            __m256i pix0 = _mm256_load_si256((__m256i *)(ptr + stride * 0 + x));
+            __m256i pix1 = _mm256_load_si256((__m256i *)(ptr + stride * 1 + x));
+            __m256i pix2 = _mm256_load_si256((__m256i *)(ptr + stride * 2 + x));
+            __m256i temp = _mm256_avg_epu16(pix0, pix2);
+            __m256i temp0 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(temp, 0));
+            __m256i temp1 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(temp, 1));
+            temp0 = _mm256_abs_epi32(_mm256_sub_epi32(temp0, _mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix1, 0))));
+            temp1 = _mm256_abs_epi32(_mm256_sub_epi32(temp1, _mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix1, 1))));
+            accl = _mm256_min_epu32(temp0, accl);
+            accl = _mm256_min_epu32(temp1, accl);
+            acch = _mm256_max_epu32(temp0, acch);
+            acch = _mm256_max_epu32(temp1, acch);
+            temp = _mm256_add_epi32(temp0, temp1);
+            temp0 = _mm256_cvtepu32_epi64(_mm256_extracti128_si256(temp, 0));
+            temp1 = _mm256_cvtepu32_epi64(_mm256_extracti128_si256(temp, 1));
+            acc = _mm256_add_epi64(_mm256_add_epi64(temp0, temp1), acc);
+        }
+        if (tail) {
+            __m256i pix0 = _mm256_and_si256(_mm256_load_si256((__m256i *)(ptr + stride * 0 + x)), tail_mask);
+            __m256i pix1 = _mm256_and_si256(_mm256_load_si256((__m256i *)(ptr + stride * 1 + x)), tail_mask);
+            __m256i pix2 = _mm256_and_si256(_mm256_load_si256((__m256i *)(ptr + stride * 2 + x)), tail_mask);
+            __m256i temp = _mm256_avg_epu16(pix0, pix2);
+            __m256i temp0 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(temp, 0));
+            __m256i temp1 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(temp, 1));
+            temp0 = _mm256_abs_epi32(_mm256_sub_epi32(temp0, _mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix1, 0))));
+            temp1 = _mm256_abs_epi32(_mm256_sub_epi32(temp1, _mm256_cvtepu16_epi32(_mm256_extracti128_si256(pix1, 1))));
+            accl = _mm256_min_epu32(_mm256_blendv_epi8(vmax, temp0, sub_mask0), accl);
+            accl = _mm256_min_epu32(_mm256_blendv_epi8(vmax, temp1, sub_mask1), accl);
+            acch = _mm256_max_epu32(temp0, acch);
+            acch = _mm256_max_epu32(temp1, acch);
+            temp = _mm256_add_epi32(temp0, temp1);
+            temp0 = _mm256_cvtepu32_epi64(_mm256_extracti128_si256(temp, 0));
+            temp1 = _mm256_cvtepu32_epi64(_mm256_extracti128_si256(temp, 1));
+            acc = _mm256_add_epi64(_mm256_add_epi64(temp0, temp1), acc);
+        }
+        ptr += stride;
+    }
+    
+    __m128i acc2 = _mm_add_epi64(_mm256_extracti128_si256(acc, 0), _mm256_extracti128_si256(acc, 1));
+    acc2 = _mm_add_epi64(acc2, _mm_unpackhi_epi64(acc2, acc2));
+    double li_msad = (double)_mm_cvtsi128_si64(acc2) / ((double)src_w * (double)(src_h - 2));
+    
+    __m128i accl2 = _mm_packus_epi32(_mm256_extracti128_si256(accl, 0), _mm256_extracti128_si256(accl, 1));
+    accl2 = _mm_cvtepu16_epi64(_mm_minpos_epu16(accl2));
+    
+    __m128i acch2 = _mm_packus_epi32(_mm256_extracti128_si256(acch, 0), _mm256_extracti128_si256(acch, 1));
+    __m128i xone = _mm_set1_epi16(-1);
+    acch2 = _mm_cvtepu16_epi64(_mm_xor_si128(_mm_minpos_epu16(_mm_xor_si128(acch2, xone)), xone));
+    
+    return (frame_stats){li_msad, _mm_cvtsi128_si64(accl2), _mm_cvtsi128_si64(acch2)};
+}
+
+static frame_stats get_linear_interp_msad_32(
+    const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride
+) {
+    const float *restrict ptr = srcp;
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    __m256d sub_mask0 = _mm256_castsi256_pd(_mm256_cvtepi32_epi64(_mm256_extracti128_si256(tail_mask, 0)));
+    __m256d sub_mask1 = _mm256_castsi256_pd(_mm256_cvtepi32_epi64(_mm256_extracti128_si256(tail_mask, 1)));
+    
+    __m256 vmin = _mm256_setzero_ps();
+    __m256 vmax = _mm256_set1_ps(1.0f);
+    __m256d vone = _mm256_set1_pd(1.0);
+    __m256d accl = _mm256_set1_pd(1.0);
+    __m256d acch = _mm256_setzero_pd();
+    __m256d acc0 = _mm256_setzero_pd();
+    __m256d acc1 = _mm256_setzero_pd();
+    __m256d vmul = _mm256_set1_pd(0.5);
+    __m256d vabs = _mm256_castsi256_pd(_mm256_set1_epi64x(0x7fffffffffffffff));
+    
+    for (int y = 0; y < src_h - 2; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m256 pix0 = VCLAMP_PS(_mm256_load_ps(ptr + stride * 0 + x), vmin, vmax);
+            __m256 pix1 = VCLAMP_PS(_mm256_load_ps(ptr + stride * 1 + x), vmin, vmax);
+            __m256 pix2 = VCLAMP_PS(_mm256_load_ps(ptr + stride * 2 + x), vmin, vmax);
+            __m256d temp0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 0));
+            __m256d temp1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 1));
+            temp0 = _mm256_mul_pd(_mm256_add_pd(temp0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix2, 0))), vmul);
+            temp1 = _mm256_mul_pd(_mm256_add_pd(temp1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix2, 1))), vmul);
+            temp0 = _mm256_and_pd(_mm256_sub_pd(temp0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 0))), vabs);
+            temp1 = _mm256_and_pd(_mm256_sub_pd(temp1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 1))), vabs);
+            accl = _mm256_min_pd(temp0, accl);
+            accl = _mm256_min_pd(temp1, accl);
+            acch = _mm256_max_pd(temp0, acch);
+            acch = _mm256_max_pd(temp1, acch);
+            acc0 = _mm256_add_pd(temp0, acc0);
+            acc1 = _mm256_add_pd(temp1, acc1);
+        }
+        if (tail) {
+            __m256 pix0 = VCLAMP_PS(_mm256_maskload_ps(ptr + stride * 0 + x, tail_mask), vmin, vmax);
+            __m256 pix1 = VCLAMP_PS(_mm256_maskload_ps(ptr + stride * 1 + x, tail_mask), vmin, vmax);
+            __m256 pix2 = VCLAMP_PS(_mm256_maskload_ps(ptr + stride * 2 + x, tail_mask), vmin, vmax);
+            __m256d temp0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 0));
+            __m256d temp1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 1));
+            temp0 = _mm256_mul_pd(_mm256_add_pd(temp0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix2, 0))), vmul);
+            temp1 = _mm256_mul_pd(_mm256_add_pd(temp1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix2, 1))), vmul);
+            temp0 = _mm256_and_pd(_mm256_sub_pd(temp0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 0))), vabs);
+            temp1 = _mm256_and_pd(_mm256_sub_pd(temp1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 1))), vabs);
+            accl = _mm256_min_pd(_mm256_blendv_pd(vone, temp0, sub_mask0), accl);
+            accl = _mm256_min_pd(_mm256_blendv_pd(vone, temp1, sub_mask1), accl);
+            acch = _mm256_max_pd(temp0, acch);
+            acch = _mm256_max_pd(temp1, acch);
+            acc0 = _mm256_add_pd(temp0, acc0);
+            acc1 = _mm256_add_pd(temp1, acc1);
+        }
+        ptr += stride;
+    }
+    
+    acc0 = _mm256_add_pd(acc0, acc1);
+    __m128d acc2 = _mm_add_pd(_mm256_extractf128_pd(acc0, 0), _mm256_extractf128_pd(acc0, 1));
+    acc2 = _mm_add_sd(acc2, _mm_unpackhi_pd(acc2, acc2));
+    double li_msad = _mm_cvtsd_f64(acc2) / ((double)src_w * (double)(src_h - 2));
+    
+    __m128d accl3 = _mm_min_pd(_mm256_extractf128_pd(accl, 0), _mm256_extractf128_pd(accl, 1));
+    accl3 = _mm_min_sd(accl3, _mm_unpackhi_pd(accl3, accl3));
+    
+    __m128d acch3 = _mm_max_pd(_mm256_extractf128_pd(acch, 0), _mm256_extractf128_pd(acch, 1));
+    acch3 = _mm_max_sd(acch3, _mm_unpackhi_pd(acch3, acch3));
+    
+    return (frame_stats){li_msad, _mm_cvtsd_f64(accl3), _mm_cvtsd_f64(acch3)};
+}
+
+static const VSFrame *VS_CC MeanGetFrame(
+    int n, int activationReason, void *instanceData, void **frameData UNUSED,
+    VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi
+) {
+    MeanData *d = (MeanData *)instanceData;
+    
+    if (activationReason == arInitial) {
+        vsapi->requestFrameFilter(n, d->node, frameCtx);
+    }
+    else if (activationReason == arAllFramesReady) {
+        const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
+        const VSVideoFormat *fi = vsapi->getVideoFrameFormat(src);
+        VSFrame *dst = vsapi->copyFrame(src, core);
+        
+        const void *restrict srcp = vsapi->getReadPtr(src, d->plane);
+        ptrdiff_t src_stride = vsapi->getStride(src, d->plane) / fi->bytesPerSample;
+        int src_w = vsapi->getFrameWidth(src, d->plane);
+        int src_h = vsapi->getFrameHeight(src, d->plane);
+        
+        frame_stats mean = d->mean.f(srcp, src_w, src_h, src_stride);
+        if (d->norm && fi->sampleType == stInteger) {
+            mean.frame_mean /= (1 << fi->bitsPerSample) - 1;
+        }
+        
+        VSMap *props = vsapi->getFramePropertiesRW(dst);
+        vsapi->mapSetFloat(props, d->mean.name, mean.frame_mean, maReplace);
+        
+        if (fi->sampleType == stInteger) {
+            vsapi->mapSetInt(props, "minimum", mean.frame_min, maReplace);
+            vsapi->mapSetInt(props, "maximum", mean.frame_max, maReplace);
+        }
+        else {
+            vsapi->mapSetFloat(props, "minimum", mean.frame_min, maReplace);
+            vsapi->mapSetFloat(props, "maximum", mean.frame_max, maReplace);
+        }
+        
+        vsapi->freeFrame(src);
+        return dst;
+    }
+    return NULL;
+}
+
+static void VS_CC MeanFree(void *instanceData, VSCore *core UNUSED, const VSAPI *vsapi) {
+    MeanData *d = (MeanData *)instanceData;
+    vsapi->freeNode(d->node);
+    free(d);
+}
+
+static void VS_CC MeanCreate(
+    const VSMap *in, VSMap *out, void *userData UNUSED, VSCore *core, const VSAPI *vsapi
+) {
+    MeanData d;
+    d.node = vsapi->mapGetNode(in, "clip", 0, NULL);
+    VSVideoInfo vi = *vsapi->getVideoInfo(d.node);
+    
+    if (
+        !vsh_isConstantVideoFormat(&vi) ||
+        (vi.format.sampleType == stInteger && (vi.format.bitsPerSample < 8 || vi.format.bitsPerSample > 16)) ||
+        (vi.format.sampleType == stFloat && vi.format.bitsPerSample != 32)
+    ) {
+        vsapi->mapSetError(out, "Mean: only constant format 8-16bit integer or 32bit float input supported");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    int err;
+    const char *mode = vsapi->mapGetData(in, "mode", 0, &err);
+    if (err || !strcmp(mode, "am")) {
+        if (vi.format.bytesPerSample == 1) d.mean.f = get_arithmetic_mean_8;
+        else if (vi.format.bytesPerSample == 2) d.mean.f = get_arithmetic_mean_16;
+        else d.mean.f = get_arithmetic_mean_32;
+        strcpy(d.mean.name, "arithmetic_mean");
+    }
+    else if (!strcmp(mode, "gm")) {
+        if (vi.format.bytesPerSample == 1) d.mean.f = get_geometric_mean_8;
+        else if (vi.format.bytesPerSample == 2) d.mean.f = get_geometric_mean_16;
+        else d.mean.f = get_geometric_mean_32;
+        strcpy(d.mean.name, "geometric_mean");
+    }
+    else if (!strcmp(mode, "agm")) {
+        if (vi.format.bytesPerSample == 1) d.mean.f = get_arithmetic_geometric_mean_8;
+        else if (vi.format.bytesPerSample == 2) d.mean.f = get_arithmetic_geometric_mean_16;
+        else d.mean.f = get_arithmetic_geometric_mean_32;
+        strcpy(d.mean.name, "arithmetic_geometric_mean");
+    }
+    else if (!strcmp(mode, "hm")) {
+        if (vi.format.bytesPerSample == 1) d.mean.f = get_harmonic_mean_8;
+        else if (vi.format.bytesPerSample == 2) d.mean.f = get_harmonic_mean_16;
+        else d.mean.f = get_harmonic_mean_32;
+        strcpy(d.mean.name, "harmonic_mean");
+    }
+    else if (!strcmp(mode, "chm")) {
+        if (vi.format.bytesPerSample == 1) d.mean.f = get_contraharmonic_mean_8;
+        else if (vi.format.bytesPerSample == 2) d.mean.f = get_contraharmonic_mean_16;
+        else d.mean.f = get_contraharmonic_mean_32;
+        strcpy(d.mean.name, "contraharmonic_mean");
+    }
+    else if (!strcmp(mode, "rms")) {
+        if (vi.format.bytesPerSample == 1) d.mean.f = get_root_mean_square_8;
+        else if (vi.format.bytesPerSample == 2) d.mean.f = get_root_mean_square_16;
+        else d.mean.f = get_root_mean_square_32;
+        strcpy(d.mean.name, "root_mean_square");
+    }
+    else if (!strcmp(mode, "rmc")) {
+        if (vi.format.bytesPerSample == 1) d.mean.f = get_root_mean_cube_8;
+        else if (vi.format.bytesPerSample == 2) d.mean.f = get_root_mean_cube_16;
+        else d.mean.f = get_root_mean_cube_32;
+        strcpy(d.mean.name, "root_mean_cube");
+    }
+    else if (!strcmp(mode, "median")) {
+        if (vi.format.bytesPerSample == 1) d.mean.f = get_median_8;
+        else if (vi.format.bytesPerSample == 2) d.mean.f = get_median_16;
+        else d.mean.f = get_median_32;
+        strcpy(d.mean.name, "median");
+    }
+    else if (!strcmp(mode, "limsad")) {
+        if (vi.format.bytesPerSample == 1) d.mean.f = get_linear_interp_msad_8;
+        else if (vi.format.bytesPerSample == 2) d.mean.f = get_linear_interp_msad_16;
+        else d.mean.f = get_linear_interp_msad_32;
+        strcpy(d.mean.name, "linear_interp_msad");
+    }
+    else {
+        vsapi->mapSetError(out, "Mean: invalid mode specified");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    d.plane = vsapi->mapGetIntSaturated(in, "plane", 0, &err);
+    if (err) {
+        d.plane = 0;
+    }
+    if (d.plane < 0 || d.plane >= vi.format.numPlanes) {
+        vsapi->mapSetError(out, "Mean: plane index out of range");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    d.norm = !!vsapi->mapGetIntSaturated(in, "norm", 0, &err);
+    if (err) {
+        d.norm = true;
+    }
+    
+    MeanData *data = (MeanData *)malloc(sizeof d);
+    *data = d;
+    
+    VSFilterDependency deps[] = {{d.node, rpStrictSpatial}};
+    vsapi->createVideoFilter(out, "Mean", &vi, MeanGetFrame, MeanFree, fmParallel, deps, 1, data, core);
+}
+
+typedef double (*metric_func)(const float *restrict srcp0, const float *restrict srcp1, int src_w, int src_h, ptrdiff_t stride);
+
+typedef struct {
+    metric_func f;
+    char name[16];
+} metric_t;
+
+typedef struct {
     VSNode *node0;
     VSNode *node1;
-} RelativeErrorData;
+    metric_t metric;
+} MetricData;
 
 static double get_relative_error(
     const float *restrict srcp0, const float *restrict srcp1, int src_w, int src_h, ptrdiff_t stride
@@ -2615,6 +4650,8 @@ static double get_relative_error(
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
     __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
     
+    __m256 vmin = _mm256_setzero_ps();
+    __m256 vmax = _mm256_set1_ps(1.0f);
     __m256d acc0 = _mm256_setzero_pd();
     __m256d acc1 = _mm256_setzero_pd();
     __m256d acc2 = _mm256_setzero_pd();
@@ -2623,8 +4660,8 @@ static double get_relative_error(
     for (int y = 0; y < src_h; y++) {
         int x = 0;
         for (; x < mod8_w; x += 8) {
-            __m256 pix0 = _mm256_load_ps(srcp0 + x);
-            __m256 pix1 = _mm256_load_ps(srcp1 + x);
+            __m256 pix0 = VCLAMP_PS(_mm256_load_ps(srcp0 + x), vmin, vmax);
+            __m256 pix1 = VCLAMP_PS(_mm256_load_ps(srcp1 + x), vmin, vmax);
             __m256d pix0_0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 0));
             __m256d pix0_1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 1));
             __m256d sub0 = _mm256_sub_pd(pix0_0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 0)));
@@ -2635,8 +4672,8 @@ static double get_relative_error(
             acc3 = _mm256_fmadd_pd(pix0_1, pix0_1, acc3);
         }
         if (tail) {
-            __m256 pix0 = _mm256_maskload_ps(srcp0 + x, tail_mask);
-            __m256 pix1 = _mm256_maskload_ps(srcp1 + x, tail_mask);
+            __m256 pix0 = VCLAMP_PS(_mm256_maskload_ps(srcp0 + x, tail_mask), vmin, vmax);
+            __m256 pix1 = VCLAMP_PS(_mm256_maskload_ps(srcp1 + x, tail_mask), vmin, vmax);
             __m256d pix0_0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 0));
             __m256d pix0_1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 1));
             __m256d sub0 = _mm256_sub_pd(pix0_0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 0)));
@@ -2660,11 +4697,396 @@ static double get_relative_error(
     return sqrt(_mm_cvtsd_f64(acc4)) / fmax(sqrt(_mm_cvtsd_f64(acc5)), 1e-16);
 }
 
-static const VSFrame *VS_CC RelativeErrorGetFrame(
+static double get_rmse(
+    const float *restrict srcp0, const float *restrict srcp1, int src_w, int src_h, ptrdiff_t stride
+) {
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    
+    __m256 vmin = _mm256_setzero_ps();
+    __m256 vmax = _mm256_set1_ps(1.0f);
+    __m256d acc0 = _mm256_setzero_pd();
+    __m256d acc1 = _mm256_setzero_pd();
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m256 pix0 = VCLAMP_PS(_mm256_load_ps(srcp0 + x), vmin, vmax);
+            __m256 pix1 = VCLAMP_PS(_mm256_load_ps(srcp1 + x), vmin, vmax);
+            __m256d temp0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 0));
+            __m256d temp1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 1));
+            temp0 = _mm256_sub_pd(temp0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 0)));
+            temp1 = _mm256_sub_pd(temp1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 1)));
+            acc0 = _mm256_fmadd_pd(temp0, temp0, acc0);
+            acc1 = _mm256_fmadd_pd(temp1, temp1, acc1);
+        }
+        if (tail) {
+            __m256 pix0 = VCLAMP_PS(_mm256_maskload_ps(srcp0 + x, tail_mask), vmin, vmax);
+            __m256 pix1 = VCLAMP_PS(_mm256_maskload_ps(srcp1 + x, tail_mask), vmin, vmax);
+            __m256d temp0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 0));
+            __m256d temp1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 1));
+            temp0 = _mm256_sub_pd(temp0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 0)));
+            temp1 = _mm256_sub_pd(temp1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 1)));
+            acc0 = _mm256_fmadd_pd(temp0, temp0, acc0);
+            acc1 = _mm256_fmadd_pd(temp1, temp1, acc1);
+        }
+        srcp0 += stride;
+        srcp1 += stride;
+    }
+            
+    acc0 = _mm256_add_pd(acc0, acc1);
+    __m128d acc2 = _mm_add_pd(_mm256_extractf128_pd(acc0, 0), _mm256_extractf128_pd(acc0, 1));
+    acc2 = _mm_add_sd(acc2, _mm_unpackhi_pd(acc2, acc2));
+    
+    return sqrt(_mm_cvtsd_f64(acc2) / ((double)src_w * (double)src_h));
+}
+
+static double get_psnr(
+    const float *restrict srcp0, const float *restrict srcp1, int src_w, int src_h, ptrdiff_t stride
+) {
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    
+    __m256 vmin = _mm256_setzero_ps();
+    __m256 vmax = _mm256_set1_ps(1.0f);
+    __m256d acc0 = _mm256_setzero_pd();
+    __m256d acc1 = _mm256_setzero_pd();
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m256 pix0 = VCLAMP_PS(_mm256_load_ps(srcp0 + x), vmin, vmax);
+            __m256 pix1 = VCLAMP_PS(_mm256_load_ps(srcp1 + x), vmin, vmax);
+            __m256d temp0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 0));
+            __m256d temp1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 1));
+            temp0 = _mm256_sub_pd(temp0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 0)));
+            temp1 = _mm256_sub_pd(temp1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 1)));
+            acc0 = _mm256_fmadd_pd(temp0, temp0, acc0);
+            acc1 = _mm256_fmadd_pd(temp1, temp1, acc1);
+        }
+        if (tail) {
+            __m256 pix0 = VCLAMP_PS(_mm256_maskload_ps(srcp0 + x, tail_mask), vmin, vmax);
+            __m256 pix1 = VCLAMP_PS(_mm256_maskload_ps(srcp1 + x, tail_mask), vmin, vmax);
+            __m256d temp0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 0));
+            __m256d temp1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 1));
+            temp0 = _mm256_sub_pd(temp0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 0)));
+            temp1 = _mm256_sub_pd(temp1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 1)));
+            acc0 = _mm256_fmadd_pd(temp0, temp0, acc0);
+            acc1 = _mm256_fmadd_pd(temp1, temp1, acc1);
+        }
+        srcp0 += stride;
+        srcp1 += stride;
+    }
+    
+    acc0 = _mm256_add_pd(acc0, acc1);
+    __m128d acc2 = _mm_add_pd(_mm256_extractf128_pd(acc0, 0), _mm256_extractf128_pd(acc0, 1));
+    acc2 = _mm_add_sd(acc2, _mm_unpackhi_pd(acc2, acc2));
+    
+    return -10.0 * log10(fmax(_mm_cvtsd_f64(acc2) / ((double)src_w * (double)src_h), 1e-16));
+}
+
+static double get_msad(
+    const float *restrict srcp0, const float *restrict srcp1, int src_w, int src_h, ptrdiff_t stride
+) {
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    
+    __m256 vmin = _mm256_setzero_ps();
+    __m256 vmax = _mm256_set1_ps(1.0f);
+    __m256d acc0 = _mm256_setzero_pd();
+    __m256d acc1 = _mm256_setzero_pd();
+    __m256d vabs = _mm256_castsi256_pd(_mm256_set1_epi64x(0x7fffffffffffffff));
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m256 pix0 = VCLAMP_PS(_mm256_load_ps(srcp0 + x), vmin, vmax);
+            __m256 pix1 = VCLAMP_PS(_mm256_load_ps(srcp1 + x), vmin, vmax);
+            __m256d temp0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 0));
+            __m256d temp1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 1));
+            temp0 = _mm256_sub_pd(temp0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 0)));
+            temp1 = _mm256_sub_pd(temp1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 1)));
+            acc0 = _mm256_add_pd(_mm256_and_pd(temp0, vabs), acc0);
+            acc1 = _mm256_add_pd(_mm256_and_pd(temp1, vabs), acc1);
+        }
+        if (tail) {
+            __m256 pix0 = VCLAMP_PS(_mm256_maskload_ps(srcp0 + x, tail_mask), vmin, vmax);
+            __m256 pix1 = VCLAMP_PS(_mm256_maskload_ps(srcp1 + x, tail_mask), vmin, vmax);
+            __m256d temp0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 0));
+            __m256d temp1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 1));
+            temp0 = _mm256_sub_pd(temp0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 0)));
+            temp1 = _mm256_sub_pd(temp1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 1)));
+            acc0 = _mm256_add_pd(_mm256_and_pd(temp0, vabs), acc0);
+            acc1 = _mm256_add_pd(_mm256_and_pd(temp1, vabs), acc1);
+        }
+        srcp0 += stride;
+        srcp1 += stride;
+    }
+    
+    acc0 = _mm256_add_pd(acc0, acc1);
+    __m128d acc2 = _mm_add_pd(_mm256_extractf128_pd(acc0, 0), _mm256_extractf128_pd(acc0, 1));
+    acc2 = _mm_add_sd(acc2, _mm_unpackhi_pd(acc2, acc2));
+    
+    return _mm_cvtsd_f64(acc2) / ((double)src_w * (double)src_h);
+}
+
+static double get_pearson(
+    const float *restrict srcp0, const float *restrict srcp1, int src_w, int src_h, ptrdiff_t stride
+) {
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
+    __m256d sub_mask0 = _mm256_castsi256_pd(_mm256_cvtepi32_epi64(_mm256_extracti128_si256(tail_mask, 0)));
+    __m256d sub_mask1 = _mm256_castsi256_pd(_mm256_cvtepi32_epi64(_mm256_extracti128_si256(tail_mask, 1)));
+    
+    __m256 vmin = _mm256_setzero_ps();
+    __m256 vmax = _mm256_set1_ps(1.0f);
+    __m256d mean0 = _mm256_set1_pd(get_arithmetic_mean_32(srcp0, src_w, src_h, stride).frame_mean);
+    __m256d mean1 = _mm256_set1_pd(get_arithmetic_mean_32(srcp1, src_w, src_h, stride).frame_mean);
+    __m256d acc0 = _mm256_setzero_pd();
+    __m256d acc1 = _mm256_setzero_pd();
+    __m256d acc2 = _mm256_setzero_pd();
+    __m256d acc3 = _mm256_setzero_pd();
+    __m256d acc4 = _mm256_setzero_pd();
+    __m256d acc5 = _mm256_setzero_pd();
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m256 pix0 = VCLAMP_PS(_mm256_load_ps(srcp0 + x), vmin, vmax);
+            __m256 pix1 = VCLAMP_PS(_mm256_load_ps(srcp1 + x), vmin, vmax);
+            __m256d pix0_0 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 0)), mean0);
+            __m256d pix0_1 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 1)), mean0);
+            __m256d pix1_0 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 0)), mean1);
+            __m256d pix1_1 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 1)), mean1);
+            acc0 = _mm256_fmadd_pd(pix0_0, pix1_0, acc0);
+            acc1 = _mm256_fmadd_pd(pix0_1, pix1_1, acc1);
+            acc2 = _mm256_fmadd_pd(pix0_0, pix0_0, acc2);
+            acc3 = _mm256_fmadd_pd(pix0_1, pix0_1, acc3);
+            acc4 = _mm256_fmadd_pd(pix1_0, pix1_0, acc4);
+            acc5 = _mm256_fmadd_pd(pix1_1, pix1_1, acc5);
+        }
+        if (tail) {
+            __m256 pix0 = VCLAMP_PS(_mm256_maskload_ps(srcp0 + x, tail_mask), vmin, vmax);
+            __m256 pix1 = VCLAMP_PS(_mm256_maskload_ps(srcp1 + x, tail_mask), vmin, vmax);
+            __m256d pix0_0 = _mm256_and_pd(_mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 0)), mean0), sub_mask0);
+            __m256d pix0_1 = _mm256_and_pd(_mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 1)), mean0), sub_mask1);
+            __m256d pix1_0 = _mm256_and_pd(_mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 0)), mean1), sub_mask0);
+            __m256d pix1_1 = _mm256_and_pd(_mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 1)), mean1), sub_mask1);
+            acc0 = _mm256_fmadd_pd(pix0_0, pix1_0, acc0);
+            acc1 = _mm256_fmadd_pd(pix0_1, pix1_1, acc1);
+            acc2 = _mm256_fmadd_pd(pix0_0, pix0_0, acc2);
+            acc3 = _mm256_fmadd_pd(pix0_1, pix0_1, acc3);
+            acc4 = _mm256_fmadd_pd(pix1_0, pix1_0, acc4);
+            acc5 = _mm256_fmadd_pd(pix1_1, pix1_1, acc5);
+        }
+        srcp0 += stride;
+        srcp1 += stride;
+    }
+    
+    acc0 = _mm256_add_pd(acc0, acc1);
+    acc2 = _mm256_add_pd(acc2, acc3);
+    acc4 = _mm256_add_pd(acc4, acc5);
+    __m128d acc6 = _mm_add_pd(_mm256_extractf128_pd(acc0, 0), _mm256_extractf128_pd(acc0, 1));
+    __m128d acc7 = _mm_add_pd(_mm256_extractf128_pd(acc2, 0), _mm256_extractf128_pd(acc2, 1));
+    __m128d acc8 = _mm_add_pd(_mm256_extractf128_pd(acc4, 0), _mm256_extractf128_pd(acc4, 1));
+    acc6 = _mm_add_sd(acc6, _mm_unpackhi_pd(acc6, acc6));
+    acc7 = _mm_mul_sd(_mm_add_sd(acc7, _mm_unpackhi_pd(acc7, acc7)), _mm_add_sd(acc8, _mm_unpackhi_pd(acc8, acc8)));
+    
+    return _mm_cvtsd_f64(acc6) / fmax(sqrt(_mm_cvtsd_f64(acc7)), 1e-16);
+}
+
+static inline double get_mean_8x8(
+    __m256 row0, __m256 row1, __m256 row2, __m256 row3, __m256 row4, __m256 row5, __m256 row6, __m256 row7
+) {
+    __m256d temp = _mm256_cvtps_pd(_mm256_extractf128_ps(row0, 0));
+    temp = _mm256_add_pd(temp, _mm256_cvtps_pd(_mm256_extractf128_ps(row0, 1)));
+    temp = _mm256_add_pd(temp, _mm256_cvtps_pd(_mm256_extractf128_ps(row1, 0)));
+    temp = _mm256_add_pd(temp, _mm256_cvtps_pd(_mm256_extractf128_ps(row1, 1)));
+    temp = _mm256_add_pd(temp, _mm256_cvtps_pd(_mm256_extractf128_ps(row2, 0)));
+    temp = _mm256_add_pd(temp, _mm256_cvtps_pd(_mm256_extractf128_ps(row2, 1)));
+    temp = _mm256_add_pd(temp, _mm256_cvtps_pd(_mm256_extractf128_ps(row3, 0)));
+    temp = _mm256_add_pd(temp, _mm256_cvtps_pd(_mm256_extractf128_ps(row3, 1)));
+    temp = _mm256_add_pd(temp, _mm256_cvtps_pd(_mm256_extractf128_ps(row4, 0)));
+    temp = _mm256_add_pd(temp, _mm256_cvtps_pd(_mm256_extractf128_ps(row4, 1)));
+    temp = _mm256_add_pd(temp, _mm256_cvtps_pd(_mm256_extractf128_ps(row5, 0)));
+    temp = _mm256_add_pd(temp, _mm256_cvtps_pd(_mm256_extractf128_ps(row5, 1)));
+    temp = _mm256_add_pd(temp, _mm256_cvtps_pd(_mm256_extractf128_ps(row6, 0)));
+    temp = _mm256_add_pd(temp, _mm256_cvtps_pd(_mm256_extractf128_ps(row6, 1)));
+    temp = _mm256_add_pd(temp, _mm256_cvtps_pd(_mm256_extractf128_ps(row7, 0)));
+    temp = _mm256_add_pd(temp, _mm256_cvtps_pd(_mm256_extractf128_ps(row7, 1)));
+    __m128d temp2 = _mm_add_pd(_mm256_extractf128_pd(temp, 0), _mm256_extractf128_pd(temp, 1));
+    temp2 = _mm_add_sd(temp2, _mm_unpackhi_pd(temp2, temp2));
+    return _mm_cvtsd_f64(temp2) / 64.0;
+}
+
+static inline double get_variance_8x8(
+    __m256 row0, __m256 row1, __m256 row2, __m256 row3, __m256 row4, __m256 row5, __m256 row6, __m256 row7, __m256d mean
+) {
+    __m256d acc = _mm256_setzero_pd();
+    __m256d temp = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row0, 0)), mean);
+    acc = _mm256_fmadd_pd(temp, temp, acc);
+    temp = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row0, 1)), mean);
+    acc = _mm256_fmadd_pd(temp, temp, acc);
+    temp = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row1, 0)), mean);
+    acc = _mm256_fmadd_pd(temp, temp, acc);
+    temp = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row1, 1)), mean);
+    acc = _mm256_fmadd_pd(temp, temp, acc);
+    temp = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row2, 0)), mean);
+    acc = _mm256_fmadd_pd(temp, temp, acc);
+    temp = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row2, 1)), mean);
+    acc = _mm256_fmadd_pd(temp, temp, acc);
+    temp = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row3, 0)), mean);
+    acc = _mm256_fmadd_pd(temp, temp, acc);
+    temp = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row3, 1)), mean);
+    acc = _mm256_fmadd_pd(temp, temp, acc);
+    temp = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row4, 0)), mean);
+    acc = _mm256_fmadd_pd(temp, temp, acc);
+    temp = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row4, 1)), mean);
+    acc = _mm256_fmadd_pd(temp, temp, acc);
+    temp = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row5, 0)), mean);
+    acc = _mm256_fmadd_pd(temp, temp, acc);
+    temp = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row5, 1)), mean);
+    acc = _mm256_fmadd_pd(temp, temp, acc);
+    temp = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row6, 0)), mean);
+    acc = _mm256_fmadd_pd(temp, temp, acc);
+    temp = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row6, 1)), mean);
+    acc = _mm256_fmadd_pd(temp, temp, acc);
+    temp = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row7, 0)), mean);
+    acc = _mm256_fmadd_pd(temp, temp, acc);
+    temp = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row7, 1)), mean);
+    acc = _mm256_fmadd_pd(temp, temp, acc);
+    __m128d acc2 = _mm_add_pd(_mm256_extractf128_pd(acc, 0), _mm256_extractf128_pd(acc, 1));
+    acc2 = _mm_add_sd(acc2, _mm_unpackhi_pd(acc2, acc2));
+    return _mm_cvtsd_f64(acc2) / 64.0;
+}
+
+static inline double get_covariance_8x8(
+    __m256 row0_0, __m256 row0_1, __m256 row0_2, __m256 row0_3, __m256 row0_4, __m256 row0_5, __m256 row0_6, __m256 row0_7,
+    __m256 row1_0, __m256 row1_1, __m256 row1_2, __m256 row1_3, __m256 row1_4, __m256 row1_5, __m256 row1_6, __m256 row1_7,
+    __m256d mean0, __m256d mean1
+) {
+    __m256d acc = _mm256_setzero_pd();
+    __m256d temp0 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row0_0, 0)), mean0);
+    __m256d temp1 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row1_0, 0)), mean1);
+    acc = _mm256_fmadd_pd(temp0, temp1, acc);
+    temp0 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row0_0, 1)), mean0);
+    temp1 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row1_0, 1)), mean1);
+    acc = _mm256_fmadd_pd(temp0, temp1, acc);
+    temp0 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row0_1, 0)), mean0);
+    temp1 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row1_1, 0)), mean1);
+    acc = _mm256_fmadd_pd(temp0, temp1, acc);
+    temp0 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row0_1, 1)), mean0);
+    temp1 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row1_1, 1)), mean1);
+    acc = _mm256_fmadd_pd(temp0, temp1, acc);
+    temp0 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row0_2, 0)), mean0);
+    temp1 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row1_2, 0)), mean1);
+    acc = _mm256_fmadd_pd(temp0, temp1, acc);
+    temp0 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row0_2, 1)), mean0);
+    temp1 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row1_2, 1)), mean1);
+    acc = _mm256_fmadd_pd(temp0, temp1, acc);
+    temp0 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row0_3, 0)), mean0);
+    temp1 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row1_3, 0)), mean1);
+    acc = _mm256_fmadd_pd(temp0, temp1, acc);
+    temp0 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row0_3, 1)), mean0);
+    temp1 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row1_3, 1)), mean1);
+    acc = _mm256_fmadd_pd(temp0, temp1, acc);
+    temp0 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row0_4, 0)), mean0);
+    temp1 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row1_4, 0)), mean1);
+    acc = _mm256_fmadd_pd(temp0, temp1, acc);
+    temp0 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row0_4, 1)), mean0);
+    temp1 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row1_4, 1)), mean1);
+    acc = _mm256_fmadd_pd(temp0, temp1, acc);
+    temp0 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row0_5, 0)), mean0);
+    temp1 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row1_5, 0)), mean1);
+    acc = _mm256_fmadd_pd(temp0, temp1, acc);
+    temp0 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row0_5, 1)), mean0);
+    temp1 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row1_5, 1)), mean1);
+    acc = _mm256_fmadd_pd(temp0, temp1, acc);
+    temp0 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row0_6, 0)), mean0);
+    temp1 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row1_6, 0)), mean1);
+    acc = _mm256_fmadd_pd(temp0, temp1, acc);
+    temp0 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row0_6, 1)), mean0);
+    temp1 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row1_6, 1)), mean1);
+    acc = _mm256_fmadd_pd(temp0, temp1, acc);
+    temp0 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row0_7, 0)), mean0);
+    temp1 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row1_7, 0)), mean1);
+    acc = _mm256_fmadd_pd(temp0, temp1, acc);
+    temp0 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row0_7, 1)), mean0);
+    temp1 = _mm256_sub_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(row1_7, 1)), mean1);
+    acc = _mm256_fmadd_pd(temp0, temp1, acc);
+    __m128d acc2 = _mm_add_pd(_mm256_extractf128_pd(acc, 0), _mm256_extractf128_pd(acc, 1));
+    acc2 = _mm_add_sd(acc2, _mm_unpackhi_pd(acc2, acc2));
+    return _mm_cvtsd_f64(acc2) / 64.0;
+}
+
+static double get_ssim(
+    const float *restrict srcp0, const float *restrict srcp1, int src_w, int src_h, ptrdiff_t stride
+) {
+    __m256 vmin = _mm256_setzero_ps();
+    __m256 vmax = _mm256_set1_ps(1.0f);
+    double acc = 0.0;
+    
+    for(int y = 0; y < src_h - 7; y++) {
+        for(int x = 0; x < src_w - 7; x++) {
+            __m256 pix0_0 = VCLAMP_PS(_mm256_loadu_ps(srcp0 + stride * 0 + x), vmin, vmax);
+            __m256 pix0_1 = VCLAMP_PS(_mm256_loadu_ps(srcp0 + stride * 1 + x), vmin, vmax);
+            __m256 pix0_2 = VCLAMP_PS(_mm256_loadu_ps(srcp0 + stride * 2 + x), vmin, vmax);
+            __m256 pix0_3 = VCLAMP_PS(_mm256_loadu_ps(srcp0 + stride * 3 + x), vmin, vmax);
+            __m256 pix0_4 = VCLAMP_PS(_mm256_loadu_ps(srcp0 + stride * 4 + x), vmin, vmax);
+            __m256 pix0_5 = VCLAMP_PS(_mm256_loadu_ps(srcp0 + stride * 5 + x), vmin, vmax);
+            __m256 pix0_6 = VCLAMP_PS(_mm256_loadu_ps(srcp0 + stride * 6 + x), vmin, vmax);
+            __m256 pix0_7 = VCLAMP_PS(_mm256_loadu_ps(srcp0 + stride * 7 + x), vmin, vmax);
+            __m256 pix1_0 = VCLAMP_PS(_mm256_loadu_ps(srcp1 + stride * 0 + x), vmin, vmax);
+            __m256 pix1_1 = VCLAMP_PS(_mm256_loadu_ps(srcp1 + stride * 1 + x), vmin, vmax);
+            __m256 pix1_2 = VCLAMP_PS(_mm256_loadu_ps(srcp1 + stride * 2 + x), vmin, vmax);
+            __m256 pix1_3 = VCLAMP_PS(_mm256_loadu_ps(srcp1 + stride * 3 + x), vmin, vmax);
+            __m256 pix1_4 = VCLAMP_PS(_mm256_loadu_ps(srcp1 + stride * 4 + x), vmin, vmax);
+            __m256 pix1_5 = VCLAMP_PS(_mm256_loadu_ps(srcp1 + stride * 5 + x), vmin, vmax);
+            __m256 pix1_6 = VCLAMP_PS(_mm256_loadu_ps(srcp1 + stride * 6 + x), vmin, vmax);
+            __m256 pix1_7 = VCLAMP_PS(_mm256_loadu_ps(srcp1 + stride * 7 + x), vmin, vmax);
+            
+            double mean0 = get_mean_8x8(pix0_0, pix0_1, pix0_2, pix0_3, pix0_4, pix0_5, pix0_6, pix0_7);
+            double mean1 = get_mean_8x8(pix1_0, pix1_1, pix1_2, pix1_3, pix1_4, pix1_5, pix1_6, pix1_7);
+            __m256d vmean0 = _mm256_set1_pd(mean0);
+            __m256d vmean1 = _mm256_set1_pd(mean1);
+            double var0 = get_variance_8x8(pix0_0, pix0_1, pix0_2, pix0_3, pix0_4, pix0_5, pix0_6, pix0_7, vmean0);
+            double var1 = get_variance_8x8(pix1_0, pix1_1, pix1_2, pix1_3, pix1_4, pix1_5, pix1_6, pix1_7, vmean1);
+            double covar = get_covariance_8x8(
+                pix0_0, pix0_1, pix0_2, pix0_3, pix0_4, pix0_5, pix0_6, pix0_7,
+                pix1_0, pix1_1, pix1_2, pix1_3, pix1_4, pix1_5, pix1_6, pix1_7,
+                vmean0, vmean1
+            );
+            double numerator = (2.0 * mean0 * mean1 + 0.0001) * (2.0 * covar + 0.0009);
+            double denominator = (mean0 * mean0 + mean1 * mean1 + 0.0001) * (var0 + var1 + 0.0009);
+            acc += numerator / denominator;
+        }
+        srcp0 += stride;
+        srcp1 += stride;
+    }
+    return acc / ((double)(src_w - 7) * (double)(src_h - 7));
+}
+
+static const VSFrame *VS_CC MetricGetFrame(
     int n, int activationReason, void *instanceData, void **frameData UNUSED,
     VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi
 ) {
-    RelativeErrorData *d = (RelativeErrorData *)instanceData;
+    MetricData *d = (MetricData *)instanceData;
     
     if (activationReason == arInitial) {
         vsapi->requestFrameFilter(n, d->node0, frameCtx);
@@ -2681,10 +5103,10 @@ static const VSFrame *VS_CC RelativeErrorGetFrame(
         int src_w = vsapi->getFrameWidth(src0, 0);
         int src_h = vsapi->getFrameHeight(src0, 0);
         
-        double err = get_relative_error(srcp0, srcp1, src_w, src_h, src_stride);
+        double metric = d->metric.f(srcp0, srcp1, src_w, src_h, src_stride);
         
         VSMap *props = vsapi->getFramePropertiesRW(dst);
-        vsapi->mapSetFloat(props, "RelativeError", err, maReplace);
+        vsapi->mapSetFloat(props, d->metric.name, metric, maReplace);
         
         vsapi->freeFrame(src0);
         vsapi->freeFrame(src1);
@@ -2693,41 +5115,81 @@ static const VSFrame *VS_CC RelativeErrorGetFrame(
     return NULL;
 }
 
-static void VS_CC RelativeErrorFree(void *instanceData, VSCore *core UNUSED, const VSAPI *vsapi) {
-    RelativeErrorData *d = (RelativeErrorData *)instanceData;
+static void VS_CC MetricFree(void *instanceData, VSCore *core UNUSED, const VSAPI *vsapi) {
+    MetricData *d = (MetricData *)instanceData;
     vsapi->freeNode(d->node0);
     vsapi->freeNode(d->node1);
     free(d);
 }
 
-static void VS_CC RelativeErrorCreate(
+static void VS_CC MetricCreate(
     const VSMap *in, VSMap *out, void *userData UNUSED, VSCore *core, const VSAPI *vsapi
 ) {
-    RelativeErrorData d;
+    MetricData d;
     d.node0 = vsapi->mapGetNode(in, "clip0", 0, NULL);
     d.node1 = vsapi->mapGetNode(in, "clip1", 0, NULL);
     VSVideoInfo vi0 = *vsapi->getVideoInfo(d.node0);
     VSVideoInfo vi1 = *vsapi->getVideoInfo(d.node1);
     
     if (!vsh_isConstantVideoFormat(&vi0) || !vsh_isSameVideoPresetFormat(pfGrayS, &vi0.format, core, vsapi)) {
-        vsapi->mapSetError(out, "RelativeError: only GRAY constant format 32bit float input supported");
+        vsapi->mapSetError(out, "Metric: only GRAY constant format 32bit float input supported");
         vsapi->freeNode(d.node0);
         vsapi->freeNode(d.node1);
         return;
     }
     
     if (!vsh_isSameVideoInfo(&vi0, &vi1) || vi0.numFrames != vi1.numFrames) {
-        vsapi->mapSetError(out, "RelativeError: clips must have the same format and number of frames");
+        vsapi->mapSetError(out, "Metric: clips must have the same format and number of frames");
         vsapi->freeNode(d.node0);
         vsapi->freeNode(d.node1);
         return;
     }
     
-    RelativeErrorData *data = (RelativeErrorData *)malloc(sizeof d);
+    if (vi0.width < 8 || vi0.height < 8) {
+        vsapi->mapSetError(out, "Metric: the width and height of clips must be at least 8x8.");
+        vsapi->freeNode(d.node0);
+        vsapi->freeNode(d.node1);
+        return;
+    }
+    
+    int err;
+    const char *mode = vsapi->mapGetData(in, "mode", 0, &err);
+    if (err || !strcmp(mode, "relative")) {
+        d.metric.f = get_relative_error;
+        strcpy(d.metric.name, "RelativeError");
+    }
+    else if (!strcmp(mode, "rmse")) {
+        d.metric.f = get_rmse;
+        strcpy(d.metric.name, "RMSE");
+    }
+    else if (!strcmp(mode, "psnr")) {
+        d.metric.f = get_psnr;
+        strcpy(d.metric.name, "PSNR");
+    }
+    else if (!strcmp(mode, "msad")) {
+        d.metric.f = get_msad;
+        strcpy(d.metric.name, "MSAD");
+    }
+    else if (!strcmp(mode, "pcc")) {
+        d.metric.f = get_pearson;
+        strcpy(d.metric.name, "PCC");
+    }
+    else if (!strcmp(mode, "ssim")) {
+        d.metric.f = get_ssim;
+        strcpy(d.metric.name, "SSIM");
+    }
+    else {
+        vsapi->mapSetError(out, "Metric: invalid mode specified");
+        vsapi->freeNode(d.node0);
+        vsapi->freeNode(d.node1);
+        return;
+    }
+    
+    MetricData *data = (MetricData *)malloc(sizeof d);
     *data = d;
     
     VSFilterDependency deps[] = {{d.node0, rpStrictSpatial}, {d.node1, rpStrictSpatial}};
-    vsapi->createVideoFilter(out, "RelativeError", &vi0, RelativeErrorGetFrame, RelativeErrorFree, fmParallel, deps, 2, data, core);
+    vsapi->createVideoFilter(out, "Metric", &vi0, MetricGetFrame, MetricFree, fmParallel, deps, 2, data, core);
 }
 
 typedef struct {
@@ -3137,11 +5599,21 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
                              DescaleCreate,
                              NULL,
                              plugin);
-    vspapi->registerFunction("RelativeError",
-                             "clip0:vnode;"
-                             "clip1:vnode;",
+    vspapi->registerFunction("Mean",
+                             "clip:vnode;"
+                             "mode:data:opt;"
+                             "plane:int:opt;"
+                             "norm:int:opt;",
                              "clip:vnode;",
-                             RelativeErrorCreate,
+                             MeanCreate,
+                             NULL,
+                             plugin);
+    vspapi->registerFunction("Metric",
+                             "clip0:vnode;"
+                             "clip1:vnode;"
+                             "mode:data:opt;",
+                             "clip:vnode;",
+                             MetricCreate,
                              NULL,
                              plugin);
     vspapi->registerFunction("Linearize",
