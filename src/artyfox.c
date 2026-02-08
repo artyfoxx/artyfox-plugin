@@ -157,7 +157,7 @@ static double bicubic_kernel(double x, void *ctx) {
 }
 
 typedef struct {
-    int taps;
+    double taps;
 } sinc_ctx;
 
 static inline double sinc_function(double x) {
@@ -324,8 +324,7 @@ static double nuttall_kernel(double x, void *ctx) {
 }
 
 typedef struct {
-    int taps;
-    double beta, i0_beta;
+    double taps, beta, i0_beta;
 } kaiser_ctx;
 
 // Based on: https://www.advanpix.com/2015/11/11/rational-approximations-for-the-modified-bessel-function-of-the-first-kind-i0-computations-double-precision/
@@ -396,8 +395,7 @@ static double kaiser_kernel(double x, void *ctx) {
 }
 
 typedef struct {
-    int taps;
-    double p;
+    double b, p, taps;
 } gauss_ctx;
 
 static double gauss_kernel(double x, void *ctx) {
@@ -405,8 +403,8 @@ static double gauss_kernel(double x, void *ctx) {
     if (x < 0.0) {
         x = -x;
     }
-    if (x < gs->taps) {
-        return pow(2.0, -gs->p * x * x);
+    if (x <= gs->taps) {
+        return pow(gs->b, -gs->p * (x * x));
     }
     return 0.0;
 }
@@ -1633,17 +1631,17 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData UNUSE
     }
     else if (!strcmp(kernel, "lanczos")) {
         sinc_ctx *sn = (sinc_ctx *)malloc(sizeof(*sn));
-        sn->taps = vsapi->mapGetIntSaturated(in, "taps", 0, &err);
+        sn->taps = vsapi->mapGetFloat(in, "taps", 0, &err);
         if (err) {
-            sn->taps = 3;
+            sn->taps = 3.0;
         }
-        if (sn->taps < 1 || sn->taps > 128) {
+        if (sn->taps < 1.0 || sn->taps > 128.0) {
             vsapi->mapSetError(out, "Resize: taps must be between 1 and 128");
             vsapi->freeNode(d.node);
             free(sn);
             return;
         }
-        d.kernel_w = d.kernel_h = (kernel_t){lanczos_kernel, (double)sn->taps, sn};
+        d.kernel_w = d.kernel_h = (kernel_t){lanczos_kernel, sn->taps, sn};
     }
     else if (!strcmp(kernel, "spline16")) {
         d.kernel_w = d.kernel_h = (kernel_t){spline16_kernel, 2.0, NULL};
@@ -1665,39 +1663,39 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData UNUSE
     }
     else if (!strcmp(kernel, "blackman")) {
         sinc_ctx *sn = (sinc_ctx *)malloc(sizeof(*sn));
-        sn->taps = vsapi->mapGetIntSaturated(in, "taps", 0, &err);
+        sn->taps = vsapi->mapGetFloat(in, "taps", 0, &err);
         if (err) {
-            sn->taps = 3;
+            sn->taps = 3.0;
         }
-        if (sn->taps < 1 || sn->taps > 128) {
+        if (sn->taps < 1.0 || sn->taps > 128.0) {
             vsapi->mapSetError(out, "Resize: taps must be between 1 and 128");
             vsapi->freeNode(d.node);
             free(sn);
             return;
         }
-        d.kernel_w = d.kernel_h = (kernel_t){blackman_kernel, (double)sn->taps, sn};
+        d.kernel_w = d.kernel_h = (kernel_t){blackman_kernel, sn->taps, sn};
     }
     else if (!strcmp(kernel, "nuttall")) {
         sinc_ctx *sn = (sinc_ctx *)malloc(sizeof(*sn));
-        sn->taps = vsapi->mapGetIntSaturated(in, "taps", 0, &err);
+        sn->taps = vsapi->mapGetFloat(in, "taps", 0, &err);
         if (err) {
-            sn->taps = 3;
+            sn->taps = 3.0;
         }
-        if (sn->taps < 1 || sn->taps > 128) {
+        if (sn->taps < 1.0 || sn->taps > 128.0) {
             vsapi->mapSetError(out, "Resize: taps must be between 1 and 128");
             vsapi->freeNode(d.node);
             free(sn);
             return;
         }
-        d.kernel_w = d.kernel_h = (kernel_t){nuttall_kernel, (double)sn->taps, sn};
+        d.kernel_w = d.kernel_h = (kernel_t){nuttall_kernel, sn->taps, sn};
     }
     else if (!strcmp(kernel, "kaiser")) {
         kaiser_ctx *ks = (kaiser_ctx *)malloc(sizeof(*ks));
-        ks->taps = vsapi->mapGetIntSaturated(in, "taps", 0, &err);
+        ks->taps = vsapi->mapGetFloat(in, "taps", 0, &err);
         if (err) {
-            ks->taps = 3;
+            ks->taps = 3.0;
         }
-        if (ks->taps < 1 || ks->taps > 128) {
+        if (ks->taps < 1.0 || ks->taps > 128.0) {
             vsapi->mapSetError(out, "Resize: taps must be between 1 and 128");
             vsapi->freeNode(d.node);
             free(ks);
@@ -1714,21 +1712,21 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData UNUSE
             return;
         }
         ks->i0_beta = bessel_i0(ks->beta);
-        d.kernel_w = d.kernel_h = (kernel_t){kaiser_kernel, (double)ks->taps, ks};
+        d.kernel_w = d.kernel_h = (kernel_t){kaiser_kernel, ks->taps, ks};
     }
     else if (!strcmp(kernel, "gauss")) {
         gauss_ctx *gs = (gauss_ctx *)malloc(sizeof(*gs));
-        gs->taps = vsapi->mapGetIntSaturated(in, "taps", 0, &err);
+        gs->b = vsapi->mapGetFloat(in, "b", 0, &err);
         if (err) {
-            gs->taps = 3;
+           gs->b = 2.0;
         }
-        if (gs->taps < 1 || gs->taps > 128) {
-            vsapi->mapSetError(out, "Resize: taps must be between 1 and 128");
+        if (gs->b < 1.5 || gs->b > 3.5) {
+            vsapi->mapSetError(out, "Resize: b must be between 1.5 and 3.5");
             vsapi->freeNode(d.node);
             free(gs);
             return;
         }
-        gs->p = vsapi->mapGetFloat(in, "b", 0, &err);
+        gs->p = vsapi->mapGetFloat(in, "c", 0, &err);
         if (err) {
            gs->p = 30.0;
         }
@@ -1739,7 +1737,20 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData UNUSE
             return;
         }
         gs->p /= 10.0;
-        d.kernel_w = d.kernel_h = (kernel_t){gauss_kernel, (double)gs->taps, gs};
+        gs->taps = vsapi->mapGetFloat(in, "taps", 0, &err);
+        if (err) {
+            gs->taps = 4.0;
+        }
+        if (gs->taps == 0.0) {
+            gs->taps = sqrt(4.6 / (gs->p * log(gs->b)));
+        }
+        if (gs->taps < 0.6 || gs->taps > 128.0) {
+            vsapi->mapSetError(out, "Resize: taps must be between 0.6 and 128 or 0 for automatic calculation");
+            vsapi->freeNode(d.node);
+            free(gs);
+            return;
+        }
+        d.kernel_w = d.kernel_h = (kernel_t){gauss_kernel, gs->taps, gs};
     }
     else {
         vsapi->mapSetError(out, "Resize: invalid kernel specified");
@@ -2267,7 +2278,7 @@ static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData UNUS
     d.vi = *vsapi->getVideoInfo(d.node);
     
     if (!vsh_isConstantVideoFormat(&d.vi) || d.vi.format.sampleType != stFloat || d.vi.format.bitsPerSample != 32) {
-        vsapi->mapSetError(out, "Resize: only constant format 32bit float input supported");
+        vsapi->mapSetError(out, "Descale: only constant format 32bit float input supported");
         vsapi->freeNode(d.node);
         return;
     }
@@ -2276,25 +2287,25 @@ static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData UNUS
     d.dst_height = vsapi->mapGetIntSaturated(in, "height", 0, NULL);
     
     if (d.dst_width <= 1 << d.vi.format.subSamplingW || d.dst_width > d.vi.width) {
-        vsapi->mapSetError(out, "Resize: \"width\" any of the planes must be greater than 1 and less than or equal to source width");
+        vsapi->mapSetError(out, "Descale: \"width\" any of the planes must be greater than 1 and less than or equal to source width");
         vsapi->freeNode(d.node);
         return;
     }
     
     if (d.dst_width % (1 << d.vi.format.subSamplingW)) {
-        vsapi->mapSetError(out, "Resize: \"width\" must be a multiple of the subsampling");
+        vsapi->mapSetError(out, "Descale: \"width\" must be a multiple of the subsampling");
         vsapi->freeNode(d.node);
         return;
     }
     
     if (d.dst_height <= 1 << d.vi.format.subSamplingH || d.dst_height > d.vi.height) {
-        vsapi->mapSetError(out, "Resize: \"height\" any of the planes must be greater than 1 and less than or equal to source height");
+        vsapi->mapSetError(out, "Descale: \"height\" any of the planes must be greater than 1 and less than or equal to source height");
         vsapi->freeNode(d.node);
         return;
     }
     
     if (d.dst_height % (1 << d.vi.format.subSamplingH)) {
-        vsapi->mapSetError(out, "Resize: \"height\" must be a multiple of the subsampling");
+        vsapi->mapSetError(out, "Descale: \"height\" must be a multiple of the subsampling");
         vsapi->freeNode(d.node);
         return;
     }
@@ -2307,7 +2318,7 @@ static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData UNUS
     }
     
     if (d.start_w <= -d.dst_width || d.start_w >= d.dst_width) {
-        vsapi->mapSetError(out, "Resize: \"src_left\" must be between \"-width\" and \"width\"");
+        vsapi->mapSetError(out, "Descale: \"src_left\" must be between \"-width\" and \"width\"");
         vsapi->freeNode(d.node);
         return;
     }
@@ -2318,7 +2329,7 @@ static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData UNUS
     }
     
     if (d.start_h <= -d.dst_height || d.start_h >= d.dst_height) {
-        vsapi->mapSetError(out, "Resize: \"src_top\" must be between \"-height\" and \"height\"");
+        vsapi->mapSetError(out, "Descale: \"src_top\" must be between \"-height\" and \"height\"");
         vsapi->freeNode(d.node);
         return;
     }
@@ -2329,7 +2340,7 @@ static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData UNUS
     }
     
     if (d.real_w <= -d.dst_width + d.start_w || d.real_w >= d.dst_width * 2 - d.start_w) {
-        vsapi->mapSetError(out, "Resize: \"src_width\" must be between \"-width + src_left\" and \"width * 2 - src_left\"");
+        vsapi->mapSetError(out, "Descale: \"src_width\" must be between \"-width + src_left\" and \"width * 2 - src_left\"");
         vsapi->freeNode(d.node);
         return;
     }
@@ -2344,7 +2355,7 @@ static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData UNUS
     }
     
     if (d.real_h <= -d.dst_height + d.start_h || d.real_h >= d.dst_height * 2 - d.start_h) {
-        vsapi->mapSetError(out, "Resize: \"src_height\" must be between \"-height + src_top\" and \"height * 2 - src_top\"");
+        vsapi->mapSetError(out, "Descale: \"src_height\" must be between \"-height + src_top\" and \"height * 2 - src_top\"");
         vsapi->freeNode(d.node);
         return;
     }
@@ -2359,7 +2370,7 @@ static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData UNUS
     }
     
     if (d.lambda < 1e-16 || d.lambda >= 1.0) {
-        vsapi->mapSetError(out, "Resize: \"lambda\" must be between 1e-16 and 1");
+        vsapi->mapSetError(out, "Descale: \"lambda\" must be between 1e-16 and 1");
         vsapi->freeNode(d.node);
         return;
     }
@@ -2399,17 +2410,17 @@ static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData UNUS
     }
     else if (!strcmp(kernel, "lanczos")) {
         sinc_ctx *sn = (sinc_ctx *)malloc(sizeof(*sn));
-        sn->taps = vsapi->mapGetIntSaturated(in, "taps", 0, &err);
+        sn->taps = vsapi->mapGetFloat(in, "taps", 0, &err);
         if (err) {
-            sn->taps = 3;
+            sn->taps = 3.0;
         }
-        if (sn->taps < 1 || sn->taps > 128) {
-            vsapi->mapSetError(out, "Resize: taps must be between 1 and 128");
+        if (sn->taps < 1.0 || sn->taps > 128.0) {
+            vsapi->mapSetError(out, "Descale: taps must be between 1 and 128");
             vsapi->freeNode(d.node);
             free(sn);
             return;
         }
-        d.kernel_w = d.kernel_h = (kernel_t){lanczos_kernel, (double)sn->taps, sn};
+        d.kernel_w = d.kernel_h = (kernel_t){lanczos_kernel, sn->taps, sn};
     }
     else if (!strcmp(kernel, "spline16")) {
         d.kernel_w = d.kernel_h = (kernel_t){spline16_kernel, 2.0, NULL};
@@ -2431,40 +2442,40 @@ static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData UNUS
     }
     else if (!strcmp(kernel, "blackman")) {
         sinc_ctx *sn = (sinc_ctx *)malloc(sizeof(*sn));
-        sn->taps = vsapi->mapGetIntSaturated(in, "taps", 0, &err);
+        sn->taps = vsapi->mapGetFloat(in, "taps", 0, &err);
         if (err) {
-            sn->taps = 3;
+            sn->taps = 3.0;
         }
-        if (sn->taps < 1 || sn->taps > 128) {
-            vsapi->mapSetError(out, "Resize: taps must be between 1 and 128");
+        if (sn->taps < 1.0 || sn->taps > 128.0) {
+            vsapi->mapSetError(out, "Descale: taps must be between 1 and 128");
             vsapi->freeNode(d.node);
             free(sn);
             return;
         }
-        d.kernel_w = d.kernel_h = (kernel_t){blackman_kernel, (double)sn->taps, sn};
+        d.kernel_w = d.kernel_h = (kernel_t){blackman_kernel, sn->taps, sn};
     }
     else if (!strcmp(kernel, "nuttall")) {
         sinc_ctx *sn = (sinc_ctx *)malloc(sizeof(*sn));
-        sn->taps = vsapi->mapGetIntSaturated(in, "taps", 0, &err);
+        sn->taps = vsapi->mapGetFloat(in, "taps", 0, &err);
         if (err) {
-            sn->taps = 3;
+            sn->taps = 3.0;
         }
-        if (sn->taps < 1 || sn->taps > 128) {
-            vsapi->mapSetError(out, "Resize: taps must be between 1 and 128");
+        if (sn->taps < 1.0 || sn->taps > 128.0) {
+            vsapi->mapSetError(out, "Descale: taps must be between 1 and 128");
             vsapi->freeNode(d.node);
             free(sn);
             return;
         }
-        d.kernel_w = d.kernel_h = (kernel_t){nuttall_kernel, (double)sn->taps, sn};
+        d.kernel_w = d.kernel_h = (kernel_t){nuttall_kernel, sn->taps, sn};
     }
     else if (!strcmp(kernel, "kaiser")) {
         kaiser_ctx *ks = (kaiser_ctx *)malloc(sizeof(*ks));
-        ks->taps = vsapi->mapGetIntSaturated(in, "taps", 0, &err);
+        ks->taps = vsapi->mapGetFloat(in, "taps", 0, &err);
         if (err) {
-            ks->taps = 3;
+            ks->taps = 3.0;
         }
-        if (ks->taps < 1 || ks->taps > 128) {
-            vsapi->mapSetError(out, "Resize: taps must be between 1 and 128");
+        if (ks->taps < 1.0 || ks->taps > 128.0) {
+            vsapi->mapSetError(out, "Descale: taps must be between 1 and 128");
             vsapi->freeNode(d.node);
             free(ks);
             return;
@@ -2474,41 +2485,54 @@ static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData UNUS
            ks->beta = 4.0;
         }
         if (ks->beta <= 0.0 || ks->beta > 32.0) {
-            vsapi->mapSetError(out, "Resize: beta must be between 0 and 32");
+            vsapi->mapSetError(out, "Descale: beta must be between 0 and 32");
             vsapi->freeNode(d.node);
             free(ks);
             return;
         }
         ks->i0_beta = bessel_i0(ks->beta);
-        d.kernel_w = d.kernel_h = (kernel_t){kaiser_kernel, (double)ks->taps, ks};
+        d.kernel_w = d.kernel_h = (kernel_t){kaiser_kernel, ks->taps, ks};
     }
     else if (!strcmp(kernel, "gauss")) {
         gauss_ctx *gs = (gauss_ctx *)malloc(sizeof(*gs));
-        gs->taps = vsapi->mapGetIntSaturated(in, "taps", 0, &err);
+        gs->b = vsapi->mapGetFloat(in, "b", 0, &err);
         if (err) {
-            gs->taps = 3;
+           gs->b = 2.0;
         }
-        if (gs->taps < 1 || gs->taps > 128) {
-            vsapi->mapSetError(out, "Resize: taps must be between 1 and 128");
+        if (gs->b < 1.5 || gs->b > 3.5) {
+            vsapi->mapSetError(out, "Descale: b must be between 1.5 and 3.5");
             vsapi->freeNode(d.node);
             free(gs);
             return;
         }
-        gs->p = vsapi->mapGetFloat(in, "b", 0, &err);
+        gs->p = vsapi->mapGetFloat(in, "c", 0, &err);
         if (err) {
            gs->p = 30.0;
         }
         if (gs->p < 1.0 || gs->p > 100.0) {
-            vsapi->mapSetError(out, "Resize: p must be between 1 and 100");
+            vsapi->mapSetError(out, "Descale: p must be between 1 and 100");
             vsapi->freeNode(d.node);
             free(gs);
             return;
         }
         gs->p /= 10.0;
-        d.kernel_w = d.kernel_h = (kernel_t){gauss_kernel, (double)gs->taps, gs};
+        gs->taps = vsapi->mapGetFloat(in, "taps", 0, &err);
+        if (err) {
+            gs->taps = 4.0;
+        }
+        if (gs->taps == 0.0) {
+            gs->taps = sqrt(4.6 / (gs->p * log(gs->b)));
+        }
+        if (gs->taps < 0.6 || gs->taps > 128.0) {
+            vsapi->mapSetError(out, "Descale: taps must be between 0.6 and 128 or 0 for automatic calculation");
+            vsapi->freeNode(d.node);
+            free(gs);
+            return;
+        }
+        d.kernel_w = d.kernel_h = (kernel_t){gauss_kernel, gs->taps, gs};
     }
     else {
-        vsapi->mapSetError(out, "Resize: invalid kernel specified");
+        vsapi->mapSetError(out, "Descale: invalid kernel specified");
         vsapi->freeNode(d.node);
         return;
     }
@@ -3059,7 +3083,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
                              "kernel:data:opt;"
                              "b:float:opt;"
                              "c:float:opt;"
-                             "taps:int:opt;"
+                             "taps:float:opt;"
                              "gamma:data:opt;"
                              "sharp:float:opt;",
                              "clip:vnode;",
@@ -3077,7 +3101,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
                              "kernel:data:opt;"
                              "b:float:opt;"
                              "c:float:opt;"
-                             "taps:int:opt;"
+                             "taps:float:opt;"
                              "lambda:float:opt;",
                              "clip:vnode;",
                              DescaleCreate,
