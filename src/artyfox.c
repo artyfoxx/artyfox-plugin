@@ -1292,7 +1292,7 @@ static const VSFrame *VS_CC ResizeGetFrame(
             range = false;
         }
         else if (err) {
-            range = (fi->colorFamily == cfRGB) ? false : true;
+            range = (fi->colorFamily != cfRGB);
         }
         
         csr_t chroma_w, chroma_h;
@@ -1584,6 +1584,7 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData UNUSE
         d.gamma = (GammaData){1.0 / 0.45, 0.0913f, 0.0228f, 0.1115f, 4.0f, false};
     }
     else if (!strcmp(gamma, "none")) {
+        d.gamma = (GammaData){1.0, 0.0f, 0.0f, 0.0f, 1.0f, false};
         d.linear = false;
     }
     else {
@@ -1771,8 +1772,8 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData UNUSE
         return;
     }
     
-    d.process_w = (d.dst_width == d.vi.width && d.real_w == d.vi.width && d.start_w == 0.0) ? false : true;
-    d.process_h = (d.dst_height == d.vi.height && d.real_h == d.vi.height && d.start_h == 0.0) ? false : true;
+    d.process_w = (d.dst_width != d.vi.width || d.real_w != d.vi.width || d.start_w != 0.0);
+    d.process_h = (d.dst_height != d.vi.height || d.real_h != d.vi.height || d.start_h != 0.0);
     
     if (d.process_w) {
         d.luma_w = csr_get_weights(d.kernel_w, d.vi.width, d.dst_width, d.start_w, d.real_w);
@@ -2563,8 +2564,8 @@ static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData UNUS
         return;
     }
     
-    d.process_w = (d.dst_width == d.vi.width && d.real_w == d.dst_width && d.start_w == 0.0) ? false : true;
-    d.process_h = (d.dst_height == d.vi.height && d.real_h == d.dst_height && d.start_h == 0.0) ? false : true;
+    d.process_w = (d.dst_width != d.vi.width || d.real_w != d.dst_width || d.start_w != 0.0);
+    d.process_h = (d.dst_height != d.vi.height || d.real_h != d.dst_height || d.start_h != 0.0);
     
     if (d.process_w) {
         csr_t temp = csr_get_weights(d.kernel_w, d.dst_width, d.vi.width, d.start_w, d.real_w);
@@ -2617,8 +2618,6 @@ typedef struct {
     int plane;
     bool norm;
 } MeanData;
-
-#define VCLAMP_PS(v, min, max) _mm256_max_ps(_mm256_min_ps(v, max), min)
 
 static frame_stats get_arithmetic_mean_8(
     const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride
@@ -2736,26 +2735,26 @@ static frame_stats get_arithmetic_mean_32(
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
     __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
     
-    __m256 vmin = _mm256_setzero_ps();
-    __m256 vmax = _mm256_set1_ps(1.0f);
-    __m256 accl = _mm256_set1_ps(1.0f);
-    __m256 acch = _mm256_setzero_ps();
+    __m256 vmin = _mm256_set1_ps(-3.40282347e+38f);
+    __m256 vmax = _mm256_set1_ps(3.40282347e+38f);
+    __m256 accl = _mm256_set1_ps(3.40282347e+38f);
+    __m256 acch = _mm256_set1_ps(-3.40282347e+38f);
     __m256d acc0 = _mm256_setzero_pd();
     __m256d acc1 = _mm256_setzero_pd();
     
     for (int y = 0; y < src_h; y++) {
         int x = 0;
         for (; x < mod8_w; x += 8) {
-            __m256 pix = VCLAMP_PS(_mm256_load_ps(ptr + x), vmin, vmax);
+            __m256 pix = _mm256_load_ps(ptr + x);
             accl = _mm256_min_ps(accl, pix);
             acch = _mm256_max_ps(acch, pix);
             acc0 = _mm256_add_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), acc0);
             acc1 = _mm256_add_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), acc1);
         }
         if (tail) {
-            __m256 pix = VCLAMP_PS(_mm256_maskload_ps(ptr + x, tail_mask), vmin, vmax);
+            __m256 pix = _mm256_maskload_ps(ptr + x, tail_mask);
             accl = _mm256_min_ps(accl, _mm256_blendv_ps(vmax, pix, _mm256_castsi256_ps(tail_mask)));
-            acch = _mm256_max_ps(acch, pix);
+            acch = _mm256_max_ps(acch, _mm256_blendv_ps(vmin, pix, _mm256_castsi256_ps(tail_mask)));
             acc0 = _mm256_add_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), acc0);
             acc1 = _mm256_add_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), acc1);
         }
@@ -2970,27 +2969,29 @@ static frame_stats get_geometric_mean_32(
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
     __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
     
-    __m256 vmin = _mm256_setzero_ps();
-    __m256 vmax = _mm256_set1_ps(1.0f);
-    __m256 accl = _mm256_set1_ps(1.0f);
-    __m256 acch = _mm256_setzero_ps();
+    __m256 vmin = _mm256_set1_ps(-3.40282347e+38f);
+    __m256 vmax = _mm256_set1_ps(3.40282347e+38f);
+    __m256 accl = _mm256_set1_ps(3.40282347e+38f);
+    __m256 acch = _mm256_set1_ps(-3.40282347e+38f);
+    __m256 vone = _mm256_set1_ps(1.0f);
     __m256d acc0 = _mm256_setzero_pd();
     __m256d acc1 = _mm256_setzero_pd();
+    
     
     for (int y = 0; y < src_h; y++) {
         int x = 0;
         for (; x < mod8_w; x += 8) {
-            __m256 pix = VCLAMP_PS(_mm256_load_ps(ptr + x), vmin, vmax);
+            __m256 pix = _mm256_load_ps(ptr + x);
             accl = _mm256_min_ps(accl, pix);
             acch = _mm256_max_ps(acch, pix);
             acc0 = _mm256_add_pd(ffast_log(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0))), acc0);
             acc1 = _mm256_add_pd(ffast_log(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1))), acc1);
         }
         if (tail) {
-            __m256 pix = VCLAMP_PS(_mm256_maskload_ps(ptr + x, tail_mask), vmin, vmax);
-            acch = _mm256_max_ps(acch, pix);
-            pix = _mm256_blendv_ps(vmax, pix, _mm256_castsi256_ps(tail_mask));
-            accl = _mm256_min_ps(accl, pix);
+            __m256 pix = _mm256_maskload_ps(ptr + x, tail_mask);
+            accl = _mm256_min_ps(accl, _mm256_blendv_ps(vmax, pix, _mm256_castsi256_ps(tail_mask)));
+            acch = _mm256_max_ps(acch, _mm256_blendv_ps(vmin, pix, _mm256_castsi256_ps(tail_mask)));
+            pix = _mm256_blendv_ps(vone, pix, _mm256_castsi256_ps(tail_mask));
             acc0 = _mm256_add_pd(ffast_log(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0))), acc0);
             acc1 = _mm256_add_pd(ffast_log(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1))), acc1);
         }
@@ -3015,7 +3016,7 @@ static frame_stats get_geometric_mean_32(
 
 // Complete elliptic integral of the first kind
 // Based on: "Fast computation of complete elliptic integrals and Jacobian elliptic functions" by Toshio Fukushima, 2009
-// 0.0 is used instead of inf and nan.
+// 1.7976931348623157e+308 is used instead of inf and nan.
 static double ellipk(double x) {
     if (x < 0.0) {
         return ellipk(x / (x - 1.0)) / sqrt(1.0 - x);
@@ -3225,7 +3226,7 @@ static double ellipk(double x) {
     //     return __builtin_inf();
     // }
     // return __builtin_nan("");
-    return 0.0;
+    return 1.7976931348623157e+308;
 }
 
 static frame_stats get_arithmetic_geometric_mean_8(
@@ -3419,10 +3420,10 @@ static frame_stats get_harmonic_mean_32(
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
     __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
     
-    __m256 vmin = _mm256_setzero_ps();
-    __m256 vmax = _mm256_set1_ps(1.0f);
-    __m256 accl = _mm256_set1_ps(1.0f);
-    __m256 acch = _mm256_setzero_ps();
+    __m256 vmin = _mm256_set1_ps(-3.40282347e+38f);
+    __m256 vmax = _mm256_set1_ps(3.40282347e+38f);
+    __m256 accl = _mm256_set1_ps(3.40282347e+38f);
+    __m256 acch = _mm256_set1_ps(-3.40282347e+38f);
     __m256 vlow = _mm256_set1_ps(1e-16f);
     __m256d acc0 = _mm256_setzero_pd();
     __m256d acc1 = _mm256_setzero_pd();
@@ -3430,7 +3431,7 @@ static frame_stats get_harmonic_mean_32(
     for (int y = 0; y < src_h; y++) {
         int x = 0;
         for (; x < mod8_w; x += 8) {
-            __m256 pix = VCLAMP_PS(_mm256_load_ps(ptr + x), vmin, vmax);
+            __m256 pix = _mm256_load_ps(ptr + x);
             accl = _mm256_min_ps(accl, pix);
             acch = _mm256_max_ps(acch, pix);
             pix = _mm256_max_ps(pix, vlow);
@@ -3438,9 +3439,9 @@ static frame_stats get_harmonic_mean_32(
             acc1 = _mm256_add_pd(ffast_rcp(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1))), acc1);
         }
         if (tail) {
-            __m256 pix = VCLAMP_PS(_mm256_maskload_ps(ptr + x, tail_mask), vmin, vmax);
+            __m256 pix = _mm256_maskload_ps(ptr + x, tail_mask);
             accl = _mm256_min_ps(accl, _mm256_blendv_ps(vmax, pix, _mm256_castsi256_ps(tail_mask)));
-            acch = _mm256_max_ps(acch, pix);
+            acch = _mm256_max_ps(acch, _mm256_blendv_ps(vmin, pix, _mm256_castsi256_ps(tail_mask)));
             pix = _mm256_and_ps(_mm256_max_ps(pix, vlow), _mm256_castsi256_ps(tail_mask));
             acc0 = _mm256_add_pd(ffast_rcp(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0))), acc0);
             acc1 = _mm256_add_pd(ffast_rcp(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1))), acc1);
@@ -3609,22 +3610,20 @@ static frame_stats get_contraharmonic_mean_32(
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
     __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
     
-    __m256 vmin = _mm256_setzero_ps();
-    __m256 vmax = _mm256_set1_ps(1.0f);
     __m256d acc0 = _mm256_setzero_pd();
     __m256d acc1 = _mm256_setzero_pd();
     
     for (int y = 0; y < src_h; y++) {
         int x = 0;
         for (; x < mod8_w; x += 8) {
-            __m256 pix = VCLAMP_PS(_mm256_load_ps(ptr + x), vmin, vmax);
+            __m256 pix = _mm256_load_ps(ptr + x);
             __m256d temp0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0));
             __m256d temp1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1));
             acc0 = _mm256_fmadd_pd(temp0, temp0, acc0);
             acc1 = _mm256_fmadd_pd(temp1, temp1, acc1);
         }
         if (tail) {
-            __m256 pix = VCLAMP_PS(_mm256_maskload_ps(ptr + x, tail_mask), vmin, vmax);
+            __m256 pix = _mm256_maskload_ps(ptr + x, tail_mask);
             __m256d temp0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0));
             __m256d temp1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1));
             acc0 = _mm256_fmadd_pd(temp0, temp0, acc0);
@@ -3812,17 +3811,17 @@ static frame_stats get_root_mean_square_32(
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
     __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
     
-    __m256 vmin = _mm256_setzero_ps();
-    __m256 vmax = _mm256_set1_ps(1.0f);
-    __m256 accl = _mm256_set1_ps(1.0f);
-    __m256 acch = _mm256_setzero_ps();
+    __m256 vmin = _mm256_set1_ps(-3.40282347e+38f);
+    __m256 vmax = _mm256_set1_ps(3.40282347e+38f);
+    __m256 accl = _mm256_set1_ps(3.40282347e+38f);
+    __m256 acch = _mm256_set1_ps(-3.40282347e+38f);
     __m256d acc0 = _mm256_setzero_pd();
     __m256d acc1 = _mm256_setzero_pd();
     
     for (int y = 0; y < src_h; y++) {
         int x = 0;
         for (; x < mod8_w; x += 8) {
-            __m256 pix = VCLAMP_PS(_mm256_load_ps(ptr + x), vmin, vmax);
+            __m256 pix = _mm256_load_ps(ptr + x);
             accl = _mm256_min_ps(accl, pix);
             acch = _mm256_max_ps(acch, pix);
             __m256d temp0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0));
@@ -3831,9 +3830,9 @@ static frame_stats get_root_mean_square_32(
             acc1 = _mm256_fmadd_pd(temp1, temp1, acc1);
         }
         if (tail) {
-            __m256 pix = VCLAMP_PS(_mm256_maskload_ps(ptr + x, tail_mask), vmin, vmax);
+            __m256 pix = _mm256_maskload_ps(ptr + x, tail_mask);
             accl = _mm256_min_ps(accl, _mm256_blendv_ps(vmax, pix, _mm256_castsi256_ps(tail_mask)));
-            acch = _mm256_max_ps(acch, pix);
+            acch = _mm256_max_ps(acch, _mm256_blendv_ps(vmin, pix, _mm256_castsi256_ps(tail_mask)));
             __m256d temp0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0));
             __m256d temp1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1));
             acc0 = _mm256_fmadd_pd(temp0, temp0, acc0);
@@ -4029,17 +4028,17 @@ static frame_stats get_root_mean_cube_32(
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
     __m256i tail_mask = _mm256_loadu_si256((__m256i *)mask_arr);
     
-    __m256 vmin = _mm256_setzero_ps();
-    __m256 vmax = _mm256_set1_ps(1.0f);
-    __m256 accl = _mm256_set1_ps(1.0f);
-    __m256 acch = _mm256_setzero_ps();
+    __m256 vmin = _mm256_set1_ps(-3.40282347e+38f);
+    __m256 vmax = _mm256_set1_ps(3.40282347e+38f);
+    __m256 accl = _mm256_set1_ps(3.40282347e+38f);
+    __m256 acch = _mm256_set1_ps(-3.40282347e+38f);
     __m256d acc0 = _mm256_setzero_pd();
     __m256d acc1 = _mm256_setzero_pd();
     
     for (int y = 0; y < src_h; y++) {
         int x = 0;
         for (; x < mod8_w; x += 8) {
-            __m256 pix = VCLAMP_PS(_mm256_load_ps(ptr + x), vmin, vmax);
+            __m256 pix = _mm256_load_ps(ptr + x);
             accl = _mm256_min_ps(accl, pix);
             acch = _mm256_max_ps(acch, pix);
             __m256d temp0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0));
@@ -4048,9 +4047,9 @@ static frame_stats get_root_mean_cube_32(
             acc1 = _mm256_fmadd_pd(_mm256_mul_pd(temp1, temp1), temp1, acc1);
         }
         if (tail) {
-            __m256 pix = VCLAMP_PS(_mm256_maskload_ps(ptr + x, tail_mask), vmin, vmax);
+            __m256 pix = _mm256_maskload_ps(ptr + x, tail_mask);
             accl = _mm256_min_ps(accl, _mm256_blendv_ps(vmax, pix, _mm256_castsi256_ps(tail_mask)));
-            acch = _mm256_max_ps(acch, pix);
+            acch = _mm256_max_ps(acch, _mm256_blendv_ps(vmin, pix, _mm256_castsi256_ps(tail_mask)));
             __m256d temp0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0));
             __m256d temp1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1));
             acc0 = _mm256_fmadd_pd(_mm256_mul_pd(temp0, temp0), temp0, acc0);
@@ -4165,22 +4164,21 @@ static float castuf32(uint32_t x) {
         uint32_t u;
         float f;
     } uf32;
-    uf32.u = x;
+    uf32.u = (x & 0x80000000) ? (x & 0x7fffffff) : ~x;
     return uf32.f;
 }
 
 static frame_stats get_median_32(
     const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride
 ) {
-    uint32_t accl = 0x3f800000, acch = 0;
+    uint32_t accl = 0xffffffff, acch = 0;
     uint64_t *hist = (uint64_t *)calloc(65536, sizeof(uint64_t));
     const uint32_t *restrict ptr = srcp;
     
     for (int y = 0; y < src_h; y++) {
         for (int x = 0; x < src_w; x++) {
             uint32_t idx = ptr[x];
-            if (idx & 0x80000000) idx = 0;
-            if (idx > 0x3f800000) idx = 0x3f800000;
+            idx = (idx & 0x80000000) ? ~idx : (idx | 0x80000000);
             if (idx < accl) accl = idx;
             if (idx > acch) acch = idx;
             hist[(idx & 0xffff0000) >> 16]++;
@@ -4210,8 +4208,7 @@ static frame_stats get_median_32(
         for (int y = 0; y < src_h; y++) {
             for (int x = 0; x < src_w; x++) {
                 uint32_t idx = ptr[x];
-                if (idx & 0x80000000) idx = 0;
-                if (idx > 0x3f800000) idx = 0x3f800000;
+                idx = (idx & 0x80000000) ? ~idx : (idx | 0x80000000);
                 uint32_t idx_high = idx & 0xffff0000, idx_low = idx & 0x0000ffff;
                 if (median_high == idx_high && median_max < idx_low) median_max = idx_low;
                 if (median_next == idx_high && median_min > idx_low) median_min = idx_low;
@@ -4229,8 +4226,7 @@ static frame_stats get_median_32(
         for (int y = 0; y < src_h; y++) {
             for (int x = 0; x < src_w; x++) {
                 uint32_t idx = ptr[x];
-                if (idx & 0x80000000) idx = 0;
-                if (idx > 0x3f800000) idx = 0x3f800000;
+                idx = (idx & 0x80000000) ? ~idx : (idx | 0x80000000);
                 uint32_t idx_high = idx & 0xffff0000, idx_low = idx & 0x0000ffff;
                 if (median_high == idx_high) hist[idx_low]++;
                 if (median_high > idx) count++;
@@ -4415,8 +4411,6 @@ static frame_stats get_linear_interp_msad_32(
     __m256d sub_mask0 = _mm256_castsi256_pd(_mm256_cvtepi32_epi64(_mm256_extracti128_si256(tail_mask, 0)));
     __m256d sub_mask1 = _mm256_castsi256_pd(_mm256_cvtepi32_epi64(_mm256_extracti128_si256(tail_mask, 1)));
     
-    __m256 vmin = _mm256_setzero_ps();
-    __m256 vmax = _mm256_set1_ps(1.0f);
     __m256d vone = _mm256_set1_pd(1.0);
     __m256d accl = _mm256_set1_pd(1.0);
     __m256d acch = _mm256_setzero_pd();
@@ -4428,9 +4422,9 @@ static frame_stats get_linear_interp_msad_32(
     for (int y = 0; y < src_h - 2; y++) {
         int x = 0;
         for (; x < mod8_w; x += 8) {
-            __m256 pix0 = VCLAMP_PS(_mm256_load_ps(ptr + stride * 0 + x), vmin, vmax);
-            __m256 pix1 = VCLAMP_PS(_mm256_load_ps(ptr + stride * 1 + x), vmin, vmax);
-            __m256 pix2 = VCLAMP_PS(_mm256_load_ps(ptr + stride * 2 + x), vmin, vmax);
+            __m256 pix0 = _mm256_load_ps(ptr + stride * 0 + x);
+            __m256 pix1 = _mm256_load_ps(ptr + stride * 1 + x);
+            __m256 pix2 = _mm256_load_ps(ptr + stride * 2 + x);
             __m256d temp0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 0));
             __m256d temp1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 1));
             temp0 = _mm256_mul_pd(_mm256_add_pd(temp0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix2, 0))), vmul);
@@ -4445,9 +4439,9 @@ static frame_stats get_linear_interp_msad_32(
             acc1 = _mm256_add_pd(temp1, acc1);
         }
         if (tail) {
-            __m256 pix0 = VCLAMP_PS(_mm256_maskload_ps(ptr + stride * 0 + x, tail_mask), vmin, vmax);
-            __m256 pix1 = VCLAMP_PS(_mm256_maskload_ps(ptr + stride * 1 + x, tail_mask), vmin, vmax);
-            __m256 pix2 = VCLAMP_PS(_mm256_maskload_ps(ptr + stride * 2 + x, tail_mask), vmin, vmax);
+            __m256 pix0 = _mm256_maskload_ps(ptr + stride * 0 + x, tail_mask);
+            __m256 pix1 = _mm256_maskload_ps(ptr + stride * 1 + x, tail_mask);
+            __m256 pix2 = _mm256_maskload_ps(ptr + stride * 2 + x, tail_mask);
             __m256d temp0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 0));
             __m256d temp1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 1));
             temp0 = _mm256_mul_pd(_mm256_add_pd(temp0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix2, 0))), vmul);
@@ -4639,6 +4633,8 @@ typedef struct {
     VSNode *node1;
     metric_t metric;
 } MetricData;
+
+#define VCLAMP_PS(v, min, max) _mm256_max_ps(_mm256_min_ps(v, max), min)
 
 static double get_relative_error(
     const float *restrict srcp0, const float *restrict srcp1, int src_w, int src_h, ptrdiff_t stride
@@ -5462,7 +5458,7 @@ static const VSFrame *VS_CC BitDepthGetFrame(
             range = false;
         }
         else if (err) {
-            range = (fi->colorFamily == cfRGB) ? false : true;
+            range = (fi->colorFamily != cfRGB);
         }
         
         for (int plane = 0; plane < fi->numPlanes; plane++) {
@@ -5546,7 +5542,6 @@ static void VS_CC BitDepthCreate(
     
     int err;
     d.direct = !!vsapi->mapGetIntSaturated(in, "direct", 0, &err);
-    
     if (err) {
         d.direct = false;
     }

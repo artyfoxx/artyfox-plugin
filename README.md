@@ -60,13 +60,13 @@ Descaling via Tikhonov regularization and Cholesky decomposition (U.T @ U) using
 ## Mean
 `artyfox.Mean(clip clip[, str mode='am', int plane=0, bool norm=True])`
 
-Calculates the `minimum`, `maximum` and the set mean value for the specified plane of each frame of the clip and stores them in the frame properties. For 32-bit float sample type, the input range is always clamped to 0:1.
+Calculates the `minimum`, `maximum` and the set mean value for the specified plane of each frame of the clip and stores them in the frame properties. For the 32-bit float sample type, negative pixel values ​​are handled correctly in the `am`, `median`, and `limsad` modes; the other modes are not suitable for this usage case due to the mathematics used.
 * `clip`: Original clip. Must be RGB, YUV or GRAY. 8-16-bit integer or 32-bit float sample type.
 * `mode`: Algorithm for finding the mean value of a frame plane. Can take the following values:
   * `am`: Arithmetic mean (`arithmetic_mean`). Used by default.
-  * `gm`: Geometric mean (`geometric_mean`).
+  * `gm`: Geometric mean (`geometric_mean`). Vector log is implemented without any checks; if x<=0, it returns incorrect results, so it is necessary to manually limit the input range.
   * `agm`: Arithmetic-geometric mean (`arithmetic_geometric_mean`).
-  * `hm`: Harmonic mean (`harmonic_mean`). Since division by zero is not possible, the lower range for integer is limited to `1`, and for float to `1e-16`.
+  * `hm`: Harmonic mean (`harmonic_mean`). Since division by zero is inf, the lower range for integer is limited to `1`, and for float to `1e-16`.
   * `chm`: Contraharmonic mean (`contraharmonic_mean`).
   * `rms`: Root mean square (`root_mean_square`).
   * `rmc`: Root mean cube (`root_mean_cube`).
