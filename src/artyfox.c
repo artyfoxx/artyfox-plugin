@@ -4537,7 +4537,23 @@ static void VS_CC MeanCreate(
         return;
     }
     
+    if (vi.width < 1 || vi.height < 1) {
+        vsapi->mapSetError(out, "Mean: the width and height of the frame cannot be less than 1");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
     int err;
+    d.plane = vsapi->mapGetIntSaturated(in, "plane", 0, &err);
+    if (err) {
+        d.plane = 0;
+    }
+    if (d.plane < 0 || d.plane >= vi.format.numPlanes) {
+        vsapi->mapSetError(out, "Mean: plane index out of range");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
     const char *mode = vsapi->mapGetData(in, "mode", 0, &err);
     if (err || !strcmp(mode, "am")) {
         if (vi.format.bytesPerSample == 1) d.mean.f = get_arithmetic_mean_8;
@@ -4588,6 +4604,11 @@ static void VS_CC MeanCreate(
         strcpy(d.mean.name, "median");
     }
     else if (!strcmp(mode, "limsad")) {
+        if ((d.plane ? (vi.height >> vi.format.subSamplingH) : vi.height) < 3) {
+            vsapi->mapSetError(out, "Mean: when mode='limsad' the height of the specified frame plane must be at least 3");
+            vsapi->freeNode(d.node);
+            return;
+        }
         if (vi.format.bytesPerSample == 1) d.mean.f = get_linear_interp_msad_8;
         else if (vi.format.bytesPerSample == 2) d.mean.f = get_linear_interp_msad_16;
         else d.mean.f = get_linear_interp_msad_32;
@@ -4595,16 +4616,6 @@ static void VS_CC MeanCreate(
     }
     else {
         vsapi->mapSetError(out, "Mean: invalid mode specified");
-        vsapi->freeNode(d.node);
-        return;
-    }
-    
-    d.plane = vsapi->mapGetIntSaturated(in, "plane", 0, &err);
-    if (err) {
-        d.plane = 0;
-    }
-    if (d.plane < 0 || d.plane >= vi.format.numPlanes) {
-        vsapi->mapSetError(out, "Mean: plane index out of range");
         vsapi->freeNode(d.node);
         return;
     }
@@ -5249,6 +5260,12 @@ static void VS_CC LinearizeCreate(
         return;
     }
     
+    if (d.vi.width < 1 || d.vi.height < 1) {
+        vsapi->mapSetError(out, "Linearize: the width and height of the frame cannot be less than 1");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
     int err;
     
     const char *gamma = vsapi->mapGetData(in, "gamma", 0, &err);
@@ -5362,6 +5379,12 @@ static void VS_CC GammaCorrCreate(
     
     if (!vsh_isConstantVideoFormat(&d.vi) || d.vi.format.sampleType != stFloat || d.vi.format.bitsPerSample != 32) {
         vsapi->mapSetError(out, "GammaCorr: only constant format 32bit float input supported");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    if (d.vi.width < 1 || d.vi.height < 1) {
+        vsapi->mapSetError(out, "GammaCorr: the width and height of the frame cannot be less than 1");
         vsapi->freeNode(d.node);
         return;
     }
@@ -5502,6 +5525,12 @@ static void VS_CC BitDepthCreate(
         return;
     }
     
+    if (d.vi.width < 1 || d.vi.height < 1) {
+        vsapi->mapSetError(out, "BitDepth: the width and height of the frame cannot be less than 1");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
     int bits = vsapi->mapGetIntSaturated(in, "bits", 0, NULL);
     
     if (bits == d.vi.format.bitsPerSample) {
@@ -5558,7 +5587,7 @@ static void VS_CC BitDepthCreate(
 }
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
-    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(17, 1), VAPOURSYNTH_API_VERSION, 0, plugin);
+    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(17, 2), VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction("Resize",
                              "clip:vnode;"
                              "width:int;"
