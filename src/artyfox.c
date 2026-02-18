@@ -9,7 +9,7 @@
 
 #define ALWAYS_INLINE __attribute__((always_inline))
 #define UNUSED __attribute__((unused))
-#define CLAMP(x, min, max) ((x) > (max) ? (max) : ((x) < (min) ? (min) : (x))) 
+#define CLAMP(x, min, max) ((x) > (max) ? (max) : ((x) < (min) ? (min) : (x)))
 
 typedef double (*kernel_func)(double x, void *ctx);
 
@@ -24,6 +24,8 @@ typedef struct {
     double *values;
     int *col_idx, *row_ptr;
 } csr_t;
+
+typedef csr_t (*csr_get_weights_func)(kernel_t kernel, int src_n, int dst_n, double start_n, double real_n);
 
 typedef struct {
     int col_n, row_n, ku;
@@ -49,6 +51,7 @@ typedef struct {
     kernel_t kernel_w, kernel_h;
     GammaData gamma;
     float sharp;
+    csr_get_weights_func csr_get_weights;
     bool linear, process_w, process_h;
     csr_t luma_w, luma_h;
     convert_func conv_up, conv_down;
@@ -1035,7 +1038,7 @@ static void sharp_height(
     }
 }
 
-static csr_t csr_get_weights(kernel_t kernel, int src_n, int dst_n, double start_n, double real_n) {
+static csr_t csr_get_weights_zero(kernel_t kernel, int src_n, int dst_n, double start_n, double real_n) {
     double factor = dst_n / real_n;
     double scale = fmin(factor, 1.0);
     int min_n = (int)floor(start_n);
@@ -1043,7 +1046,7 @@ static csr_t csr_get_weights(kernel_t kernel, int src_n, int dst_n, double start
     int border = src_n - 1;
     double radius = kernel.radius / scale;
     int step = (int)ceil(radius * 2.0) + 2;
-    double *weights = (double *)malloc(sizeof(double) * step * dst_n);
+    double *weights = (double *)calloc(step * dst_n, sizeof(double));
     int *col_idx = (int *)malloc(sizeof(int) * step * dst_n);
     int *row_ptr = (int *)malloc(sizeof(int) * (dst_n + 1));
     row_ptr[0] = 0;
@@ -1053,20 +1056,112 @@ static csr_t csr_get_weights(kernel_t kernel, int src_n, int dst_n, double start
         double center = (i + 0.5) / factor - 0.5 + start_n;
         int low = VSMAX((int)floor(center - radius), min_n);
         int high = VSMIN((int)ceil(center + radius), max_n);
+        int min_idx = CLAMP(low, 0, border);
+        int max_idx = CLAMP(high, 0, border);
         double norm = 0.0;
         for (int j = low; j <= high; j++) {
             double temp_val = kernel.f((j - center) * scale, kernel.ctx);
-            if (temp_val == 0.0) continue;
+            norm += temp_val;
+            if (j < 0 || j > border) temp_val = 0.0;
+            int temp_idx = CLAMP(j, 0, border);
+            int idx = nnz + (temp_idx - min_idx);
+            weights[idx] += temp_val;
+            col_idx[idx] = temp_idx;
+        }
+        nnz += max_idx - min_idx + 1;
+        for (int j = row_ptr[i]; j < nnz; j++) {
+            weights[j] /= norm;
+        }
+        row_ptr[i + 1] = nnz;
+    }
+    
+    return (csr_t){src_n, dst_n, nnz, weights, col_idx, row_ptr};
+}
+
+static csr_t csr_get_weights_inf(kernel_t kernel, int src_n, int dst_n, double start_n, double real_n) {
+    double factor = dst_n / real_n;
+    double scale = fmin(factor, 1.0);
+    int min_n = (int)floor(start_n);
+    int max_n = (int)ceil(real_n + start_n) - 1;
+    int border = src_n - 1;
+    double radius = kernel.radius / scale;
+    int step = (int)ceil(radius * 2.0) + 2;
+    double *weights = (double *)calloc(step * dst_n, sizeof(double));
+    int *col_idx = (int *)malloc(sizeof(int) * step * dst_n);
+    int *row_ptr = (int *)malloc(sizeof(int) * (dst_n + 1));
+    row_ptr[0] = 0;
+    int nnz = 0;
+    
+    for (int i = 0; i < dst_n; i++) {
+        double center = (i + 0.5) / factor - 0.5 + start_n;
+        int low = VSMAX((int)floor(center - radius), min_n);
+        int high = VSMIN((int)ceil(center + radius), max_n);
+        int min_idx = CLAMP(low, 0, border);
+        int max_idx = CLAMP(high, 0, border);
+        double norm = 0.0;
+        for (int j = low; j <= high; j++) {
+            double temp_val = kernel.f((j - center) * scale, kernel.ctx);
             norm += temp_val;
             int temp_idx = CLAMP(j, 0, border);
-            if (row_ptr[i] != nnz && temp_idx == col_idx[nnz - 1]) {
-                weights[nnz - 1] += temp_val;
-                continue;
-            }
-            weights[nnz] = temp_val;
-            col_idx[nnz] = temp_idx;
-            nnz++;
+            int idx = nnz + (temp_idx - min_idx);
+            weights[idx] += temp_val;
+            col_idx[idx] = temp_idx;
         }
+        nnz += max_idx - min_idx + 1;
+        for (int j = row_ptr[i]; j < nnz; j++) {
+            weights[j] /= norm;
+        }
+        row_ptr[i + 1] = nnz;
+    }
+    
+    return (csr_t){src_n, dst_n, nnz, weights, col_idx, row_ptr};
+}
+
+static int clamp_mirror(int x, int border) {
+    if (x > border) {
+        return clamp_mirror(border - ~(border - x), border);
+    }
+    if (x < 0) {
+        return clamp_mirror(~x, border);
+    }
+    return x;
+}
+
+static csr_t csr_get_weights_mirror(kernel_t kernel, int src_n, int dst_n, double start_n, double real_n) {
+    double factor = dst_n / real_n;
+    double scale = fmin(factor, 1.0);
+    int min_n = (int)floor(start_n);
+    int max_n = (int)ceil(real_n + start_n) - 1;
+    int border = src_n - 1;
+    double radius = kernel.radius / scale;
+    int step = (int)ceil(radius * 2.0) + 2;
+    double *weights = (double *)calloc(step * dst_n, sizeof(double));
+    int *col_idx = (int *)malloc(sizeof(int) * step * dst_n);
+    int *row_ptr = (int *)malloc(sizeof(int) * (dst_n + 1));
+    row_ptr[0] = 0;
+    int nnz = 0;
+    
+    for (int i = 0; i < dst_n; i++) {
+        double center = (i + 0.5) / factor - 0.5 + start_n;
+        int low = VSMAX((int)floor(center - radius), min_n);
+        int high = VSMIN((int)ceil(center + radius), max_n);
+        int min_idx = border;
+        int max_idx = 0;
+		for (int j = low; j <= high; j++) {
+            int temp_idx = clamp_mirror(j, border);
+            if (temp_idx < min_idx) min_idx = temp_idx;
+            if (temp_idx > max_idx) max_idx = temp_idx;
+        }
+        double norm = 0.0;
+        for (int j = low; j <= high; j++) {
+            double temp_val = kernel.f((j - center) * scale, kernel.ctx);
+            norm += temp_val;
+            int temp_idx = clamp_mirror(j, border);
+            int idx = nnz + (temp_idx - min_idx);
+            weights[idx] += temp_val;
+            col_idx[idx] = temp_idx;
+        }
+        nnz += max_idx - min_idx + 1;
         for (int j = row_ptr[i]; j < nnz; j++) {
             weights[j] /= norm;
         }
@@ -1305,7 +1400,7 @@ static const VSFrame *VS_CC ResizeGetFrame(
                 double offset = ((1 << fi->subSamplingW) - 1) / 2.0;
                 start_w += offset / (1 << fi->subSamplingW) - offset * real_w / d->dst_width;
             }
-            chroma_w = csr_get_weights(d->kernel_w, chroma_src_w, chroma_dst_w, start_w, real_w);
+            chroma_w = d->csr_get_weights(d->kernel_w, chroma_src_w, chroma_dst_w, start_w, real_w);
         }
         else {
             chroma_w = (csr_t){0, 0, 0, NULL, NULL, NULL};
@@ -1324,7 +1419,7 @@ static const VSFrame *VS_CC ResizeGetFrame(
                 double offset = ((1 << fi->subSamplingH) - 1) / 2.0;
                 start_h -= offset / (1 << fi->subSamplingH) - offset * real_h / d->dst_height;
             }
-            chroma_h = csr_get_weights(d->kernel_h, chroma_src_h, chroma_dst_h, start_h, real_h);
+            chroma_h = d->csr_get_weights(d->kernel_h, chroma_src_h, chroma_dst_h, start_h, real_h);
         }
         else {
             chroma_h = (csr_t){0, 0, 0, NULL, NULL, NULL};
@@ -1772,18 +1867,34 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData UNUSE
         return;
     }
     
+    const char *confine = vsapi->mapGetData(in, "confine", 0, &err);
+    if (err || !strcmp(confine, "inf")) {
+        d.csr_get_weights = csr_get_weights_inf;
+    }
+    else if (!strcmp(confine, "zero")) {
+        d.csr_get_weights = csr_get_weights_zero;
+    }
+    else if (!strcmp(confine, "mirror")) {
+        d.csr_get_weights = csr_get_weights_mirror;
+    }
+    else {
+        vsapi->mapSetError(out, "Resize: invalid confine specified");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
     d.process_w = (d.dst_width != d.vi.width || d.real_w != d.vi.width || d.start_w != 0.0);
     d.process_h = (d.dst_height != d.vi.height || d.real_h != d.vi.height || d.start_h != 0.0);
     
     if (d.process_w) {
-        d.luma_w = csr_get_weights(d.kernel_w, d.vi.width, d.dst_width, d.start_w, d.real_w);
+        d.luma_w = d.csr_get_weights(d.kernel_w, d.vi.width, d.dst_width, d.start_w, d.real_w);
     }
     else {
         d.luma_w = (csr_t){0, 0, 0, NULL, NULL, NULL};
     }
     
     if (d.process_h) {
-        d.luma_h = csr_get_weights(d.kernel_h, d.vi.height, d.dst_height, d.start_h, d.real_h);
+        d.luma_h = d.csr_get_weights(d.kernel_h, d.vi.height, d.dst_height, d.start_h, d.real_h);
     }
     else {
         d.luma_h = (csr_t){0, 0, 0, NULL, NULL, NULL};
@@ -1820,8 +1931,9 @@ typedef struct {
     VSNode *node;
     VSVideoInfo vi;
     int dst_width, dst_height;
-    double start_w, start_h, real_w, real_h, lambda;
+    double start_w, start_h, real_w, real_h, reg;
     kernel_t kernel_w, kernel_h;
+    csr_get_weights_func csr_get_weights;
     bool process_w, process_h;
     csr_t luma_w, luma_h;
     banded_t luma_b_w, luma_b_h;
@@ -1870,7 +1982,7 @@ static int get_ku_from_csr(csr_t csr) {
     return ku;
 }
 
-static banded_t banded_gramian_from_csr(csr_t csr, double lambda) {
+static banded_t banded_gramian_from_csr(csr_t csr, double reg) {
     int ku = get_ku_from_csr(csr);
     int kf = ku + 1;
     
@@ -1894,7 +2006,7 @@ static banded_t banded_gramian_from_csr(csr_t csr, double lambda) {
     }
     
     for (int i = csr.col_n * ku; i < csr.col_n * kf; i++) {
-        banded[i] += lambda;
+        banded[i] += reg;
     }
     
     return (banded_t){csr.col_n, kf, ku, banded};
@@ -2194,9 +2306,9 @@ static const VSFrame *VS_CC DescaleGetFrame(
                 double offset = ((1 << fi->subSamplingW) - 1) / 2.0;
                 start_w += offset / (1 << fi->subSamplingW) - offset * real_w / d->vi.width;
             }
-            csr_t temp = csr_get_weights(d->kernel_w, chroma_dst_w, chroma_src_w, start_w, real_w);
+            csr_t temp = d->csr_get_weights(d->kernel_w, chroma_dst_w, chroma_src_w, start_w, real_w);
             chroma_w = csr_transpose(temp);
-            chroma_b_w = banded_gramian_from_csr(temp, d->lambda);
+            chroma_b_w = banded_gramian_from_csr(temp, d->reg);
             banded_cholesky_from_gramian(chroma_b_w);
             csr_free(temp);
         }
@@ -2218,9 +2330,9 @@ static const VSFrame *VS_CC DescaleGetFrame(
                 double offset = ((1 << fi->subSamplingH) - 1) / 2.0;
                 start_h -= offset / (1 << fi->subSamplingH) - offset * real_h / d->vi.height;
             }
-            csr_t temp = csr_get_weights(d->kernel_h, chroma_dst_h, chroma_src_h, start_h, real_h);
+            csr_t temp = d->csr_get_weights(d->kernel_h, chroma_dst_h, chroma_src_h, start_h, real_h);
             chroma_h = csr_transpose(temp);
-            chroma_b_h = banded_gramian_from_csr(temp, d->lambda);
+            chroma_b_h = banded_gramian_from_csr(temp, d->reg);
             banded_cholesky_from_gramian(chroma_b_h);
             csr_free(temp);
         }
@@ -2391,13 +2503,13 @@ static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData UNUS
         d.real_h += d.dst_height - d.start_h;
     }
     
-    d.lambda = vsapi->mapGetFloat(in, "lambda", 0, &err);
+    d.reg = vsapi->mapGetFloat(in, "reg", 0, &err);
     if (err) {
-        d.lambda = 1e-4;
+        d.reg = 1e-8;
     }
     
-    if (d.lambda < 1e-16 || d.lambda >= 1.0) {
-        vsapi->mapSetError(out, "Descale: \"lambda\" must be between 1e-16 and 1");
+    if (d.reg < 1e-16 || d.reg >= 1.0) {
+        vsapi->mapSetError(out, "Descale: \"reg\" must be between 1e-16 and 1");
         vsapi->freeNode(d.node);
         return;
     }
@@ -2564,13 +2676,29 @@ static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData UNUS
         return;
     }
     
+    const char *confine = vsapi->mapGetData(in, "confine", 0, &err);
+    if (err || !strcmp(confine, "inf")) {
+        d.csr_get_weights = csr_get_weights_inf;
+    }
+    else if (!strcmp(confine, "zero")) {
+        d.csr_get_weights = csr_get_weights_zero;
+    }
+    else if (!strcmp(confine, "mirror")) {
+        d.csr_get_weights = csr_get_weights_mirror;
+    }
+    else {
+        vsapi->mapSetError(out, "Descale: invalid confine specified");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
     d.process_w = (d.dst_width != d.vi.width || d.real_w != d.dst_width || d.start_w != 0.0);
     d.process_h = (d.dst_height != d.vi.height || d.real_h != d.dst_height || d.start_h != 0.0);
     
     if (d.process_w) {
-        csr_t temp = csr_get_weights(d.kernel_w, d.dst_width, d.vi.width, d.start_w, d.real_w);
+        csr_t temp = d.csr_get_weights(d.kernel_w, d.dst_width, d.vi.width, d.start_w, d.real_w);
         d.luma_w = csr_transpose(temp);
-        d.luma_b_w = banded_gramian_from_csr(temp, d.lambda);
+        d.luma_b_w = banded_gramian_from_csr(temp, d.reg);
         banded_cholesky_from_gramian(d.luma_b_w);
         csr_free(temp);
     }
@@ -2580,9 +2708,9 @@ static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData UNUS
     }
     
     if (d.process_h) {
-        csr_t temp = csr_get_weights(d.kernel_h, d.dst_height, d.vi.height, d.start_h, d.real_h);
+        csr_t temp = d.csr_get_weights(d.kernel_h, d.dst_height, d.vi.height, d.start_h, d.real_h);
         d.luma_h = csr_transpose(temp);
-        d.luma_b_h = banded_gramian_from_csr(temp, d.lambda);
+        d.luma_b_h = banded_gramian_from_csr(temp, d.reg);
         banded_cholesky_from_gramian(d.luma_b_h);
         csr_free(temp);
     }
@@ -4632,7 +4760,9 @@ static void VS_CC MeanCreate(
     vsapi->createVideoFilter(out, "Mean", &vi, MeanGetFrame, MeanFree, fmParallel, deps, 1, data, core);
 }
 
-typedef double (*metric_func)(const float *restrict srcp0, const float *restrict srcp1, int src_w, int src_h, ptrdiff_t stride);
+typedef double (*metric_func)(
+    const float *restrict srcp0, const float *restrict srcp1, int src_w, int src_h, ptrdiff_t stride, double thr
+);
 
 typedef struct {
     metric_func f;
@@ -4643,12 +4773,13 @@ typedef struct {
     VSNode *node0;
     VSNode *node1;
     metric_t metric;
+    double thr;
 } MetricData;
 
 #define VCLAMP_PS(v, min, max) _mm256_max_ps(_mm256_min_ps(v, max), min)
 
 static double get_relative_error(
-    const float *restrict srcp0, const float *restrict srcp1, int src_w, int src_h, ptrdiff_t stride
+    const float *restrict srcp0, const float *restrict srcp1, int src_w, int src_h, ptrdiff_t stride, double thr
 ) {
     int tail = src_w % 8;
     int mod8_w = src_w - tail;
@@ -4659,6 +4790,8 @@ static double get_relative_error(
     
     __m256 vmin = _mm256_setzero_ps();
     __m256 vmax = _mm256_set1_ps(1.0f);
+    __m256d vabs = _mm256_castsi256_pd(_mm256_set1_epi64x(0x7fffffffffffffff));
+    __m256d vthr = _mm256_set1_pd(thr);
     __m256d acc0 = _mm256_setzero_pd();
     __m256d acc1 = _mm256_setzero_pd();
     __m256d acc2 = _mm256_setzero_pd();
@@ -4671,8 +4804,10 @@ static double get_relative_error(
             __m256 pix1 = VCLAMP_PS(_mm256_load_ps(srcp1 + x), vmin, vmax);
             __m256d pix0_0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 0));
             __m256d pix0_1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 1));
-            __m256d sub0 = _mm256_sub_pd(pix0_0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 0)));
-            __m256d sub1 = _mm256_sub_pd(pix0_1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 1)));
+            __m256d sub0 = _mm256_and_pd(_mm256_sub_pd(pix0_0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 0))), vabs);
+            __m256d sub1 = _mm256_and_pd(_mm256_sub_pd(pix0_1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 1))), vabs);
+            sub0 = _mm256_and_pd(_mm256_cmp_pd(sub0, vthr, _CMP_GT_OQ), sub0);
+            sub1 = _mm256_and_pd(_mm256_cmp_pd(sub1, vthr, _CMP_GT_OQ), sub1);
             acc0 = _mm256_fmadd_pd(sub0, sub0, acc0);
             acc1 = _mm256_fmadd_pd(sub1, sub1, acc1);
             acc2 = _mm256_fmadd_pd(pix0_0, pix0_0, acc2);
@@ -4683,8 +4818,10 @@ static double get_relative_error(
             __m256 pix1 = VCLAMP_PS(_mm256_maskload_ps(srcp1 + x, tail_mask), vmin, vmax);
             __m256d pix0_0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 0));
             __m256d pix0_1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 1));
-            __m256d sub0 = _mm256_sub_pd(pix0_0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 0)));
-            __m256d sub1 = _mm256_sub_pd(pix0_1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 1)));
+            __m256d sub0 = _mm256_and_pd(_mm256_sub_pd(pix0_0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 0))), vabs);
+            __m256d sub1 = _mm256_and_pd(_mm256_sub_pd(pix0_1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 1))), vabs);
+            sub0 = _mm256_and_pd(_mm256_cmp_pd(sub0, vthr, _CMP_GT_OQ), sub0);
+            sub1 = _mm256_and_pd(_mm256_cmp_pd(sub1, vthr, _CMP_GT_OQ), sub1);
             acc0 = _mm256_fmadd_pd(sub0, sub0, acc0);
             acc1 = _mm256_fmadd_pd(sub1, sub1, acc1);
             acc2 = _mm256_fmadd_pd(pix0_0, pix0_0, acc2);
@@ -4705,7 +4842,7 @@ static double get_relative_error(
 }
 
 static double get_rmse(
-    const float *restrict srcp0, const float *restrict srcp1, int src_w, int src_h, ptrdiff_t stride
+    const float *restrict srcp0, const float *restrict srcp1, int src_w, int src_h, ptrdiff_t stride, double thr
 ) {
     int tail = src_w % 8;
     int mod8_w = src_w - tail;
@@ -4716,6 +4853,8 @@ static double get_rmse(
     
     __m256 vmin = _mm256_setzero_ps();
     __m256 vmax = _mm256_set1_ps(1.0f);
+    __m256d vabs = _mm256_castsi256_pd(_mm256_set1_epi64x(0x7fffffffffffffff));
+    __m256d vthr = _mm256_set1_pd(thr);
     __m256d acc0 = _mm256_setzero_pd();
     __m256d acc1 = _mm256_setzero_pd();
     
@@ -4726,8 +4865,10 @@ static double get_rmse(
             __m256 pix1 = VCLAMP_PS(_mm256_load_ps(srcp1 + x), vmin, vmax);
             __m256d temp0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 0));
             __m256d temp1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 1));
-            temp0 = _mm256_sub_pd(temp0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 0)));
-            temp1 = _mm256_sub_pd(temp1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 1)));
+            temp0 = _mm256_and_pd(_mm256_sub_pd(temp0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 0))), vabs);
+            temp1 = _mm256_and_pd(_mm256_sub_pd(temp1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 1))), vabs);
+            temp0 = _mm256_and_pd(_mm256_cmp_pd(temp0, vthr, _CMP_GT_OQ), temp0);
+            temp1 = _mm256_and_pd(_mm256_cmp_pd(temp1, vthr, _CMP_GT_OQ), temp1);
             acc0 = _mm256_fmadd_pd(temp0, temp0, acc0);
             acc1 = _mm256_fmadd_pd(temp1, temp1, acc1);
         }
@@ -4736,8 +4877,10 @@ static double get_rmse(
             __m256 pix1 = VCLAMP_PS(_mm256_maskload_ps(srcp1 + x, tail_mask), vmin, vmax);
             __m256d temp0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 0));
             __m256d temp1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 1));
-            temp0 = _mm256_sub_pd(temp0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 0)));
-            temp1 = _mm256_sub_pd(temp1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 1)));
+            temp0 = _mm256_and_pd(_mm256_sub_pd(temp0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 0))), vabs);
+            temp1 = _mm256_and_pd(_mm256_sub_pd(temp1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 1))), vabs);
+            temp0 = _mm256_and_pd(_mm256_cmp_pd(temp0, vthr, _CMP_GT_OQ), temp0);
+            temp1 = _mm256_and_pd(_mm256_cmp_pd(temp1, vthr, _CMP_GT_OQ), temp1);
             acc0 = _mm256_fmadd_pd(temp0, temp0, acc0);
             acc1 = _mm256_fmadd_pd(temp1, temp1, acc1);
         }
@@ -4753,7 +4896,7 @@ static double get_rmse(
 }
 
 static double get_psnr(
-    const float *restrict srcp0, const float *restrict srcp1, int src_w, int src_h, ptrdiff_t stride
+    const float *restrict srcp0, const float *restrict srcp1, int src_w, int src_h, ptrdiff_t stride, double thr
 ) {
     int tail = src_w % 8;
     int mod8_w = src_w - tail;
@@ -4764,6 +4907,8 @@ static double get_psnr(
     
     __m256 vmin = _mm256_setzero_ps();
     __m256 vmax = _mm256_set1_ps(1.0f);
+    __m256d vabs = _mm256_castsi256_pd(_mm256_set1_epi64x(0x7fffffffffffffff));
+    __m256d vthr = _mm256_set1_pd(thr);
     __m256d acc0 = _mm256_setzero_pd();
     __m256d acc1 = _mm256_setzero_pd();
     
@@ -4774,8 +4919,10 @@ static double get_psnr(
             __m256 pix1 = VCLAMP_PS(_mm256_load_ps(srcp1 + x), vmin, vmax);
             __m256d temp0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 0));
             __m256d temp1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 1));
-            temp0 = _mm256_sub_pd(temp0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 0)));
-            temp1 = _mm256_sub_pd(temp1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 1)));
+            temp0 = _mm256_and_pd(_mm256_sub_pd(temp0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 0))), vabs);
+            temp1 = _mm256_and_pd(_mm256_sub_pd(temp1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 1))), vabs);
+            temp0 = _mm256_and_pd(_mm256_cmp_pd(temp0, vthr, _CMP_GT_OQ), temp0);
+            temp1 = _mm256_and_pd(_mm256_cmp_pd(temp1, vthr, _CMP_GT_OQ), temp1);
             acc0 = _mm256_fmadd_pd(temp0, temp0, acc0);
             acc1 = _mm256_fmadd_pd(temp1, temp1, acc1);
         }
@@ -4784,8 +4931,10 @@ static double get_psnr(
             __m256 pix1 = VCLAMP_PS(_mm256_maskload_ps(srcp1 + x, tail_mask), vmin, vmax);
             __m256d temp0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 0));
             __m256d temp1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 1));
-            temp0 = _mm256_sub_pd(temp0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 0)));
-            temp1 = _mm256_sub_pd(temp1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 1)));
+            temp0 = _mm256_and_pd(_mm256_sub_pd(temp0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 0))), vabs);
+            temp1 = _mm256_and_pd(_mm256_sub_pd(temp1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 1))), vabs);
+            temp0 = _mm256_and_pd(_mm256_cmp_pd(temp0, vthr, _CMP_GT_OQ), temp0);
+            temp1 = _mm256_and_pd(_mm256_cmp_pd(temp1, vthr, _CMP_GT_OQ), temp1);
             acc0 = _mm256_fmadd_pd(temp0, temp0, acc0);
             acc1 = _mm256_fmadd_pd(temp1, temp1, acc1);
         }
@@ -4801,7 +4950,7 @@ static double get_psnr(
 }
 
 static double get_msad(
-    const float *restrict srcp0, const float *restrict srcp1, int src_w, int src_h, ptrdiff_t stride
+    const float *restrict srcp0, const float *restrict srcp1, int src_w, int src_h, ptrdiff_t stride, double thr
 ) {
     int tail = src_w % 8;
     int mod8_w = src_w - tail;
@@ -4812,9 +4961,10 @@ static double get_msad(
     
     __m256 vmin = _mm256_setzero_ps();
     __m256 vmax = _mm256_set1_ps(1.0f);
+    __m256d vabs = _mm256_castsi256_pd(_mm256_set1_epi64x(0x7fffffffffffffff));
+    __m256d vthr = _mm256_set1_pd(thr);
     __m256d acc0 = _mm256_setzero_pd();
     __m256d acc1 = _mm256_setzero_pd();
-    __m256d vabs = _mm256_castsi256_pd(_mm256_set1_epi64x(0x7fffffffffffffff));
     
     for (int y = 0; y < src_h; y++) {
         int x = 0;
@@ -4823,20 +4973,24 @@ static double get_msad(
             __m256 pix1 = VCLAMP_PS(_mm256_load_ps(srcp1 + x), vmin, vmax);
             __m256d temp0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 0));
             __m256d temp1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 1));
-            temp0 = _mm256_sub_pd(temp0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 0)));
-            temp1 = _mm256_sub_pd(temp1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 1)));
-            acc0 = _mm256_add_pd(_mm256_and_pd(temp0, vabs), acc0);
-            acc1 = _mm256_add_pd(_mm256_and_pd(temp1, vabs), acc1);
+            temp0 = _mm256_and_pd(_mm256_sub_pd(temp0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 0))), vabs);
+            temp1 = _mm256_and_pd(_mm256_sub_pd(temp1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 1))), vabs);
+            temp0 = _mm256_and_pd(_mm256_cmp_pd(temp0, vthr, _CMP_GT_OQ), temp0);
+            temp1 = _mm256_and_pd(_mm256_cmp_pd(temp1, vthr, _CMP_GT_OQ), temp1);
+            acc0 = _mm256_add_pd(temp0, acc0);
+            acc1 = _mm256_add_pd(temp1, acc1);
         }
         if (tail) {
             __m256 pix0 = VCLAMP_PS(_mm256_maskload_ps(srcp0 + x, tail_mask), vmin, vmax);
             __m256 pix1 = VCLAMP_PS(_mm256_maskload_ps(srcp1 + x, tail_mask), vmin, vmax);
             __m256d temp0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 0));
             __m256d temp1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix0, 1));
-            temp0 = _mm256_sub_pd(temp0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 0)));
-            temp1 = _mm256_sub_pd(temp1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 1)));
-            acc0 = _mm256_add_pd(_mm256_and_pd(temp0, vabs), acc0);
-            acc1 = _mm256_add_pd(_mm256_and_pd(temp1, vabs), acc1);
+            temp0 = _mm256_and_pd(_mm256_sub_pd(temp0, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 0))), vabs);
+            temp1 = _mm256_and_pd(_mm256_sub_pd(temp1, _mm256_cvtps_pd(_mm256_extractf128_ps(pix1, 1))), vabs);
+            temp0 = _mm256_and_pd(_mm256_cmp_pd(temp0, vthr, _CMP_GT_OQ), temp0);
+            temp1 = _mm256_and_pd(_mm256_cmp_pd(temp1, vthr, _CMP_GT_OQ), temp1);
+            acc0 = _mm256_add_pd(temp0, acc0);
+            acc1 = _mm256_add_pd(temp1, acc1);
         }
         srcp0 += stride;
         srcp1 += stride;
@@ -4850,7 +5004,7 @@ static double get_msad(
 }
 
 static double get_pearson(
-    const float *restrict srcp0, const float *restrict srcp1, int src_w, int src_h, ptrdiff_t stride
+    const float *restrict srcp0, const float *restrict srcp1, int src_w, int src_h, ptrdiff_t stride, double thr UNUSED
 ) {
     int tail = src_w % 8;
     int mod8_w = src_w - tail;
@@ -5043,7 +5197,7 @@ static inline double get_covariance_8x8(
 }
 
 static double get_ssim(
-    const float *restrict srcp0, const float *restrict srcp1, int src_w, int src_h, ptrdiff_t stride
+    const float *restrict srcp0, const float *restrict srcp1, int src_w, int src_h, ptrdiff_t stride, double thr UNUSED
 ) {
     __m256 vmin = _mm256_setzero_ps();
     __m256 vmax = _mm256_set1_ps(1.0f);
@@ -5110,7 +5264,7 @@ static const VSFrame *VS_CC MetricGetFrame(
         int src_w = vsapi->getFrameWidth(src0, 0);
         int src_h = vsapi->getFrameHeight(src0, 0);
         
-        double metric = d->metric.f(srcp0, srcp1, src_w, src_h, src_stride);
+        double metric = d->metric.f(srcp0, srcp1, src_w, src_h, src_stride, d->thr);
         
         VSMap *props = vsapi->getFramePropertiesRW(dst);
         vsapi->mapSetFloat(props, d->metric.name, metric, maReplace);
@@ -5187,6 +5341,17 @@ static void VS_CC MetricCreate(
     }
     else {
         vsapi->mapSetError(out, "Metric: invalid mode specified");
+        vsapi->freeNode(d.node0);
+        vsapi->freeNode(d.node1);
+        return;
+    }
+    
+    d.thr = vsapi->mapGetFloat(in, "thr", 0, &err);
+    if (err) {
+        d.thr = 0.0;
+    }
+    if (d.thr < 0.0 || d.thr >= 1.0) {
+        vsapi->mapSetError(out, "Metric: \"thr\" must be between 0 and 1");
         vsapi->freeNode(d.node0);
         vsapi->freeNode(d.node1);
         return;
@@ -5587,7 +5752,7 @@ static void VS_CC BitDepthCreate(
 }
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
-    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(17, 2), VAPOURSYNTH_API_VERSION, 0, plugin);
+    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(18, 0), VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction("Resize",
                              "clip:vnode;"
                              "width:int;"
@@ -5600,6 +5765,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
                              "b:float:opt;"
                              "c:float:opt;"
                              "taps:float:opt;"
+                             "confine:data:opt;"
                              "gamma:data:opt;"
                              "sharp:float:opt;",
                              "clip:vnode;",
@@ -5618,7 +5784,8 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
                              "b:float:opt;"
                              "c:float:opt;"
                              "taps:float:opt;"
-                             "lambda:float:opt;",
+                             "confine:data:opt;"
+                             "reg:float:opt;",
                              "clip:vnode;",
                              DescaleCreate,
                              NULL,
@@ -5635,7 +5802,8 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
     vspapi->registerFunction("Metric",
                              "clip0:vnode;"
                              "clip1:vnode;"
-                             "mode:data:opt;",
+                             "mode:data:opt;"
+                             "thr:float:opt;",
                              "clip:vnode;",
                              MetricCreate,
                              NULL,

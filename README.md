@@ -2,7 +2,7 @@
 A disjointed set of filters for VapourSynth, I write everything that seems interesting.  
 The library is written using AVX2 intrinsics.
 ## Resize
-`artyfox.Resize(clip clip, int width, int height[, float src_left=0.0, float src_top=0.0, float src_width=clip.width, float src_height=clip.height, str kernel="area", float b=1/3, float c=1/3, float taps=3.0, str gamma='srgb' or 'smpte170m', float sharp=1.0])`
+`artyfox.Resize(clip clip, int width, int height[, float src_left=0.0, float src_top=0.0, float src_width=clip.width, float src_height=clip.height, str kernel="area", float b=1/3, float c=1/3, float taps=3.0, str confine='inf', str gamma='srgb' or 'smpte170m', float sharp=1.0])`
 
 Implementation of multiple resize functions using double-precision convolution method in a linear color space.
 * `clip`: Source clip to resize. Must be RGB, YUV or GRAY. 8-16-bit integer or 32-bit float sample type.
@@ -33,6 +33,10 @@ Implementation of multiple resize functions using double-precision convolution m
 * `b`: The `b` parameter in the `bicubic` kernel. Defaults to 1/3.
 * `c`: The `c` parameter in the `bicubic` kernel. Defaults to 1/3.
 * `taps`: Window radius value for `blackman`, `gauss`, `kaiser`, `lanczos` and `nuttall` kernels, it must be between 1 and 128, the default value is 3.0 (except for `gauss`).
+* `confine`: A method for representing pixels that are outside the frame. Possible values:
+  * `zero`: Pixels outside the frame are considered zero.
+  * `inf`: Pixels outside the frame are replaced with the nearest pixels within the frame, used by default.
+  * `mirror`: Pixels outside the frame are considered mirror images of pixels inside the frame.
 * `gamma`: The inverse and forward gamma correction value. Correction is performed before and after resizing, in order to produce the resize itself in a linear color space. The default values ​​are `'srgb'` for RGB and `'smpte170m'` for YUV and GRAY. Two different formulas are used for RGB and YUV/GRAY. The formula for YUV/GRAY is suitable for SMPTE 170M, BT.601, BT.709, BT.2020.
 Other supported values ​​are: `'adobe'` (Adobe RGB), `'dcip3'` (DCI-P3), `'smpte240m'` (SMPTE 240M) and `'none'` (completely disables correction, resizing occurs directly, in a logarithmic color space).
 * `sharp`: Optional post sharp. It is performed after resizing, but before gamma correction. By default, 1.0 (sharp is disabled). Values ​​​​less than 1.0 - blur, more - sharp. The allowed range of values ​​is from 0.1 to 5.0
@@ -41,7 +45,7 @@ Chroma alignment in YUV with subsampling is performed based on the `"_ChromaLoca
 Resize and alignment by fields are not supported.
 
 ## Descale
-`artyfox.Descale(clip clip, int width, int height[, float src_left=0.0, float src_top=0.0, float src_width=width, float src_height=height, str kernel="area", float b=1/3, float c=1/3, float taps=3.0, float lambda=1e-4])`
+`artyfox.Descale(clip clip, int width, int height[, float src_left=0.0, float src_top=0.0, float src_width=width, float src_height=height, str kernel="area", float b=1/3, float c=1/3, float taps=3.0, str confine='inf', float reg=1e-8])`
 
 Descaling via Tikhonov regularization and Cholesky decomposition (U.T @ U) using double-precision convolution method.
 * `clip`: Source clip to descale. Must be RGB, YUV or GRAY. 32-bit float sample type only.
@@ -55,7 +59,11 @@ Descaling via Tikhonov regularization and Cholesky decomposition (U.T @ U) using
 * `b`: The `b` parameter in the `bicubic` kernel. Defaults to 1/3.
 * `c`: The `c` parameter in the `bicubic` kernel. Defaults to 1/3.
 * `taps`: Window radius value for `blackman`, `gauss`, `kaiser`, `lanczos` and `nuttall` kernels, it must be between 1 and 128, the default value is 3.0 (except for `gauss`).
-* `lambda`: Regularization parameter. Ensures positive definiteness and stability of the solution to the system of equations. Small values ​​can lead to increased noise, quantization artifacts, and ringing. Excessively large values ​​produce a smooth image, suppressing fine details. Default is 1e-4. Valid range: 1e-16 <= `lambda` < 1. Since `lambda` is a Python keyword, you may [append an underscore to the argument’s name when invoking the filter](https://www.vapoursynth.com/doc/pythonreference.html#python-keywords-as-filter-arguments).
+* `confine`: A method for representing pixels that are outside the frame. Possible values:
+  * `zero`: Pixels outside the frame are considered zero.
+  * `inf`: Pixels outside the frame are replaced with the nearest pixels within the frame, used by default.
+  * `mirror`: Pixels outside the frame are considered mirror images of pixels inside the frame.
+* `reg`: Regularization parameter. Ensures positive definiteness and stability of the solution to the system of equations. Small values ​​can lead to increased noise, quantization artifacts, and ringing. Excessively large values ​​produce a smooth image, suppressing fine details. Default is 1e-8. Valid range: 1e-16 <= `reg` < 1.
 
 ## Mean
 `artyfox.Mean(clip clip[, str mode='am', int plane=0, bool norm=True])`
@@ -71,12 +79,12 @@ Calculates the `minimum`, `maximum` and the set mean value for the specified pla
   * `rms`: Root mean square (`root_mean_square`).
   * `rmc`: Root mean cube (`root_mean_cube`).
   * `median`: Median (`median`).
-  * `limsad`: Meaned sum of absolute differences between the mutual linear interpolation of the frame fields and the true values ​​of the corresponding pixels; the `minimum` and `maximum` correspond to the minimum and maximum absolute difference between the interpolated and true values ​​of the frame (`linear_interp_msad`).
+  * `limsad`: Modified sum of absolute differences between the mutual linear interpolation of the frame fields and the true values ​​of the corresponding pixels; the `minimum` and `maximum` correspond to the minimum and maximum absolute difference between the interpolated and true values ​​of the frame (`linear_interp_msad`).
 * `plane`: Plane for analysis. Default is 0.
 * `norm`: Normalizes the mean to the 0:1 range. Default is true.
 
 ## Metric
-`artyfox.Metric(clip clip0, clip clip1[, str mode='relative'])`
+`artyfox.Metric(clip clip0, clip clip1[, str mode='relative', float thr=0.0])`
 
 Compares two video clips and calculates the specified difference metric. The metric is stored as a frame property. The input range is always clamped to 0:1.
 * `clip0`: Original clip. Must be GRAY. 32-bit float sample type only.
@@ -85,9 +93,10 @@ Compares two video clips and calculates the specified difference metric. The met
   * `relative`: Relative error (`RelativeError`). Used by default.
   * `rmse`: Root mean square error (`RMSE`).
   * `psnr`: Peak signal-to-noise ratio (`PSNR`).
-  * `msad`: Meaned sum of absolute differences (`MSAD`).
+  * `msad`: Modified sum of absolute differences (`MSAD`).
   * `pcc`: Pearson correlation coefficient (`PCC`).
   * `ssim`: Structural similarity index measure (`SSIM`).
+* `thr`: The absolute difference threshold above which the difference is considered significant; everything else is set to zero. This allows noise to be filtered out. Doesn't work for `pcc` and `ssim`. The default is 0.
 
 ## Linearize
 `artyfox.Linearize(clip clip[, str gamma='srgb' or 'smpte170m', int[] planes=[0, 1, 2]])`
