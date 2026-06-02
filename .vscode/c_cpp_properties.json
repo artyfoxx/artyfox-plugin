@@ -4,8 +4,7 @@
             "name": "Clang",
             "includePath": [
                 "${workspaceFolder}/**",
-                "C:\\Program Files\\VapourSynth\\sdk\\include\\vapoursynth",
-                "C:\\msys64\\home\\artyfox\\install\\include"
+                "C:\\Python314\\Lib\\site-packages\\vapoursynth\\include"
             ],
             "defines": [
                 "_DEBUG",

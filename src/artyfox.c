@@ -1382,12 +1382,13 @@ static const VSFrame *VS_CC ResizeGetFrame(
             chromaloc = 0;
         }
         
-        bool range = !!vsapi->mapGetIntSaturated(props, "_ColorRange", 0, &err);
+        bool range = !vsapi->mapGetIntSaturated(props, "_Range", 0, &err);
         if (bit_convert && !d->linear) {
             range = false;
         }
         else if (err) {
-            range = (fi->colorFamily != cfRGB);
+            range = !!vsapi->mapGetIntSaturated(props, "_ColorRange", 0, &err);
+            if (err) range = (fi->colorFamily != cfRGB);
         }
         
         csr_t chroma_w, chroma_h;
@@ -5641,12 +5642,13 @@ static const VSFrame *VS_CC BitDepthGetFrame(
         const VSMap *props = vsapi->getFramePropertiesRO(src);
         
         int err;
-        bool range = !!vsapi->mapGetIntSaturated(props, "_ColorRange", 0, &err);
+        bool range = !vsapi->mapGetIntSaturated(props, "_Range", 0, &err);
         if (d->direct) {
             range = false;
         }
         else if (err) {
-            range = (fi->colorFamily != cfRGB);
+            range = !!vsapi->mapGetIntSaturated(props, "_ColorRange", 0, &err);
+            if (err) range = (fi->colorFamily != cfRGB);
         }
         
         for (int plane = 0; plane < fi->numPlanes; plane++) {
@@ -5752,7 +5754,7 @@ static void VS_CC BitDepthCreate(
 }
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
-    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(18, 0), VAPOURSYNTH_API_VERSION, 0, plugin);
+    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(18, 1), VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction("Resize",
                              "clip:vnode;"
                              "width:int;"

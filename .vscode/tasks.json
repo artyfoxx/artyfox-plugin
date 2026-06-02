@@ -15,8 +15,8 @@
                 "-fuse-ld=lld",
                 "-Wall",
                 "-Wextra",
-                "-I\"C:\\Program Files\\VapourSynth\\sdk\\include\\vapoursynth\"",
-                "-I\"C:\\msys64\\home\\artyfox\\install\\include\"",
+                "-std=c17",
+                "-I\"C:\\Python314\\Lib\\site-packages\\vapoursynth\\include\"",
                 "${file}",
                 "-o",
                 "${fileDirname}\\${fileBasenameNoExtension}.dll"
