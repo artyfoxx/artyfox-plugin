@@ -65,10 +65,10 @@ static double area_kernel(double x, void *ctx) {
     if (x < 0.0) {
         x = -x;
     }
-    if (x < 0.5 - ar->scale / 2.0) {
+    if (x < 0.5 - ar->scale * 0.5) {
         return 1.0;
     }
-    if (x < 0.5 + ar->scale / 2.0) {
+    if (x < 0.5 + ar->scale * 0.5) {
         return 0.5 - (x - 0.5) / ar->scale;
     }
     return 0.0;
@@ -296,11 +296,12 @@ static double spline144_kernel(double x, void *ctx UNUSED) {
     return 0.0;
 }
 
-static double point_kernel(double x, void *ctx UNUSED) {
-    if (x < 0.0) {
-        x = -x;
+static double point_kernel(double x, void *ctx) {
+    sinc_ctx *sn = (sinc_ctx *)ctx;
+    if (x < -sn->taps) {
+        return 0.0;
     }
-    if (x < 0.5) {
+    if (x < sn->taps) {
         return 1.0;
     }
     return 0.0;
@@ -1740,7 +1741,12 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData UNUSE
     } else if (!strcmp(kernel, "spline144")) {
         d.kernel_w = d.kernel_h = (kernel_t){spline144_kernel, 6.0, NULL};
     } else if (!strcmp(kernel, "point")) {
-        d.kernel_w = d.kernel_h = (kernel_t){point_kernel, 0.5, NULL};
+        sinc_ctx *sn_w = (sinc_ctx *)malloc(sizeof(*sn_w));
+        sinc_ctx *sn_h = (sinc_ctx *)malloc(sizeof(*sn_h));
+        sn_w->taps = 0.5 * fmin(d.dst_width / d.real_w, 1.0);
+        sn_h->taps = 0.5 * fmin(d.dst_height / d.real_h, 1.0);
+        d.kernel_w = (kernel_t){point_kernel, sn_w->taps, sn_w};
+        d.kernel_h = (kernel_t){point_kernel, sn_h->taps, sn_h};
     } else if (!strcmp(kernel, "blackman")) {
         sinc_ctx *sn = (sinc_ctx *)malloc(sizeof(*sn));
         sn->taps = vsapi->mapGetFloat(in, "taps", 0, &err);
@@ -2472,8 +2478,8 @@ static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData UNUS
         area_ctx *ar_h = (area_ctx *)malloc(sizeof(*ar_h));
         ar_w->scale = d.real_w / d.vi.width;
         ar_h->scale = d.real_h / d.vi.height;
-        d.kernel_w = (kernel_t){area_kernel, 0.5 + ar_w->scale / 2.0, ar_w};
-        d.kernel_h = (kernel_t){area_kernel, 0.5 + ar_h->scale / 2.0, ar_h};
+        d.kernel_w = (kernel_t){area_kernel, 0.5 + ar_w->scale * 0.5, ar_w};
+        d.kernel_h = (kernel_t){area_kernel, 0.5 + ar_h->scale * 0.5, ar_h};
     } else if (!strcmp(kernel, "magic")) {
         d.kernel_w = d.kernel_h = (kernel_t){magic_kernel, 1.5, NULL};
     } else if (!strcmp(kernel, "magic13")) {
@@ -2517,7 +2523,9 @@ static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData UNUS
     } else if (!strcmp(kernel, "spline144")) {
         d.kernel_w = d.kernel_h = (kernel_t){spline144_kernel, 6.0, NULL};
     } else if (!strcmp(kernel, "point")) {
-        d.kernel_w = d.kernel_h = (kernel_t){point_kernel, 0.5, NULL};
+        sinc_ctx *sn = (sinc_ctx *)malloc(sizeof(*sn));
+        sn->taps = 0.5;
+        d.kernel_w = d.kernel_h = (kernel_t){point_kernel, sn->taps, sn};
     } else if (!strcmp(kernel, "blackman")) {
         sinc_ctx *sn = (sinc_ctx *)malloc(sizeof(*sn));
         sn->taps = vsapi->mapGetFloat(in, "taps", 0, &err);
