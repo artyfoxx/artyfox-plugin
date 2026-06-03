@@ -7,9 +7,7 @@
 #include "VapourSynth4.h"
 #include "VSHelper4.h"
 
-#define ALWAYS_INLINE __attribute__((always_inline))
 #define UNUSED __attribute__((unused))
-#define CLAMP(x, min, max) ((x) > (max) ? (max) : ((x) < (min) ? (min) : (x)))
 
 typedef double (*kernel_func)(double x, void *ctx);
 
@@ -1029,6 +1027,26 @@ static void sharp_height(
     }
 }
 
+static inline int clamp_inf(int x, int min, int max) {
+    if (x > max) {
+        return max;
+    }
+    if (x < min) {
+        return min;
+    }
+    return x;
+}
+
+static int clamp_mirror(int x, int border) {
+    if (x > border) {
+        return clamp_mirror(border - ~(border - x), border);
+    }
+    if (x < 0) {
+        return clamp_mirror(~x, border);
+    }
+    return x;
+}
+
 static csr_t csr_get_weights_zero(kernel_t kernel, int src_n, int dst_n, double start_n, double real_n) {
     double factor = dst_n / real_n;
     double scale = fmin(factor, 1.0);
@@ -1047,14 +1065,14 @@ static csr_t csr_get_weights_zero(kernel_t kernel, int src_n, int dst_n, double 
         double center = (i + 0.5) / factor - 0.5 + start_n;
         int low = VSMAX((int)floor(center - radius), min_n);
         int high = VSMIN((int)ceil(center + radius), max_n);
-        int min_idx = CLAMP(low, 0, border);
-        int max_idx = CLAMP(high, 0, border);
+        int min_idx = clamp_inf(low, 0, border);
+        int max_idx = clamp_inf(high, 0, border);
         double norm = 0.0;
         for (int j = low; j <= high; j++) {
             double temp_val = kernel.f((j - center) * scale, kernel.ctx);
             norm += temp_val;
             if (j < 0 || j > border) temp_val = 0.0;
-            int temp_idx = CLAMP(j, 0, border);
+            int temp_idx = clamp_inf(j, 0, border);
             int idx = nnz + (temp_idx - min_idx);
             weights[idx] += temp_val;
             col_idx[idx] = temp_idx;
@@ -1087,13 +1105,13 @@ static csr_t csr_get_weights_inf(kernel_t kernel, int src_n, int dst_n, double s
         double center = (i + 0.5) / factor - 0.5 + start_n;
         int low = VSMAX((int)floor(center - radius), min_n);
         int high = VSMIN((int)ceil(center + radius), max_n);
-        int min_idx = CLAMP(low, 0, border);
-        int max_idx = CLAMP(high, 0, border);
+        int min_idx = clamp_inf(low, 0, border);
+        int max_idx = clamp_inf(high, 0, border);
         double norm = 0.0;
         for (int j = low; j <= high; j++) {
             double temp_val = kernel.f((j - center) * scale, kernel.ctx);
             norm += temp_val;
-            int temp_idx = CLAMP(j, 0, border);
+            int temp_idx = clamp_inf(j, 0, border);
             int idx = nnz + (temp_idx - min_idx);
             weights[idx] += temp_val;
             col_idx[idx] = temp_idx;
@@ -1106,16 +1124,6 @@ static csr_t csr_get_weights_inf(kernel_t kernel, int src_n, int dst_n, double s
     }
     
     return (csr_t){src_n, dst_n, nnz, weights, col_idx, row_ptr};
-}
-
-static int clamp_mirror(int x, int border) {
-    if (x > border) {
-        return clamp_mirror(border - ~(border - x), border);
-    }
-    if (x < 0) {
-        return clamp_mirror(~x, border);
-    }
-    return x;
 }
 
 static csr_t csr_get_weights_mirror(kernel_t kernel, int src_n, int dst_n, double start_n, double real_n) {
