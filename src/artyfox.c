@@ -1176,37 +1176,39 @@ static void csr_free(csr_t csr) {
     free(csr.values);
 }
 
-static void _mm256_transpose8_lane4_ps(__m256 *row0, __m256 *row1, __m256 *row2, __m256 *row3) {
-    __m256 t0 = _mm256_unpacklo_ps(*row0, *row2);
-    __m256 t1 = _mm256_unpackhi_ps(*row0, *row2);
-    __m256 t2 = _mm256_unpacklo_ps(*row1, *row3);
-    __m256 t3 = _mm256_unpackhi_ps(*row1, *row3);
-    __m256 u0 = _mm256_unpacklo_ps(t0, t2);
-    __m256 u1 = _mm256_unpackhi_ps(t0, t2);
-    __m256 u2 = _mm256_unpacklo_ps(t1, t3);
-    __m256 u3 = _mm256_unpackhi_ps(t1, t3);
-    *row0 = _mm256_permute2f128_ps(u0, u1, 0b00100000);
-    *row1 = _mm256_permute2f128_ps(u2, u3, 0b00100000);
-    *row2 = _mm256_permute2f128_ps(u0, u1, 0b00110001);
-    *row3 = _mm256_permute2f128_ps(u2, u3, 0b00110001);
-}
+#define _MM256_TRANSPOSE8X4_PS(row0, row1, row2, row3) \
+do { \
+    __m256 __t0 = _mm256_unpacklo_ps(row0, row2); \
+    __m256 __t1 = _mm256_unpackhi_ps(row0, row2); \
+    __m256 __t2 = _mm256_unpacklo_ps(row1, row3); \
+    __m256 __t3 = _mm256_unpackhi_ps(row1, row3); \
+    __m256 __u0 = _mm256_unpacklo_ps(__t0, __t2); \
+    __m256 __u1 = _mm256_unpackhi_ps(__t0, __t2); \
+    __m256 __u2 = _mm256_unpacklo_ps(__t1, __t3); \
+    __m256 __u3 = _mm256_unpackhi_ps(__t1, __t3); \
+    row0 = _mm256_permute2f128_ps(__u0, __u1, 0x20); \
+    row1 = _mm256_permute2f128_ps(__u2, __u3, 0x20); \
+    row2 = _mm256_permute2f128_ps(__u0, __u1, 0x31); \
+    row3 = _mm256_permute2f128_ps(__u2, __u3, 0x31); \
+} while (0)
 
-static void _mm256_transpose4_lane8_ps(__m256 *row0, __m256 *row1, __m256 *row2, __m256 *row3) {
-    __m256 t0 = _mm256_permute2f128_ps(*row0, *row2, 0b00100000);
-    __m256 t1 = _mm256_permute2f128_ps(*row1, *row3, 0b00100000);
-    __m256 t2 = _mm256_permute2f128_ps(*row0, *row2, 0b00110001);
-    __m256 t3 = _mm256_permute2f128_ps(*row1, *row3, 0b00110001);
-    __m256 u0 = _mm256_unpacklo_ps(t0, t1);
-    __m256 u1 = _mm256_unpackhi_ps(t0, t1);
-    __m256 u2 = _mm256_unpacklo_ps(t2, t3);
-    __m256 u3 = _mm256_unpackhi_ps(t2, t3);
-    *row0 = _mm256_unpacklo_ps(u0, u2);
-    *row1 = _mm256_unpackhi_ps(u0, u2);
-    *row2 = _mm256_unpacklo_ps(u1, u3);
-    *row3 = _mm256_unpackhi_ps(u1, u3);
-}
+#define _MM256_TRANSPOSE4X8_PS(row0, row1, row2, row3) \
+do { \
+    __m256 __t0 = _mm256_permute2f128_ps(row0, row2, 0x20); \
+    __m256 __t1 = _mm256_permute2f128_ps(row1, row3, 0x20); \
+    __m256 __t2 = _mm256_permute2f128_ps(row0, row2, 0x31); \
+    __m256 __t3 = _mm256_permute2f128_ps(row1, row3, 0x31); \
+    __m256 __u0 = _mm256_unpacklo_ps(__t0, __t1); \
+    __m256 __u1 = _mm256_unpackhi_ps(__t0, __t1); \
+    __m256 __u2 = _mm256_unpacklo_ps(__t2, __t3); \
+    __m256 __u3 = _mm256_unpackhi_ps(__t2, __t3); \
+    row0 = _mm256_unpacklo_ps(__u0, __u2); \
+    row1 = _mm256_unpackhi_ps(__u0, __u2); \
+    row2 = _mm256_unpacklo_ps(__u1, __u3); \
+    row3 = _mm256_unpackhi_ps(__u1, __u3); \
+} while (0)
 
-static void transpose_block_into_buf(
+static void transpose_block_into_buf_ps(
     const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w
 ) {
     for (int x = 0; x < src_w; x += 8) {
@@ -1214,7 +1216,7 @@ static void transpose_block_into_buf(
         __m256 line_1 = _mm256_load_ps(srcp + stride * 1);
         __m256 line_2 = _mm256_load_ps(srcp + stride * 2);
         __m256 line_3 = _mm256_load_ps(srcp + stride * 3);
-        _mm256_transpose8_lane4_ps(&line_0, &line_1, &line_2, &line_3);
+        _MM256_TRANSPOSE8X4_PS(line_0, line_1, line_2, line_3);
         _mm256_store_ps(dstp + 0, line_0);
         _mm256_store_ps(dstp + 8, line_1);
         _mm256_store_ps(dstp + 16, line_2);
@@ -1224,7 +1226,7 @@ static void transpose_block_into_buf(
     }
 }
 
-static void transpose_block_into_buf_with_tail(
+static void transpose_block_into_buf_with_tail_ps(
     const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int tail
 ) {
     for (int x = 0; x < src_w; x += 8) {
@@ -1232,7 +1234,7 @@ static void transpose_block_into_buf_with_tail(
         __m256 line_1 = (tail > 1) ? _mm256_load_ps(srcp + stride * 1) : _mm256_setzero_ps();
         __m256 line_2 = (tail > 2) ? _mm256_load_ps(srcp + stride * 2) : _mm256_setzero_ps();
         __m256 line_3 = _mm256_setzero_ps();
-        _mm256_transpose8_lane4_ps(&line_0, &line_1, &line_2, &line_3);
+        _MM256_TRANSPOSE8X4_PS(line_0, line_1, line_2, line_3);
         _mm256_store_ps(dstp + 0, line_0);
         _mm256_store_ps(dstp + 8, line_1);
         _mm256_store_ps(dstp + 16, line_2);
@@ -1242,7 +1244,7 @@ static void transpose_block_into_buf_with_tail(
     }
 }
 
-static void transpose_block_from_buf(
+static void transpose_block_from_buf_ps(
     const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int dst_w
 ) {
     for (int x = 0; x < dst_w; x += 8) {
@@ -1250,7 +1252,7 @@ static void transpose_block_from_buf(
         __m256 line_1 = _mm256_load_ps(srcp + 8);
         __m256 line_2 = _mm256_load_ps(srcp + 16);
         __m256 line_3 = _mm256_load_ps(srcp + 24);
-        _mm256_transpose4_lane8_ps(&line_0, &line_1, &line_2, &line_3);
+        _MM256_TRANSPOSE4X8_PS(line_0, line_1, line_2, line_3);
         _mm256_stream_ps(dstp + stride * 0, line_0);
         _mm256_stream_ps(dstp + stride * 1, line_1);
         _mm256_stream_ps(dstp + stride * 2, line_2);
@@ -1260,7 +1262,7 @@ static void transpose_block_from_buf(
     }
 }
 
-static void transpose_block_from_buf_with_tail(
+static void transpose_block_from_buf_with_tail_ps(
     const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int dst_w, int tail
 ) {
     for (int x = 0; x < dst_w; x += 8) {
@@ -1268,7 +1270,7 @@ static void transpose_block_from_buf_with_tail(
         __m256 line_1 = _mm256_load_ps(srcp + 8);
         __m256 line_2 = _mm256_load_ps(srcp + 16);
         __m256 line_3 = _mm256_load_ps(srcp + 24);
-        _mm256_transpose4_lane8_ps(&line_0, &line_1, &line_2, &line_3);
+        _MM256_TRANSPOSE4X8_PS(line_0, line_1, line_2, line_3);
         _mm256_stream_ps(dstp + stride * 0, line_0);
         if (tail > 1) _mm256_stream_ps(dstp + stride * 1, line_1);
         if (tail > 2) _mm256_stream_ps(dstp + stride * 2, line_2);
@@ -1288,7 +1290,7 @@ static void resize_width(
     int mod4_h = src_h - tail;
     
     for (int y = 0; y < mod4_h; y += 4) {
-        transpose_block_into_buf(srcp, src_buf, src_stride, src_w);
+        transpose_block_into_buf_ps(srcp, src_buf, src_stride, src_w);
         for (int x = 0; x < dst_w; x++) {
             __m256d v_acc = _mm256_setzero_pd();
             for (int i = weights.row_ptr[x]; i < weights.row_ptr[x + 1]; i++) {
@@ -1298,12 +1300,12 @@ static void resize_width(
             }
             _mm_store_ps(dst_buf + x * 4, _mm256_cvtpd_ps(v_acc));
         }
-        transpose_block_from_buf(dst_buf, dstp, dst_stride, dst_w);
+        transpose_block_from_buf_ps(dst_buf, dstp, dst_stride, dst_w);
         dstp += dst_stride * 4;
         srcp += src_stride * 4;
     }
     if (tail) {
-        transpose_block_into_buf_with_tail(srcp, src_buf, src_stride, src_w, tail);
+        transpose_block_into_buf_with_tail_ps(srcp, src_buf, src_stride, src_w, tail);
         for (int x = 0; x < dst_w; x++) {
             __m256d v_acc = _mm256_setzero_pd();
             for (int i = weights.row_ptr[x]; i < weights.row_ptr[x + 1]; i++) {
@@ -1313,7 +1315,7 @@ static void resize_width(
             }
             _mm_store_ps(dst_buf + x * 4, _mm256_cvtpd_ps(v_acc));
         }
-        transpose_block_from_buf_with_tail(dst_buf, dstp, dst_stride, dst_w, tail);
+        transpose_block_from_buf_with_tail_ps(dst_buf, dstp, dst_stride, dst_w, tail);
     }
     _mm_sfence();
     _mm_free(dst_buf);
@@ -2031,7 +2033,7 @@ static void solve_banded_cholesky_lane4(banded_t srcp, double *dstp) {
     }
 }
 
-static void transpose_double_block_from_buf(
+static void transpose_block_from_buf_pd_ps(
     const double *restrict srcp, float *restrict dstp, ptrdiff_t stride, int dst_w
 ) {
     for (int x = 0; x < dst_w; x += 8) {
@@ -2051,7 +2053,7 @@ static void transpose_double_block_from_buf(
             _mm256_cvtpd_ps(_mm256_load_pd(srcp + 24)),
             _mm256_cvtpd_ps(_mm256_load_pd(srcp + 28))
         );
-        _mm256_transpose4_lane8_ps(&line_0, &line_1, &line_2, &line_3);
+        _MM256_TRANSPOSE4X8_PS(line_0, line_1, line_2, line_3);
         _mm256_stream_ps(dstp + stride * 0, line_0);
         _mm256_stream_ps(dstp + stride * 1, line_1);
         _mm256_stream_ps(dstp + stride * 2, line_2);
@@ -2061,7 +2063,7 @@ static void transpose_double_block_from_buf(
     }
 }
 
-static void transpose_double_block_from_buf_with_tail(
+static void transpose_block_from_buf_with_tail_pd_ps(
     const double *restrict srcp, float *restrict dstp, ptrdiff_t stride, int dst_w, int tail
 ) {
     for (int x = 0; x < dst_w; x += 8) {
@@ -2081,7 +2083,7 @@ static void transpose_double_block_from_buf_with_tail(
             _mm256_cvtpd_ps(_mm256_load_pd(srcp + 24)),
             _mm256_cvtpd_ps(_mm256_load_pd(srcp + 28))
         );
-        _mm256_transpose4_lane8_ps(&line_0, &line_1, &line_2, &line_3);
+        _MM256_TRANSPOSE4X8_PS(line_0, line_1, line_2, line_3);
         _mm256_stream_ps(dstp + stride * 0, line_0);
         if (tail > 1) _mm256_stream_ps(dstp + stride * 1, line_1);
         if (tail > 2) _mm256_stream_ps(dstp + stride * 2, line_2);
@@ -2101,7 +2103,7 @@ static void descale_width(
     double *restrict dst_buf = (double *)_mm_malloc(sizeof(double) * dst_stride * 4, 64);
     
     for (int y = 0; y < mod4_h; y += 4) {
-        transpose_block_into_buf(srcp, src_buf, src_stride, src_w);
+        transpose_block_into_buf_ps(srcp, src_buf, src_stride, src_w);
         for (int x = 0; x < dst_w; x++) {
             __m256d v_acc = _mm256_setzero_pd();
             for (int i = weights.row_ptr[x]; i < weights.row_ptr[x + 1]; i++) {
@@ -2112,12 +2114,12 @@ static void descale_width(
             _mm256_store_pd(dst_buf + x * 4, v_acc);
         }
         solve_banded_cholesky_lane4(banded, dst_buf);
-        transpose_double_block_from_buf(dst_buf, dstp, dst_stride, dst_w);
+        transpose_block_from_buf_pd_ps(dst_buf, dstp, dst_stride, dst_w);
         dstp += dst_stride * 4;
         srcp += src_stride * 4;
     }
     if (tail) {
-        transpose_block_into_buf_with_tail(srcp, src_buf, src_stride, src_w, tail);
+        transpose_block_into_buf_with_tail_ps(srcp, src_buf, src_stride, src_w, tail);
         for (int x = 0; x < dst_w; x++) {
             __m256d v_acc = _mm256_setzero_pd();
             for (int i = weights.row_ptr[x]; i < weights.row_ptr[x + 1]; i++) {
@@ -2128,7 +2130,7 @@ static void descale_width(
             _mm256_store_pd(dst_buf + x * 4, v_acc);
         }
         solve_banded_cholesky_lane4(banded, dst_buf);
-        transpose_double_block_from_buf_with_tail(dst_buf, dstp, dst_stride, dst_w, tail);
+        transpose_block_from_buf_with_tail_pd_ps(dst_buf, dstp, dst_stride, dst_w, tail);
     }
     _mm_sfence();
     _mm_free(dst_buf);
