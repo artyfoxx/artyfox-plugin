@@ -1,6 +1,6 @@
 # artyfox-plugin
 A disjointed set of filters for VapourSynth, I write everything that seems interesting.  
-The library is written using AVX2 intrinsics.
+The library is written using AVX2 intrinsics, so processors older than Haswell and Zen 1 are not supported.
 ## Resize
 `artyfox.Resize(clip clip, int width, int height[, float src_left=0.0, float src_top=0.0, float src_width=clip.width, float src_height=clip.height, str kernel="area", float b=1/3, float c=1/3, float taps=3.0, str confine='inf', str gamma='srgb' or 'smpte170m', float sharp=1.0])`
 
@@ -17,7 +17,8 @@ Implementation of multiple resize functions using double-precision convolution m
   * `bicubic`: Bicubic interpolation.
   * `bilinear`: Bilinear interpolation.
   * `blackman`: Blackman windowed sinc.
-  * `gauss`: Gaussian kernel. `p` is specified via the `c` parameter, it must be between 1 and 100, the default value is 30.0. The base of the degree is specified by the parameter `b`, it must be between 1.5 and 3.5, the default value is 2.0. `taps` must be in the range from 0.6 to 128, with `taps=0` it is calculated automatically, the default value is 4.0.
+  * `box`: Box interpolation.
+  * `gauss`: Gaussian kernel. `p` is specified via the `b` parameter, it must be between 1 and 100, the default value is 30.0. `taps` must be in the range from 1 to 128, the default value is 4.0.
   * `kaiser`: Kaiser–Bessel windowed sinc. `beta` (`Pi` * `alpha`) is specified via the `b` parameter, it must be between 0 and 32, the default value is 4.0.
   * `lanczos`: Lanczos windowed sinc.
   * `magic`: Magic Kernel.
@@ -32,7 +33,7 @@ Implementation of multiple resize functions using double-precision convolution m
   * `spline144`: Cubic spline with 12 sample points.
 * `b`: The `b` parameter in the `bicubic` kernel. Defaults to 1/3.
 * `c`: The `c` parameter in the `bicubic` kernel. Defaults to 1/3.
-* `taps`: Window radius value for `blackman`, `gauss`, `kaiser`, `lanczos` and `nuttall` kernels, it must be between 1 and 128, the default value is 3.0 (except for `gauss`).
+* `taps`: Window radius value for `blackman`, `box`, `gauss`, `kaiser`, `lanczos` and `nuttall` kernels, it must be between 1 and 128, the default value is 3.0 (except for `gauss`).
 * `confine`: A method for representing pixels that are outside the frame. Possible values:
   * `zero`: Pixels outside the frame are considered zero.
   * `inf`: Pixels outside the frame are replaced with the nearest pixels within the frame, used by default.
@@ -110,7 +111,7 @@ Other supported values ​​are: `'adobe'` (Adobe RGB), `'dcip3'` (DCI-P3) and 
 ## GammaCorr
 `artyfox.GammaCorr(clip clip[, str gamma='srgb' or 'smpte170m', int[] planes=[0, 1, 2]])`
 
-Gamma correction of color space.
+Gamma correction of the color space.
 * `clip`: Source clip for gamma correction. Must be RGB, YUV or GRAY. 32-bit float sample type only. The range must be converted to full.
 * `gamma`: The inverse and forward gamma correction value. Correction is performed before and after resizing, in order to produce the resize itself in a linear color space. The default values ​​are `'srgb'` for RGB and `'smpte170m'` for YUV and GRAY. Two different formulas are used for RGB and YUV/GRAY. The formula for YUV/GRAY is suitable for SMPTE 170M, BT.601, BT.709, BT.2020.
 Other supported values ​​are: `'adobe'` (Adobe RGB), `'dcip3'` (DCI-P3) and `'smpte240m'` (SMPTE 240M).
@@ -121,8 +122,8 @@ Other supported values ​​are: `'adobe'` (Adobe RGB), `'dcip3'` (DCI-P3) and 
 
 Converting the bit depth of a clip.
 * `clip`: Source clip to be converted to bit depth. Must be RGB, YUV or GRAY. 8-16-bit integer or 32-bit float sample type.
-* `bits`: The bit depth of the target clip. It can be from `8` to `16` or `32`. When converting from integer to float or vice versa, a color range conversion may also occur, since in the 32-bit float format, the concept of a limited range does not exist. The range is converted according to the frame's `"_ColorRange"` property. If this property does not exist, the range is considered full for RGB and limited for YUV and GRAY. Conversion between integers occurs without regard to range. Downconversion of bit depth occurs with arithmetic rounding and saturation.
-* `direct`: If `True`, conversion from integer to float or vice versa always uses the full range and ignores the `"_ColorRange"` property. Defaults to `False`.
+* `bits`: The bit depth of the target clip. It can be from `8` to `16` or `32`. When converting from integer to float or vice versa, a color range conversion may also occur, since in the 32-bit float format, the concept of a limited range does not exist. The range is converted according to the frame's `"_ColorRange"` and `"_Range"` properties. If these properties do not exist, the range is considered full for RGB and limited for YUV and GRAY. Conversion between integers occurs without regard to range. Downconversion of bit depth occurs with arithmetic rounding and saturation.
+* `direct`: If `True`, conversion from integer to float or vice versa always uses the full range and ignores the `"_ColorRange"` and `"_Range"` properties. Defaults to `False`.
 
 ## License
 This project is licensed under the MIT License - see the LICENSE file for details.
