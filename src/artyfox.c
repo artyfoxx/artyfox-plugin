@@ -1701,6 +1701,19 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData UNUSE
         return;
     }
     
+    const char *confine = vsapi->mapGetData(in, "confine", 0, &err);
+    if (err || !strcmp(confine, "inf")) {
+        d.csr_get_weights = csr_get_weights_inf;
+    } else if (!strcmp(confine, "zero")) {
+        d.csr_get_weights = csr_get_weights_zero;
+    } else if (!strcmp(confine, "mirror")) {
+        d.csr_get_weights = csr_get_weights_mirror;
+    } else {
+        vsapi->mapSetError(out, "Resize: invalid confine specified");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
     const char *kernel = vsapi->mapGetData(in, "kernel", 0, &err);
     if (err || !strcmp(kernel, "area")) {
         area_ctx *ar_w = (area_ctx *)malloc(sizeof(*ar_w));
@@ -1847,19 +1860,6 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData UNUSE
         d.kernel_w = d.kernel_h = (kernel_t){box_kernel, sn->taps, sn};
     } else {
         vsapi->mapSetError(out, "Resize: invalid kernel specified");
-        vsapi->freeNode(d.node);
-        return;
-    }
-    
-    const char *confine = vsapi->mapGetData(in, "confine", 0, &err);
-    if (err || !strcmp(confine, "inf")) {
-        d.csr_get_weights = csr_get_weights_inf;
-    } else if (!strcmp(confine, "zero")) {
-        d.csr_get_weights = csr_get_weights_zero;
-    } else if (!strcmp(confine, "mirror")) {
-        d.csr_get_weights = csr_get_weights_mirror;
-    } else {
-        vsapi->mapSetError(out, "Resize: invalid confine specified");
         vsapi->freeNode(d.node);
         return;
     }
@@ -2483,6 +2483,19 @@ static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData UNUS
         return;
     }
     
+    const char *confine = vsapi->mapGetData(in, "confine", 0, &err);
+    if (err || !strcmp(confine, "inf")) {
+        d.csr_get_weights = csr_get_weights_inf;
+    } else if (!strcmp(confine, "zero")) {
+        d.csr_get_weights = csr_get_weights_zero;
+    } else if (!strcmp(confine, "mirror")) {
+        d.csr_get_weights = csr_get_weights_mirror;
+    } else {
+        vsapi->mapSetError(out, "Descale: invalid confine specified");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
     const char *kernel = vsapi->mapGetData(in, "kernel", 0, &err);
     if (err || !strcmp(kernel, "area")) {
         area_ctx *ar_w = (area_ctx *)malloc(sizeof(*ar_w));
@@ -2626,19 +2639,6 @@ static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData UNUS
         d.kernel_w = d.kernel_h = (kernel_t){box_kernel, sn->taps, sn};
     } else {
         vsapi->mapSetError(out, "Descale: invalid kernel specified");
-        vsapi->freeNode(d.node);
-        return;
-    }
-    
-    const char *confine = vsapi->mapGetData(in, "confine", 0, &err);
-    if (err || !strcmp(confine, "inf")) {
-        d.csr_get_weights = csr_get_weights_inf;
-    } else if (!strcmp(confine, "zero")) {
-        d.csr_get_weights = csr_get_weights_zero;
-    } else if (!strcmp(confine, "mirror")) {
-        d.csr_get_weights = csr_get_weights_mirror;
-    } else {
-        vsapi->mapSetError(out, "Descale: invalid confine specified");
         vsapi->freeNode(d.node);
         return;
     }
