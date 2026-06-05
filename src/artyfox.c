@@ -435,7 +435,8 @@ static double box_kernel(double x, void *ctx) {
 // x < 0 and y <= 0 contradict the conditions of the use case and are not processed.
 static __m256 ffast_pow(__m256 x, __m256d y) {
     __m256i i = _mm256_castps_si256(x);
-    __m256i exp = _mm256_sub_epi32(_mm256_srli_epi32(_mm256_and_si256(i, _mm256_set1_epi32(0x7F800000)), 23), _mm256_set1_epi32(127));
+    __m256i bias = _mm256_set1_epi32(127);
+    __m256i exp = _mm256_sub_epi32(_mm256_srli_epi32(_mm256_and_si256(i, _mm256_set1_epi32(0x7F800000)), 23), bias);
     __m256 mant = _mm256_or_ps(_mm256_castsi256_ps(_mm256_and_si256(i, _mm256_set1_epi32(0x007FFFFF))), _mm256_set1_ps(1.0F));
     __m256d m0 = _mm256_cvtps_pd(_mm256_extractf128_ps(mant, 0));
     __m256d m1 = _mm256_cvtps_pd(_mm256_extractf128_ps(mant, 1));
@@ -451,16 +452,15 @@ static __m256 ffast_pow(__m256 x, __m256d y) {
     temp = _mm256_set1_pd(-7.6638533210657123), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
     temp = _mm256_set1_pd(3.9049493931218771), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
     temp = _mm256_set1_pd(1.0);
-    p0 = _mm256_fmadd_pd(p0, _mm256_sub_pd(m0, temp), _mm256_cvtepi32_pd(_mm256_extractf128_ps(exp, 0)));
-    p1 = _mm256_fmadd_pd(p1, _mm256_sub_pd(m1, temp), _mm256_cvtepi32_pd(_mm256_extractf128_ps(exp, 1)));
+    p0 = _mm256_fmadd_pd(p0, _mm256_sub_pd(m0, temp), _mm256_cvtepi32_pd(_mm256_extracti128_si256(exp, 0)));
+    p1 = _mm256_fmadd_pd(p1, _mm256_sub_pd(m1, temp), _mm256_cvtepi32_pd(_mm256_extracti128_si256(exp, 1)));
     p0 = _mm256_mul_pd(p0, y), p1 = _mm256_mul_pd(p1, y);
     temp = _mm256_set1_pd(127.0), p0 = _mm256_min_pd(p0, temp), p1 = _mm256_min_pd(p1, temp);
     temp = _mm256_set1_pd(-127.0), p0 = _mm256_max_pd(p0, temp), p1 = _mm256_max_pd(p1, temp);
     __m256d i0 = _mm256_floor_pd(p0), i1 = _mm256_floor_pd(p1);
     __m256d f0 = _mm256_sub_pd(p0, i0), f1 = _mm256_sub_pd(p1, i1);
-    __m128i bias = _mm_set1_epi32(127);
-    __m256d ei0 = _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_add_epi32(_mm256_cvttpd_epi32(i0), bias), 23)));
-    __m256d ei1 = _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_add_epi32(_mm256_cvttpd_epi32(i1), bias), 23)));
+    __m256d ei0 = _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_add_epi32(_mm256_cvttpd_epi32(i0), _mm256_castsi256_si128(bias)), 23)));
+    __m256d ei1 = _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_add_epi32(_mm256_cvttpd_epi32(i1), _mm256_castsi256_si128(bias)), 23)));
     temp = _mm256_set1_pd(1.0150336705309649e-07), p0 = temp, p1 = temp;
     temp = _mm256_set1_pd(1.3259405609345135e-06), p0 = _mm256_fmadd_pd(p0, f0, temp), p1 = _mm256_fmadd_pd(p1, f1, temp);
     temp = _mm256_set1_pd(1.5252984838653427e-05), p0 = _mm256_fmadd_pd(p0, f0, temp), p1 = _mm256_fmadd_pd(p1, f1, temp);
@@ -501,8 +501,8 @@ static void to_linear(
                 __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
                 __m256 branch_0 = ffast_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
                 __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
-                __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
+                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
             }
             if (tail) {
                 __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
@@ -510,8 +510,8 @@ static void to_linear(
                 __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
                 __m256 branch_0 = ffast_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
                 __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
-                __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
+                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
             }
             srcp += stride;
             dstp += stride;
@@ -525,8 +525,8 @@ static void to_linear(
                 __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
                 __m256 branch_0 = ffast_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
                 __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
-                __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
+                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
             }
             if (tail) {
                 __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
@@ -534,8 +534,8 @@ static void to_linear(
                 __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
                 __m256 branch_0 = ffast_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
                 __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
-                __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
+                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
             }
             srcp += stride;
             dstp += stride;
@@ -570,8 +570,8 @@ static void from_linear(
                 __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
                 __m256 branch_0 = _mm256_fmsub_ps(ffast_pow(pix_abs, v_gamma), v_corr_one, v_corr);
                 __m256 branch_1 = _mm256_mul_ps(pix_abs, v_div);
-                __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
+                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
             }
             if (tail) {
                 __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
@@ -579,8 +579,8 @@ static void from_linear(
                 __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
                 __m256 branch_0 = _mm256_fmsub_ps(ffast_pow(pix_abs, v_gamma), v_corr_one, v_corr);
                 __m256 branch_1 = _mm256_mul_ps(pix_abs, v_div);
-                __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
+                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
             }
             srcp += stride;
             dstp += stride;
@@ -594,8 +594,8 @@ static void from_linear(
                 __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
                 __m256 branch_0 = _mm256_fmsub_ps(ffast_pow(pix_abs, v_gamma), v_corr_one, v_corr);
                 __m256 branch_1 = _mm256_mul_ps(pix_abs, v_div);
-                __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
+                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
             }
             if (tail) {
                 __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
@@ -603,8 +603,8 @@ static void from_linear(
                 __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
                 __m256 branch_0 = _mm256_fmsub_ps(ffast_pow(pix_abs, v_gamma), v_corr_one, v_corr);
                 __m256 branch_1 = _mm256_mul_ps(pix_abs, v_div);
-                __m256 branch = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), branch));
+                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
             }
             srcp += stride;
             dstp += stride;
@@ -620,24 +620,12 @@ static void uint8_to_uint16(
     const uint8_t *restrict srcp = ptrs;
     uint16_t *restrict dstp = ptrd;
     int count = dst_bits - src_bits;
-    int tail = src_w % 16;
-    int mod16_w = src_w - tail;
-    
-    int8_t mask_arr[16] = {0};
-    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
-    __m128i tail_mask = _mm_loadu_si128((const __m128i *)mask_arr);
     
     for (int y = 0; y < src_h; y++) {
-        int x = 0;
-        for (; x < mod16_w; x += 16) {
+        for (int x = 0; x < src_w; x += 16) {
             __m256i pix = _mm256_cvtepu8_epi16(_mm_load_si128((const __m128i *)(srcp + x)));
-            __m256i branch = _mm256_slli_epi16(pix, count);
-            _mm256_stream_si256((__m256i *)(dstp + x), branch);
-        }
-        if (tail) {
-            __m256i pix = _mm256_cvtepu8_epi16(_mm_and_si128(_mm_load_si128((const __m128i *)(srcp + x)), tail_mask));
-            __m256i branch = _mm256_slli_epi16(pix, count);
-            _mm256_stream_si256((__m256i *)(dstp + x), branch);
+            __m256i res = _mm256_slli_epi16(pix, count);
+            _mm256_stream_si256((__m256i *)(dstp + x), res);
         }
         srcp += src_stride;
         dstp += dst_stride;
@@ -651,12 +639,6 @@ static void uint8_to_float(
 ) {
     const uint8_t *restrict srcp = ptrs;
     float *restrict dstp = ptrd;
-    int tail = src_w % 16;
-    int mod16_w = src_w - tail;
-    
-    int8_t mask_arr[16] = {0};
-    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
-    __m128i tail_mask = _mm_loadu_si128((const __m128i *)mask_arr);
     
     __m256 v_low, v_high;
     if (range) {
@@ -668,29 +650,10 @@ static void uint8_to_float(
     }
     
     for (int y = 0; y < src_h; y++) {
-        int x = 0;
-        for (; x < mod16_w; x += 16) {
-            __m128i pix = _mm_load_si128((const __m128i *)(srcp + x));
-            __m256 pix_0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(pix));
-            __m256 pix_1 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_shuffle_epi32(pix, _MM_SHUFFLE(1, 0, 3, 2))));
-            __m256 branch_0 = _mm256_div_ps(_mm256_sub_ps(pix_0, v_low), v_high);
-            __m256 branch_1 = _mm256_div_ps(_mm256_sub_ps(pix_1, v_low), v_high);
-            _mm256_stream_ps(dstp + x + 0, branch_0);
-            _mm256_stream_ps(dstp + x + 8, branch_1);
-        }
-        if (tail > 8) {
-            __m128i pix = _mm_and_si128(_mm_load_si128((const __m128i *)(srcp + x)), tail_mask);
-            __m256 pix_0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(pix));
-            __m256 pix_1 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_shuffle_epi32(pix, _MM_SHUFFLE(1, 0, 3, 2))));
-            __m256 branch_0 = _mm256_div_ps(_mm256_sub_ps(pix_0, v_low), v_high);
-            __m256 branch_1 = _mm256_div_ps(_mm256_sub_ps(pix_1, v_low), v_high);
-            _mm256_stream_ps(dstp + x + 0, branch_0);
-            _mm256_stream_ps(dstp + x + 8, branch_1);
-        } else if (tail) {
-            __m128i pix = _mm_and_si128(_mm_load_si128((const __m128i *)(srcp + x)), tail_mask);
-            __m256 pix_0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(pix));
-            __m256 branch_0 = _mm256_div_ps(_mm256_sub_ps(pix_0, v_low), v_high);
-            _mm256_stream_ps(dstp + x, branch_0);
+        for (int x = 0; x < src_w; x += 8) {
+            __m256 pix = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(srcp + x))));
+            __m256 res = _mm256_div_ps(_mm256_sub_ps(pix, v_low), v_high);
+            _mm256_stream_ps(dstp + x, res);
         }
         srcp += src_stride;
         dstp += dst_stride;
@@ -704,31 +667,16 @@ static void uint16_to_uint8(
 ) {
     const uint16_t *restrict srcp = ptrs;
     uint8_t *restrict dstp = ptrd;
-    int tail = src_w % 16;
-    int mod16_w = src_w - tail;
-    
-    int16_t mask_arr[16] = {0};
-    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
-    __m256i tail_mask = _mm256_loadu_si256((const __m256i *)mask_arr);
-    
     int count = src_bits - dst_bits;
+    
     __m256i v_half = _mm256_set1_epi16(1 << (count - 1));
     
     for (int y = 0; y < src_h; y++) {
-        int x = 0;
-        for (; x < mod16_w; x += 16) {
+        for (int x = 0; x < src_w; x += 16) {
             __m256i pix = _mm256_load_si256((const __m256i *)(srcp + x));
-            __m256i branch = _mm256_srli_epi16(_mm256_adds_epu16(pix, v_half), count);
-            __m128i branch_u_0 = _mm256_extracti128_si256(branch, 0);
-            __m128i branch_u_1 = _mm256_extracti128_si256(branch, 1);
-            _mm_stream_si128((__m128i *)(dstp + x), _mm_packus_epi16(branch_u_0, branch_u_1));
-        }
-        if (tail) {
-            __m256i pix = _mm256_and_si256(_mm256_load_si256((const __m256i *)(srcp + x)), tail_mask);
-            __m256i branch = _mm256_srli_epi16(_mm256_adds_epu16(pix, v_half), count);
-            __m128i branch_u_0 = _mm256_extracti128_si256(branch, 0);
-            __m128i branch_u_1 = _mm256_extracti128_si256(branch, 1);
-            _mm_stream_si128((__m128i *)(dstp + x), _mm_packus_epi16(branch_u_0, branch_u_1));
+            __m256i res = _mm256_srli_epi16(_mm256_adds_epu16(pix, v_half), count);
+            __m128i res2 = _mm_packus_epi16(_mm256_extracti128_si256(res, 0), _mm256_extracti128_si256(res, 1));
+            _mm_stream_si128((__m128i *)(dstp + x), res2);
         }
         srcp += src_stride;
         dstp += dst_stride;
@@ -742,26 +690,14 @@ static void uint16_to_uint16(
 ) {
     const uint16_t *restrict srcp = ptrs;
     uint16_t *restrict dstp = ptrd;
-    int tail = src_w % 16;
-    int mod16_w = src_w - tail;
-    
-    int16_t mask_arr[16] = {0};
-    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
-    __m256i tail_mask = _mm256_loadu_si256((const __m256i *)mask_arr);
     
     if (src_bits < dst_bits) {
         int count = dst_bits - src_bits;
         for (int y = 0; y < src_h; y++) {
-            int x = 0;
-            for (; x < mod16_w; x += 16) {
+            for (int x = 0; x < src_w; x += 16) {
                 __m256i pix = _mm256_load_si256((const __m256i *)(srcp + x));
-                __m256i branch = _mm256_slli_epi16(pix, count);
-                _mm256_stream_si256((__m256i *)(dstp + x), branch);
-            }
-            if (tail) {
-                __m256i pix = _mm256_and_si256(_mm256_load_si256((const __m256i *)(srcp + x)), tail_mask);
-                __m256i branch = _mm256_slli_epi16(pix, count);
-                _mm256_stream_si256((__m256i *)(dstp + x), branch);
+                __m256i res = _mm256_slli_epi16(pix, count);
+                _mm256_stream_si256((__m256i *)(dstp + x), res);
             }
             srcp += src_stride;
             dstp += dst_stride;
@@ -771,16 +707,10 @@ static void uint16_to_uint16(
         __m256i v_half = _mm256_set1_epi16(1 << (count - 1));
         __m256i v_max = _mm256_set1_epi16((1 << dst_bits) - 1);
         for (int y = 0; y < src_h; y++) {
-            int x = 0;
-            for (; x < mod16_w; x += 16) {
+            for (int x = 0; x < src_w; x += 16) {
                 __m256i pix = _mm256_load_si256((const __m256i *)(srcp + x));
-                __m256i branch = _mm256_min_epu16(_mm256_srli_epi16(_mm256_adds_epu16(pix, v_half), count), v_max);
-                _mm256_stream_si256((__m256i *)(dstp + x), branch);
-            }
-            if (tail) {
-                __m256i pix = _mm256_and_si256(_mm256_load_si256((const __m256i *)(srcp + x)), tail_mask);
-                __m256i branch = _mm256_min_epu16(_mm256_srli_epi16(_mm256_adds_epu16(pix, v_half), count), v_max);
-                _mm256_stream_si256((__m256i *)(dstp + x), branch);
+                __m256i res = _mm256_min_epu16(_mm256_srli_epi16(_mm256_adds_epu16(pix, v_half), count), v_max);
+                _mm256_stream_si256((__m256i *)(dstp + x), res);
             }
             srcp += src_stride;
             dstp += dst_stride;
@@ -795,35 +725,21 @@ static void uint16_to_float(
 ) {
     const uint16_t *restrict srcp = ptrs;
     float *restrict dstp = ptrd;
-    int tail = src_w % 8;
-    int mod8_w = src_w - tail;
-    
-    int16_t mask_arr[8] = {0};
-    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
-    __m128i tail_mask = _mm_loadu_si128((const __m128i *)mask_arr);
     
     __m256 v_low, v_high;
     if (range) {
-        v_low = _mm256_set1_ps((float)((chroma ? 128 : 16) << (src_bits - 8)));
-        v_high = _mm256_set1_ps((float)((chroma ? 224 : 219) << (src_bits - 8)));
+        v_low = _mm256_set1_ps((chroma ? 128 : 16) << (src_bits - 8));
+        v_high = _mm256_set1_ps((chroma ? 224 : 219) << (src_bits - 8));
     } else {
-        v_low = _mm256_set1_ps(chroma ? (float)(128 << (src_bits - 8)) : 0.0F);
-        v_high = _mm256_set1_ps(chroma ? (float)(1 << src_bits) : (float)((1 << src_bits) - 1));
+        v_low = _mm256_set1_ps(chroma ? (128 << (src_bits - 8)) : 0);
+        v_high = _mm256_set1_ps((chroma ? 256 : 255) << (src_bits - 8));
     }
     
     for (int y = 0; y < src_h; y++) {
-        int x = 0;
-        for (; x < mod8_w; x += 8) {
-            __m128i pix = _mm_load_si128((const __m128i *)(srcp + x));
-            __m256 pix_f = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(pix));
-            __m256 branch = _mm256_div_ps(_mm256_sub_ps(pix_f, v_low), v_high);
-            _mm256_stream_ps(dstp + x, branch);
-        }
-        if (tail) {
-            __m128i pix = _mm_and_si128(_mm_load_si128((const __m128i *)(srcp + x)), tail_mask);
-            __m256 pix_f = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(pix));
-            __m256 branch = _mm256_div_ps(_mm256_sub_ps(pix_f, v_low), v_high);
-            _mm256_stream_ps(dstp + x, branch);
+        for (int x = 0; x < src_w; x += 8) {
+            __m256 pix = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm_load_si128((const __m128i *)(srcp + x))));
+            __m256 res = _mm256_div_ps(_mm256_sub_ps(pix, v_low), v_high);
+            _mm256_stream_ps(dstp + x, res);
         }
         srcp += src_stride;
         dstp += dst_stride;
@@ -837,13 +753,12 @@ static void float_to_uint8(
 ) {
     const float *restrict srcp = ptrs;
     uint8_t *restrict dstp = ptrd;
-    int tail = src_w % 16;
-    int mod16_w = src_w - tail;
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
     
-    int32_t mask_arr[16] = {0};
+    int32_t mask_arr[8] = {0};
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
-    __m256i tail_mask_0 = _mm256_loadu_si256((const __m256i *)mask_arr);
-    __m256i tail_mask_1 = _mm256_loadu_si256((const __m256i *)(mask_arr + 8));
+    __m256i tail_mask = _mm256_loadu_si256((const __m256i *)mask_arr);
     
     __m256 v_low, v_high;
     if (range) {
@@ -856,28 +771,17 @@ static void float_to_uint8(
     
     for (int y = 0; y < src_h; y++) {
         int x = 0;
-        for (; x < mod16_w; x += 16) {
-            __m256 pix_f_0 = _mm256_load_ps(srcp + x + 0);
-            __m256 pix_f_1 = _mm256_load_ps(srcp + x + 8);
-            __m256i pix_i_0 = _mm256_cvttps_epi32(_mm256_fmadd_ps(pix_f_0, v_high, v_low));
-            __m256i pix_i_1 = _mm256_cvttps_epi32(_mm256_fmadd_ps(pix_f_1, v_high, v_low));
-            __m128i pix_u_0 = _mm_packus_epi32(_mm256_extracti128_si256(pix_i_0, 0), _mm256_extracti128_si256(pix_i_0, 1));
-            __m128i pix_u_1 = _mm_packus_epi32(_mm256_extracti128_si256(pix_i_1, 0), _mm256_extracti128_si256(pix_i_1, 1));
-            _mm_stream_si128((__m128i *)(dstp + x), _mm_packus_epi16(pix_u_0, pix_u_1));
+        for (; x < mod8_w; x += 8) {
+            __m256 pix_f = _mm256_load_ps(srcp + x);
+            __m256i pix_i = _mm256_cvttps_epi32(_mm256_fmadd_ps(pix_f, v_high, v_low));
+            __m128i pix_u = _mm_packus_epi32(_mm256_extracti128_si256(pix_i, 0), _mm256_extracti128_si256(pix_i, 1));
+            _mm_stream_si64((__int64 *)(dstp + x), _mm_cvtsi128_si64(_mm_packus_epi16(pix_u, pix_u)));
         }
-        if (tail > 8) {
-            __m256 pix_f_0 = _mm256_load_ps(srcp + x + 0);
-            __m256 pix_f_1 = _mm256_maskload_ps(srcp + x + 8, tail_mask_1);
-            __m256i pix_i_0 = _mm256_cvttps_epi32(_mm256_fmadd_ps(pix_f_0, v_high, v_low));
-            __m256i pix_i_1 = _mm256_cvttps_epi32(_mm256_fmadd_ps(pix_f_1, v_high, v_low));
-            __m128i pix_u_0 = _mm_packus_epi32(_mm256_extracti128_si256(pix_i_0, 0), _mm256_extracti128_si256(pix_i_0, 1));
-            __m128i pix_u_1 = _mm_packus_epi32(_mm256_extracti128_si256(pix_i_1, 0), _mm256_extracti128_si256(pix_i_1, 1));
-            _mm_stream_si128((__m128i *)(dstp + x), _mm_packus_epi16(pix_u_0, pix_u_1));
-        } else if (tail) {
-            __m256 pix_f_0 = _mm256_maskload_ps(srcp + x, tail_mask_0);
-            __m256i pix_i_0 = _mm256_cvttps_epi32(_mm256_fmadd_ps(pix_f_0, v_high, v_low));
-            __m128i pix_u_0 = _mm_packus_epi32(_mm256_extracti128_si256(pix_i_0, 0), _mm256_extracti128_si256(pix_i_0, 1));
-            _mm_stream_si128((__m128i *)(dstp + x), _mm_packus_epi16(pix_u_0, _mm_setzero_si128()));
+        if (tail) {
+            __m256 pix_f = _mm256_maskload_ps(srcp + x, tail_mask);
+            __m256i pix_i = _mm256_cvttps_epi32(_mm256_fmadd_ps(pix_f, v_high, v_low));
+            __m128i pix_u = _mm_packus_epi32(_mm256_extracti128_si256(pix_i, 0), _mm256_extracti128_si256(pix_i, 1));
+            _mm_stream_si64((__int64 *)(dstp + x), _mm_cvtsi128_si64(_mm_packus_epi16(pix_u, pix_u)));
         }
         srcp += src_stride;
         dstp += dst_stride;
@@ -901,11 +805,11 @@ static void float_to_uint16(
     __m256i v_max = _mm256_set1_epi32((1 << dst_bits) - 1);
     __m256 v_low, v_high;
     if (range) {
-        v_low = _mm256_set1_ps(0.5F + (float)((chroma ? 128 : 16) << (dst_bits - 8)));
-        v_high = _mm256_set1_ps((float)((chroma ? 224 : 219) << (dst_bits - 8)));
+        v_low = _mm256_set1_ps(0.5F + ((chroma ? 128 : 16) << (dst_bits - 8)));
+        v_high = _mm256_set1_ps((chroma ? 224 : 219) << (dst_bits - 8));
     } else {
-        v_low = _mm256_set1_ps(chroma ? 0.5F + (float)(128 << (dst_bits - 8)) : 0.5F);
-        v_high = _mm256_set1_ps(chroma ? (float)(1 << dst_bits) : (float)((1 << dst_bits) - 1));
+        v_low = _mm256_set1_ps(chroma ? (0.5F + (128 << (dst_bits - 8))) : 0.5F);
+        v_high = _mm256_set1_ps((chroma ? 256 : 255) << (dst_bits - 8));
     }
     
     for (int y = 0; y < src_h; y++) {
@@ -942,7 +846,7 @@ static void sharp_width(
     
     __m256 v_sharp = _mm256_set1_ps(sharp);
     __m256 v_mul = _mm256_set1_ps((1.0F - sharp) / 3.0F);
-    __m256i left_idx =  _mm256_setr_epi32(0, 0, 1, 2, 3, 4, 5, 6);
+    __m256i left_idx = _mm256_setr_epi32(0, 0, 1, 2, 3, 4, 5, 6);
     
     int32_t right_arr[8];
     for (int i = 0; i < 8; i++) right_arr[i] = (i < tail - 1) ? i + 1 : tail - 1;
@@ -952,20 +856,20 @@ static void sharp_width(
         __m256 v_1 = _mm256_load_ps(srcp);
         __m256 v_2 = _mm256_loadu_ps(srcp + 1);
         __m256 v_0 = _mm256_permutevar8x32_ps(v_1, left_idx);
-        __m256 v_avg = _mm256_mul_ps(_mm256_add_ps(_mm256_add_ps(v_0, v_1), v_2), v_mul);
+        __m256 v_avg = _mm256_mul_ps(_mm256_add_ps(_mm256_add_ps(v_0, v_2), v_1), v_mul);
         _mm256_stream_ps(dstp, _mm256_fmadd_ps(v_1, v_sharp, v_avg));
         int x = 8;
         for (; x < mod8_w; x += 8) {
             v_0 = _mm256_loadu_ps(srcp + x - 1);
             v_1 = _mm256_load_ps(srcp + x);
             v_2 = _mm256_loadu_ps(srcp + x + 1);
-            v_avg = _mm256_mul_ps(_mm256_add_ps(_mm256_add_ps(v_0, v_1), v_2), v_mul);
+            v_avg = _mm256_mul_ps(_mm256_add_ps(_mm256_add_ps(v_0, v_2), v_1), v_mul);
             _mm256_stream_ps(dstp + x, _mm256_fmadd_ps(v_1, v_sharp, v_avg));
         }
         v_0 = _mm256_maskload_ps(srcp + x - 1, tail_mask_0);
         v_1 = _mm256_maskload_ps(srcp + x, tail_mask_1);
         v_2 = _mm256_permutevar8x32_ps(v_1, right_idx);
-        v_avg = _mm256_mul_ps(_mm256_add_ps(_mm256_add_ps(v_0, v_1), v_2), v_mul);
+        v_avg = _mm256_mul_ps(_mm256_add_ps(_mm256_add_ps(v_0, v_2), v_1), v_mul);
         _mm256_stream_ps(dstp + x, _mm256_fmadd_ps(v_1, v_sharp, v_avg));
         
         srcp += stride;
@@ -992,13 +896,13 @@ static void sharp_height(
     for (; x < mod8_w; x += 8) {
         __m256 v_1 = _mm256_load_ps(srcp + x);
         __m256 v_2 = _mm256_load_ps(srcp + x + stride);
-        __m256 v_avg = _mm256_mul_ps(_mm256_add_ps(_mm256_add_ps(v_1, v_1), v_2), v_mul);
+        __m256 v_avg = _mm256_mul_ps(_mm256_add_ps(_mm256_add_ps(v_1, v_2), v_1), v_mul);
         _mm256_store_ps(dstp + x, _mm256_fmadd_ps(v_1, v_sharp, v_avg));
     }
     if (tail) {
         __m256 v_1 = _mm256_maskload_ps(srcp + x, tail_mask);
         __m256 v_2 = _mm256_maskload_ps(srcp + x + stride, tail_mask);
-        __m256 v_avg = _mm256_mul_ps(_mm256_add_ps(_mm256_add_ps(v_1, v_1), v_2), v_mul);
+        __m256 v_avg = _mm256_mul_ps(_mm256_add_ps(_mm256_add_ps(v_1, v_2), v_1), v_mul);
         _mm256_store_ps(dstp + x, _mm256_fmadd_ps(v_1, v_sharp, v_avg));
     }
     srcp += stride;
@@ -1010,14 +914,14 @@ static void sharp_height(
             __m256 v_0 = _mm256_load_ps(srcp + x - stride);
             __m256 v_1 = _mm256_load_ps(srcp + x);
             __m256 v_2 = _mm256_load_ps(srcp + x + stride);
-            __m256 v_avg = _mm256_mul_ps(_mm256_add_ps(_mm256_add_ps(v_0, v_1), v_2), v_mul);
+            __m256 v_avg = _mm256_mul_ps(_mm256_add_ps(_mm256_add_ps(v_0, v_2), v_1), v_mul);
             _mm256_store_ps(dstp + x, _mm256_fmadd_ps(v_1, v_sharp, v_avg));
         }
         if (tail) {
             __m256 v_0 = _mm256_maskload_ps(srcp + x - stride, tail_mask);
             __m256 v_1 = _mm256_maskload_ps(srcp + x, tail_mask);
             __m256 v_2 = _mm256_maskload_ps(srcp + x + stride, tail_mask);
-            __m256 v_avg = _mm256_mul_ps(_mm256_add_ps(_mm256_add_ps(v_0, v_1), v_2), v_mul);
+            __m256 v_avg = _mm256_mul_ps(_mm256_add_ps(_mm256_add_ps(v_0, v_2), v_1), v_mul);
             _mm256_store_ps(dstp + x, _mm256_fmadd_ps(v_1, v_sharp, v_avg));
         }
         srcp += stride;
@@ -1670,13 +1574,13 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData UNUSE
     } else if (!strcmp(gamma, "smpte170m")) {
         d.gamma = (GammaData){1.0 / 0.45, 0.081F, 0.018F, 0.099F, 4.5F, false};
     } else if (!strcmp(gamma, "adobe")) {
-        d.gamma = (GammaData){2.19921875, 0.0F, 0.0F, 0.0F, 1.0F, false};
+        d.gamma = (GammaData){2.19921875, 0.0F, 0.0F, 0.0F, 1.0F, true};
     } else if (!strcmp(gamma, "dcip3")) {
-        d.gamma = (GammaData){2.6, 0.0F, 0.0F, 0.0F, 1.0F, false};
+        d.gamma = (GammaData){2.6, 0.0F, 0.0F, 0.0F, 1.0F, true};
     } else if (!strcmp(gamma, "smpte240m")) {
         d.gamma = (GammaData){1.0 / 0.45, 0.0913F, 0.0228F, 0.1115F, 4.0F, false};
     } else if (!strcmp(gamma, "none")) {
-        d.gamma = (GammaData){1.0, 0.0F, 0.0F, 0.0F, 1.0F, false};
+        d.gamma = (GammaData){1.0, 0.0F, 0.0F, 0.0F, 1.0F, true};
         d.linear = false;
     } else {
         vsapi->mapSetError(out, "Resize: invalid gamma specified");
@@ -1720,8 +1624,8 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData UNUSE
         area_ctx *ar_h = (area_ctx *)malloc(sizeof(*ar_h));
         ar_w->scale = (d.dst_width < d.real_w) ? (d.dst_width / d.real_w) : (d.real_w / d.dst_width);
         ar_h->scale = (d.dst_height < d.real_h) ? (d.dst_height / d.real_h) : (d.real_h / d.dst_height);
-        d.kernel_w = (kernel_t){area_kernel, 0.5 + ar_w->scale / 2.0, ar_w};
-        d.kernel_h = (kernel_t){area_kernel, 0.5 + ar_h->scale / 2.0, ar_h};
+        d.kernel_w = (kernel_t){area_kernel, 0.5 + ar_w->scale * 0.5, ar_w};
+        d.kernel_h = (kernel_t){area_kernel, 0.5 + ar_h->scale * 0.5, ar_h};
     } else if (!strcmp(kernel, "magic")) {
         d.kernel_w = d.kernel_h = (kernel_t){magic_kernel, 1.5, NULL};
     } else if (!strcmp(kernel, "magic13")) {
