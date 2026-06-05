@@ -417,6 +417,17 @@ static double gauss_kernel(double x, void *ctx) {
     return 0.0;
 }
 
+static double box_kernel(double x, void *ctx) {
+    sinc_ctx *sn = (sinc_ctx *)ctx;
+    if (x < 0.0) {
+        x = -x;
+    }
+    if (x < sn->taps) {
+        return 1.0;
+    }
+    return 0.0;
+}
+
 // exp2(log2(x) * y); 0.5 ulp
 // Based on: https://jrfonseca.blogspot.com/2008/09/fast-sse2-pow-tables-or-polynomials.html
 // All checks are removed because ffast-math is used.
@@ -1833,7 +1844,7 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData UNUSE
             free(sn);
             return;
         }
-        d.kernel_w = d.kernel_h = (kernel_t){point_kernel, sn->taps, sn};
+        d.kernel_w = d.kernel_h = (kernel_t){box_kernel, sn->taps, sn};
     } else {
         vsapi->mapSetError(out, "Resize: invalid kernel specified");
         vsapi->freeNode(d.node);
@@ -2612,7 +2623,7 @@ static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData UNUS
             free(sn);
             return;
         }
-        d.kernel_w = d.kernel_h = (kernel_t){point_kernel, sn->taps, sn};
+        d.kernel_w = d.kernel_h = (kernel_t){box_kernel, sn->taps, sn};
     } else {
         vsapi->mapSetError(out, "Descale: invalid kernel specified");
         vsapi->freeNode(d.node);
