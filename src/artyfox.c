@@ -18,7 +18,7 @@ typedef struct {
 } kernel_t;
 
 typedef struct {
-    int col_n, row_n, nnz;
+    int col_n, row_n;
     double *values;
     int *col_idx, *row_ptr;
 } csr_t;
@@ -1000,7 +1000,7 @@ static csr_t csr_get_weights_zero(kernel_t kernel, int src_n, int dst_n, double 
         row_ptr[i + 1] = nnz;
     }
     
-    return (csr_t){src_n, dst_n, nnz, weights, col_idx, row_ptr};
+    return (csr_t){src_n, dst_n, weights, col_idx, row_ptr};
 }
 
 static csr_t csr_get_weights_inf(kernel_t kernel, int src_n, int dst_n, double start_n, double real_n) {
@@ -1039,7 +1039,7 @@ static csr_t csr_get_weights_inf(kernel_t kernel, int src_n, int dst_n, double s
         row_ptr[i + 1] = nnz;
     }
     
-    return (csr_t){src_n, dst_n, nnz, weights, col_idx, row_ptr};
+    return (csr_t){src_n, dst_n, weights, col_idx, row_ptr};
 }
 
 static csr_t csr_get_weights_mirror(kernel_t kernel, int src_n, int dst_n, double start_n, double real_n) {
@@ -1083,7 +1083,7 @@ static csr_t csr_get_weights_mirror(kernel_t kernel, int src_n, int dst_n, doubl
         row_ptr[i + 1] = nnz;
     }
     
-    return (csr_t){src_n, dst_n, nnz, weights, col_idx, row_ptr};
+    return (csr_t){src_n, dst_n, weights, col_idx, row_ptr};
 }
 
 static void csr_free(csr_t csr) {
@@ -1318,7 +1318,7 @@ static const VSFrame *VS_CC ResizeGetFrame(
             }
             chroma_w = d->csr_get_weights(d->kernel_w, chroma_src_w, chroma_dst_w, start_w, real_w);
         } else {
-            chroma_w = (csr_t){0, 0, 0, NULL, NULL, NULL};
+            chroma_w = (csr_t){0, 0, NULL, NULL, NULL};
         }
         
         if (d->process_h && fi->subSamplingH) {
@@ -1335,7 +1335,7 @@ static const VSFrame *VS_CC ResizeGetFrame(
             }
             chroma_h = d->csr_get_weights(d->kernel_h, chroma_src_h, chroma_dst_h, start_h, real_h);
         } else {
-            chroma_h = (csr_t){0, 0, 0, NULL, NULL, NULL};
+            chroma_h = (csr_t){0, 0, NULL, NULL, NULL};
         }
         
         VSFrame *bcu = NULL;
@@ -1774,13 +1774,13 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData UNUSE
     if (d.process_w) {
         d.luma_w = d.csr_get_weights(d.kernel_w, d.vi.width, d.dst_width, d.start_w, d.real_w);
     } else {
-        d.luma_w = (csr_t){0, 0, 0, NULL, NULL, NULL};
+        d.luma_w = (csr_t){0, 0, NULL, NULL, NULL};
     }
     
     if (d.process_h) {
         d.luma_h = d.csr_get_weights(d.kernel_h, d.vi.height, d.dst_height, d.start_h, d.real_h);
     } else {
-        d.luma_h = (csr_t){0, 0, 0, NULL, NULL, NULL};
+        d.luma_h = (csr_t){0, 0, NULL, NULL, NULL};
     }
     
     if (d.vi.format.bytesPerSample == 1) {
@@ -1821,12 +1821,13 @@ typedef struct {
 } DescaleData;
 
 static csr_t csr_transpose(csr_t csr) {
-    double *values = (double *)malloc(sizeof(double) * csr.nnz);
-    int *col_idx = (int *)malloc(sizeof(int) * csr.nnz);
+    int nnz = csr.row_ptr[csr.row_n];
+    double *values = (double *)malloc(sizeof(double) * nnz);
+    int *col_idx = (int *)malloc(sizeof(int) * nnz);
     int *row_ptr = (int *)malloc(sizeof(int) * (csr.col_n + 1));
     int *col_count = calloc(csr.col_n, sizeof(int));
     
-    for (int i = 0; i < csr.nnz; i++) col_count[csr.col_idx[i]]++;
+    for (int i = 0; i < nnz; i++) col_count[csr.col_idx[i]]++;
     
     row_ptr[0] = 0;
     for (int i = 0; i < csr.col_n; i++) row_ptr[i + 1] = row_ptr[i] + col_count[i];
@@ -1845,7 +1846,7 @@ static csr_t csr_transpose(csr_t csr) {
     free(next);
     free(col_count);
     
-    return (csr_t){csr.row_n, csr.col_n, csr.nnz, values, col_idx, row_ptr};
+    return (csr_t){csr.row_n, csr.col_n, values, col_idx, row_ptr};
 }
 
 static int get_ku_from_csr(csr_t csr) {
@@ -2192,7 +2193,7 @@ static const VSFrame *VS_CC DescaleGetFrame(
             banded_cholesky_from_gramian(chroma_b_w);
             csr_free(temp);
         } else {
-            chroma_w = (csr_t){0, 0, 0, NULL, NULL, NULL};
+            chroma_w = (csr_t){0, 0, NULL, NULL, NULL};
             chroma_b_w = (banded_t){0, 0, 0, NULL};
         }
         
@@ -2214,7 +2215,7 @@ static const VSFrame *VS_CC DescaleGetFrame(
             banded_cholesky_from_gramian(chroma_b_h);
             csr_free(temp);
         } else {
-            chroma_h = (csr_t){0, 0, 0, NULL, NULL, NULL};
+            chroma_h = (csr_t){0, 0, NULL, NULL, NULL};
             chroma_b_h = (banded_t){0, 0, 0, NULL};
         }
         
@@ -2557,7 +2558,7 @@ static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData UNUS
         banded_cholesky_from_gramian(d.luma_b_w);
         csr_free(temp);
     } else {
-        d.luma_w = (csr_t){0, 0, 0, NULL, NULL, NULL};
+        d.luma_w = (csr_t){0, 0, NULL, NULL, NULL};
         d.luma_b_w = (banded_t){0, 0, 0, NULL};
     }
     
@@ -2568,7 +2569,7 @@ static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData UNUS
         banded_cholesky_from_gramian(d.luma_b_h);
         csr_free(temp);
     } else {
-        d.luma_h = (csr_t){0, 0, 0, NULL, NULL, NULL};
+        d.luma_h = (csr_t){0, 0, NULL, NULL, NULL};
         d.luma_b_h = (banded_t){0, 0, 0, NULL};
     }
     
