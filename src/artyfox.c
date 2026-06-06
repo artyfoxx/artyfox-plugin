@@ -1278,6 +1278,18 @@ static void resize_height(
     _mm_sfence();
 }
 
+static void vector_plane_copy(
+    const void *restrict srcp, void *restrict dstp, size_t size
+) {
+    const uint8_t *restrict ptrs = srcp;
+    uint8_t *restrict ptrd = dstp;
+    
+    for (size_t i = 0; i < size; i += 32) {
+        _mm256_stream_si256((__m256i *)(ptrd + i), _mm256_load_si256((const __m256i *)(ptrs + i)));
+    }
+    _mm_sfence();
+}
+
 static const VSFrame *VS_CC ResizeGetFrame(
     int n, int activationReason, void *instanceData, void **frameData UNUSED,
     VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi
@@ -1408,7 +1420,7 @@ static const VSFrame *VS_CC ResizeGetFrame(
             } else if (d->process_h) {
                 resize_height(srcp, dstp, dst_stride, dst_w, src_h, dst_h, sub_h ? chroma_h : d->luma_h);
             } else {
-                vsh_bitblt(dstp, sizeof(float) * dst_stride, srcp, sizeof(float) * src_stride, sizeof(float) * src_w, src_h);
+                vector_plane_copy(srcp, dstp, sizeof(float) * src_stride * src_h);
             }
             
             if (d->sharp != 1.0F) {
@@ -2249,7 +2261,7 @@ static const VSFrame *VS_CC DescaleGetFrame(
             } else if (d->process_h) {
                 descale_height(srcp, dstp, dst_stride, dst_w, src_h, dst_h, sub_h ? chroma_h : d->luma_h, sub_h ? chroma_b_h : d->luma_b_h);
             } else {
-                vsh_bitblt(dstp, sizeof(float) * dst_stride, srcp, sizeof(float) * src_stride, sizeof(float) * src_w, src_h);
+                vector_plane_copy(srcp, dstp, sizeof(float) * src_stride * src_h);
             }
         }
         
@@ -5227,7 +5239,7 @@ static const VSFrame *VS_CC LinearizeGetFrame(
             if (d->process[plane]) {
                 to_linear(srcp, dstp, src_stride, src_w, src_h, d->gamma);
             } else {
-                vsh_bitblt(dstp, sizeof(float) * src_stride, srcp, sizeof(float) * src_stride, sizeof(float) * src_w, src_h);
+                vector_plane_copy(srcp, dstp, sizeof(float) * src_stride * src_h);
             }
         }
         vsapi->freeFrame(src);
@@ -5275,9 +5287,9 @@ static void VS_CC LinearizeCreate(
     } else if (!strcmp(gamma, "smpte170m")) {
         d.gamma = (GammaData){1.0 / 0.45, 0.081F, 0.018F, 0.099F, 4.5F, false};
     } else if (!strcmp(gamma, "adobe")) {
-        d.gamma = (GammaData){2.19921875, 0.0F, 0.0F, 0.0F, 1.0F, false};
+        d.gamma = (GammaData){2.19921875, 0.0F, 0.0F, 0.0F, 1.0F, true};
     } else if (!strcmp(gamma, "dcip3")) {
-        d.gamma = (GammaData){2.6, 0.0F, 0.0F, 0.0F, 1.0F, false};
+        d.gamma = (GammaData){2.6, 0.0F, 0.0F, 0.0F, 1.0F, true};
     } else if (!strcmp(gamma, "smpte240m")) {
         d.gamma = (GammaData){1.0 / 0.45, 0.0913F, 0.0228F, 0.1115F, 4.0F, false};
     } else {
@@ -5296,7 +5308,7 @@ static void VS_CC LinearizeCreate(
         const int n = vsapi->mapGetIntSaturated(in, "planes", i, NULL);
         
         if (n < 0 || n >= d.vi.format.numPlanes) {
-            vsapi->mapSetError(out, "Linearize: plane index out of range");
+            vsapi->mapSetError(out, "Linearize: plane index is out of range");
             vsapi->freeNode(d.node);
             return;
         }
@@ -5341,7 +5353,7 @@ static const VSFrame *VS_CC GammaCorrGetFrame(
             if (d->process[plane]) {
                 from_linear(srcp, dstp, src_stride, src_w, src_h, d->gamma);
             } else {
-                vsh_bitblt(dstp, sizeof(float) * src_stride, srcp, sizeof(float) * src_stride, sizeof(float) * src_w, src_h);
+                vector_plane_copy(srcp, dstp, sizeof(float) * src_stride * src_h);
             }
         }
         vsapi->freeFrame(src);
@@ -5389,9 +5401,9 @@ static void VS_CC GammaCorrCreate(
     } else if (!strcmp(gamma, "smpte170m")) {
         d.gamma = (GammaData){1.0 / 0.45, 0.081F, 0.018F, 0.099F, 4.5F, false};
     } else if (!strcmp(gamma, "adobe")) {
-        d.gamma = (GammaData){2.19921875, 0.0F, 0.0F, 0.0F, 1.0F, false};
+        d.gamma = (GammaData){2.19921875, 0.0F, 0.0F, 0.0F, 1.0F, true};
     } else if (!strcmp(gamma, "dcip3")) {
-        d.gamma = (GammaData){2.6, 0.0F, 0.0F, 0.0F, 1.0F, false};
+        d.gamma = (GammaData){2.6, 0.0F, 0.0F, 0.0F, 1.0F, true};
     } else if (!strcmp(gamma, "smpte240m")) {
         d.gamma = (GammaData){1.0 / 0.45, 0.0913F, 0.0228F, 0.1115F, 4.0F, false};
     } else {
@@ -5410,7 +5422,7 @@ static void VS_CC GammaCorrCreate(
         const int n = vsapi->mapGetIntSaturated(in, "planes", i, NULL);
         
         if (n < 0 || n >= d.vi.format.numPlanes) {
-            vsapi->mapSetError(out, "GammaCorr: plane index out of range");
+            vsapi->mapSetError(out, "GammaCorr: plane index is out of range");
             vsapi->freeNode(d.node);
             return;
         }
