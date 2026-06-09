@@ -3277,11 +3277,9 @@ static frame_stats get_arithmetic_geometric_mean_32(
 }
 
 static inline __m256d smart_rcp(__m256d x) {
-    const __m256d zero = _mm256_setzero_pd();
     const __m256d vone = _mm256_set1_pd(1.0);
-    __m256d mask = _mm256_cmp_pd(x, zero, _CMP_EQ_OQ);
-    x = _mm256_div_pd(vone, _mm256_blendv_pd(x, vone, mask));
-    return _mm256_blendv_pd(x, zero, mask);
+    __m256d mask = _mm256_cmp_pd(x, _mm256_setzero_pd(), _CMP_EQ_OQ);
+    return _mm256_andnot_pd(mask, _mm256_div_pd(vone, _mm256_blendv_pd(x, vone, mask)));
 }
 
 static frame_stats get_harmonic_mean_8(
