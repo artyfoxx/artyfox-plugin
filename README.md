@@ -1,6 +1,6 @@
 # artyfox-plugin
 A disjointed set of filters for VapourSynth, I write everything that seems interesting.  
-The library is written using AVX2 intrinsics, so processors older than Haswell and Zen 1 are not supported.
+The library is written using AVX2 and FMA3 intrinsics, so processors older than Haswell and Zen 1 are not supported.
 ## Resize
 `artyfox.Resize(clip clip, int width, int height[, float src_left=0.0, float src_top=0.0, float src_width=clip.width, float src_height=clip.height, str kernel="area", float b=1/3, float c=1/3, float taps=3.0, str confine='inf', str gamma='srgb' or 'smpte170m', float sharp=1.0])`
 
@@ -69,9 +69,9 @@ Descaling via Tikhonov regularization and Cholesky decomposition (U.T @ U) using
 ## Mean
 `artyfox.Mean(clip clip[, str mode='am', int plane=0, bool norm=True])`
 
-Calculates the `minimum`, `maximum` and the set mean value for the specified plane of each frame of the clip and stores them in the frame properties. For the 32-bit float sample type, negative pixel values ​​are handled correctly in the `am`, `median`, and `limsad` modes; the other modes are not suitable for this usage case due to the mathematics used.
+Calculates the `minimum`, `maximum` and the set mean value for the specified plane of each frame of the clip and stores them in the frame properties. For the 32-bit float sample type, negative pixel values ​​are handled correctly in the `am`, `median`, `limsad`, `simsad`, `tbmsad` and `adtbm` modes; the other modes are not suitable for this usage case due to the mathematics used.
 * `clip`: Original clip. Must be RGB, YUV or GRAY. 8-16-bit integer or 32-bit float sample type.
-* `mode`: Algorithm for finding the mean value of a frame plane. Can take the following values:
+* `mode`: Algorithm for finding the mean value of a frame plane. Can take and return the following values:
   * `am`: Arithmetic mean (`arithmetic_mean`). Used by default.
   * `gm`: Geometric mean (`geometric_mean`). Vector log is implemented without any checks; if x<=0, it returns incorrect results, so it is necessary to manually limit the input range.
   * `agm`: Arithmetic-geometric mean (`arithmetic_geometric_mean`).
@@ -80,9 +80,12 @@ Calculates the `minimum`, `maximum` and the set mean value for the specified pla
   * `rms`: Root mean square (`root_mean_square`).
   * `rmc`: Root mean cube (`root_mean_cube`).
   * `median`: Median (`median`).
-  * `limsad`: Modified sum of absolute differences between the mutual linear interpolation of the frame fields and the true values ​​of the corresponding pixels; the `minimum` and `maximum` correspond to the minimum and maximum absolute difference between the interpolated and true values ​​of the frame (`linear_interp_msad`).
+  * `limsad`: Modified sum of absolute differences between the mutual linear (`2 points`) interpolation of the frame fields and the true values ​​of the corresponding pixels; the `minimum` and `maximum` correspond to the minimum and maximum absolute difference between the interpolated and true values ​​of the frame (`linear_interp_msad`).
+  * `simsad`: Modified sum of absolute differences between the mutual stable (`6 points`) interpolation of the frame fields and the true values ​​of the corresponding pixels; the `minimum` and `maximum` correspond to the minimum and maximum absolute difference between the interpolated and true values ​​of the frame (`stable_interp_msad`).
+  * `tbmsad`: Modified sum of absolute differences between the even and odd lines of the frame; the `minimum` and `maximum` values ​​correspond to the minimum and maximum absolute difference between even and odd lines of the frame (`top_bottom_msad`).
+  * `adtbm`: The absolute difference between the arithmetic means of the top and bottom fields of the frame; the `minimum` and `maximum` are the absolute difference between the minimums and maximums of both fields (`abs_diff_top_bottom_means`).
 * `plane`: Plane for analysis. Default is 0.
-* `norm`: Normalizes the mean to the 0:1 range. Default is true.
+* `norm`: Normalizes the mean to the 0:1 range (only for integer sample types). Default is true.
 
 ## Metric
 `artyfox.Metric(clip clip0, clip clip1[, str mode='relative', float thr=0.0])`
@@ -90,7 +93,7 @@ Calculates the `minimum`, `maximum` and the set mean value for the specified pla
 Compares two video clips and calculates the specified difference metric. The metric is stored as a frame property. The input range is always clamped to 0:1.
 * `clip0`: Original clip. Must be GRAY. 32-bit float sample type only.
 * `clip1`: Restored clip. Must be GRAY. 32-bit float sample type only. The width, height and number of frames must match the original clip.
-* `mode`: Algorithm for finding the difference between two clips. Can take the following values:
+* `mode`: Algorithm for finding the difference between two clips. Can take and return the following values:
   * `relative`: Relative error (`RelativeError`). Used by default.
   * `rmse`: Root mean square error (`RMSE`).
   * `psnr`: Peak signal-to-noise ratio (`PSNR`).
