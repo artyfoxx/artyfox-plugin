@@ -5948,6 +5948,746 @@ static void VS_CC BitDepthCreate(
     vsapi->createVideoFilter(out, "BitDepth", &d.vi, BitDepthGetFrame, BitDepthFree, fmParallel, deps, 1, data, core);
 }
 
+typedef void (*get_fix_border_func)(
+    void *restrict dstp, int dst_w, int dst_h, ptrdiff_t stride, int *target, int *donor,
+    int target_size, int donor_size, int limit, int ctx, double shift, bool clamp
+);
+
+typedef struct {
+    get_fix_border_func f;
+    int *target, *donor, target_size, donor_size, plane, limit;
+    double shift;
+    bool clamp;
+} fix_border_t;
+
+typedef struct {
+    VSNode *node;
+    fix_border_t *lanes;
+    int size;
+} FixBorderData;
+
+static void free_fix_border(fix_border_t *lanes, int size) {
+    for (int i = 0; i < size; i++) {
+        free(lanes[i].target);
+        free(lanes[i].donor);
+    }
+    free(lanes);
+}
+
+static void get_fix_border_x_8(
+    void *restrict dstp, int dst_w UNUSED, int dst_h, ptrdiff_t stride, int *target, int *donor,
+    int target_size, int donor_size, int limit, int ctx UNUSED, double shift, bool clamp
+) {
+    uint8_t *restrict ptrd = dstp;
+    uint64_t acct = 0;
+    uint64_t accd = 0;
+    int accl = 0xFF;
+    int acch = 0;
+    
+    for (int y = 0; y < dst_h; y++) {
+        for (int i = 0; i < target_size; i++) {
+            acct += (uint64_t)ptrd[target[i]];
+        }
+        for (int i = 0; i < donor_size; i++) {
+            int temp = ptrd[donor[i]];
+            accd += (uint64_t)temp;
+            if (temp < accl) accl = temp;
+            if (temp > acch) acch = temp;
+        }
+        ptrd += stride;
+    }
+    
+    double divt = (double)acct / (double)(dst_h * target_size) - shift;
+    double corr = ((double)accd / (double)(dst_h * donor_size) - shift) / (divt == 0.0 ? 1e-16 : divt);
+    double pshift = shift + 0.5;
+    ptrd = dstp;
+    
+    if (!clamp) {
+        accl = 0;
+        acch = 0xFF;
+    }
+    
+    if (limit > 0) {
+        for (int y = 0; y < dst_h; y++) {
+            for (int i = 0; i < target_size; i++) {
+                int src = ptrd[target[i]];
+                int draft = fma(src - shift, corr, pshift);
+                draft = clamp_inf(draft, accl, acch);
+                ptrd[target[i]] = clamp_inf(draft, src, src + limit);
+            }
+            ptrd += stride;
+        }
+    } else if (limit < 0) {
+        for (int y = 0; y < dst_h; y++) {
+            for (int i = 0; i < target_size; i++) {
+                int src = ptrd[target[i]];
+                int draft = fma(src - shift, corr, pshift);
+                draft = clamp_inf(draft, accl, acch);
+                ptrd[target[i]] = clamp_inf(draft, src + limit, src);
+            }
+            ptrd += stride;
+        }
+    } else {
+        for (int y = 0; y < dst_h; y++) {
+            for (int i = 0; i < target_size; i++) {
+                int src = ptrd[target[i]];
+                int draft = fma(src - shift, corr, pshift);
+                draft = clamp_inf(draft, accl, acch);
+                ptrd[target[i]] = draft;
+            }
+            ptrd += stride;
+        }
+    }
+}
+
+static void get_fix_border_y_8(
+    void *restrict dstp, int dst_w, int dst_h UNUSED, ptrdiff_t stride, int *target, int *donor,
+    int target_size, int donor_size, int limit, int ctx UNUSED, double shift, bool clamp
+) {
+    uint8_t *restrict ptrd = dstp;
+    uint64_t acct = 0;
+    uint64_t accd = 0;
+    int accl = 0xFF;
+    int acch = 0;
+    
+    for (int i = 0; i < target_size; i++) {
+        ptrd = (uint8_t *)dstp + stride * target[i];
+        for (int x = 0; x < dst_w; x++) {
+            acct += (uint64_t)ptrd[x];
+        }
+    }
+    for (int i = 0; i < donor_size; i++) {
+        ptrd = (uint8_t *)dstp + stride * donor[i];
+        for (int x = 0; x < dst_w; x++) {
+            int temp = ptrd[x];
+            accd += (uint64_t)temp;
+            if (temp < accl) accl = temp;
+            if (temp > acch) acch = temp;
+        }
+    }
+    
+    double divt = (double)acct / (double)(dst_w * target_size) - shift;
+    double corr = ((double)accd / (double)(dst_w * donor_size) - shift) / (divt == 0.0 ? 1e-16 : divt);
+    double pshift = shift + 0.5;
+    
+    if (!clamp) {
+        accl = 0;
+        acch = 0xFF;
+    }
+    
+    if (limit > 0) {
+        for (int i = 0; i < target_size; i++) {
+            ptrd = (uint8_t *)dstp + stride * target[i];
+            for (int x = 0; x < dst_w; x++) {
+                int src = ptrd[x];
+                int draft = fma(src - shift, corr, pshift);
+                draft = clamp_inf(draft, accl, acch);
+                ptrd[x] = clamp_inf(draft, src, src + limit);
+            }
+        }
+        
+    } else if (limit < 0) {
+        for (int i = 0; i < target_size; i++) {
+            ptrd = (uint8_t *)dstp + stride * target[i];
+            for (int x = 0; x < dst_w; x++) {
+                int src = ptrd[x];
+                int draft = fma(src - shift, corr, pshift);
+                draft = clamp_inf(draft, accl, acch);
+                ptrd[x] = clamp_inf(draft, src + limit, src);
+            }
+        }
+    } else {
+        for (int i = 0; i < target_size; i++) {
+            ptrd = (uint8_t *)dstp + stride * target[i];
+            for (int x = 0; x < dst_w; x++) {
+                int src = ptrd[x];
+                int draft = fma(src - shift, corr, pshift);
+                draft = clamp_inf(draft, accl, acch);
+                ptrd[x] = draft;
+            }
+        }
+    }
+}
+
+static void get_fix_border_x_16(
+    void *restrict dstp, int dst_w UNUSED, int dst_h, ptrdiff_t stride, int *target, int *donor,
+    int target_size, int donor_size, int limit, int ctx, double shift, bool clamp
+) {
+    uint16_t *restrict ptrd = dstp;
+    uint64_t acct = 0;
+    uint64_t accd = 0;
+    int accl = 0xFFFF;
+    int acch = 0;
+    int factor = 1 << (ctx - 8);
+    limit *= factor;
+    shift *= factor;
+    
+    for (int y = 0; y < dst_h; y++) {
+        for (int i = 0; i < target_size; i++) {
+            acct += (uint64_t)ptrd[target[i]];
+        }
+        for (int i = 0; i < donor_size; i++) {
+            int temp = ptrd[donor[i]];
+            accd += (uint64_t)temp;
+            if (temp < accl) accl = temp;
+            if (temp > acch) acch = temp;
+        }
+        ptrd += stride;
+    }
+    
+    double divt = (double)acct / (double)(dst_h * target_size) - shift;
+    double corr = ((double)accd / (double)(dst_h * donor_size) - shift) / (divt == 0.0 ? 1e-16 : divt);
+    double pshift = shift + 0.5;
+    ptrd = dstp;
+    
+    if (!clamp) {
+        accl = 0;
+        acch = (1 << ctx) - 1;
+    }
+    
+    if (limit > 0) {
+        for (int y = 0; y < dst_h; y++) {
+            for (int i = 0; i < target_size; i++) {
+                int src = ptrd[target[i]];
+                int draft = fma(src - shift, corr, pshift);
+                draft = clamp_inf(draft, accl, acch);
+                ptrd[target[i]] = clamp_inf(draft, src, src + limit);
+            }
+            ptrd += stride;
+        }
+    } else if (limit < 0) {
+        for (int y = 0; y < dst_h; y++) {
+            for (int i = 0; i < target_size; i++) {
+                int src = ptrd[target[i]];
+                int draft = fma(src - shift, corr, pshift);
+                draft = clamp_inf(draft, accl, acch);
+                ptrd[target[i]] = clamp_inf(draft, src + limit, src);
+            }
+            ptrd += stride;
+        }
+    } else {
+        for (int y = 0; y < dst_h; y++) {
+            for (int i = 0; i < target_size; i++) {
+                int src = ptrd[target[i]];
+                int draft = fma(src - shift, corr, pshift);
+                draft = clamp_inf(draft, accl, acch);
+                ptrd[target[i]] = draft;
+            }
+            ptrd += stride;
+        }
+    }
+}
+
+static void get_fix_border_y_16(
+    void *restrict dstp, int dst_w, int dst_h UNUSED, ptrdiff_t stride, int *target, int *donor,
+    int target_size, int donor_size, int limit, int ctx, double shift, bool clamp
+) {
+    uint16_t *restrict ptrd = dstp;
+    uint64_t acct = 0;
+    uint64_t accd = 0;
+    int accl = 0xFFFF;
+    int acch = 0;
+    int factor = 1 << (ctx - 8);
+    limit *= factor;
+    shift *= factor;
+    
+    for (int i = 0; i < target_size; i++) {
+        ptrd = (uint16_t *)dstp + stride * target[i];
+        for (int x = 0; x < dst_w; x++) {
+            acct += (uint64_t)ptrd[x];
+        }
+    }
+    for (int i = 0; i < donor_size; i++) {
+        ptrd = (uint16_t *)dstp + stride * donor[i];
+        for (int x = 0; x < dst_w; x++) {
+            int temp = ptrd[x];
+            accd += (uint64_t)temp;
+            if (temp < accl) accl = temp;
+            if (temp > acch) acch = temp;
+        }
+    }
+    
+    double divt = (double)acct / (double)(dst_w * target_size) - shift;
+    double corr = ((double)accd / (double)(dst_w * donor_size) - shift) / (divt == 0.0 ? 1e-16 : divt);
+    double pshift = shift + 0.5;
+    
+    if (!clamp) {
+        accl = 0;
+        acch = (1 << ctx) - 1;
+    }
+    
+    if (limit > 0) {
+        for (int i = 0; i < target_size; i++) {
+            ptrd = (uint16_t *)dstp + stride * target[i];
+            for (int x = 0; x < dst_w; x++) {
+                int src = ptrd[x];
+                int draft = fma(src - shift, corr, pshift);
+                draft = clamp_inf(draft, accl, acch);
+                ptrd[x] = clamp_inf(draft, src, src + limit);
+            }
+        }
+        
+    } else if (limit < 0) {
+        for (int i = 0; i < target_size; i++) {
+            ptrd = (uint16_t *)dstp + stride * target[i];
+            for (int x = 0; x < dst_w; x++) {
+                int src = ptrd[x];
+                int draft = fma(src - shift, corr, pshift);
+                draft = clamp_inf(draft, accl, acch);
+                ptrd[x] = clamp_inf(draft, src + limit, src);
+            }
+        }
+    } else {
+        for (int i = 0; i < target_size; i++) {
+            ptrd = (uint16_t *)dstp + stride * target[i];
+            for (int x = 0; x < dst_w; x++) {
+                int src = ptrd[x];
+                int draft = fma(src - shift, corr, pshift);
+                draft = clamp_inf(draft, accl, acch);
+                ptrd[x] = draft;
+            }
+        }
+    }
+}
+
+static void get_fix_border_x_32(
+    void *restrict dstp, int dst_w UNUSED, int dst_h, ptrdiff_t stride, int *target, int *donor,
+    int target_size, int donor_size, int limit, int ctx, double shift, bool clamp
+) {
+    float *restrict ptrd = dstp;
+    double acct = 0.0;
+    double accd = 0.0;
+    float accl = FLT_MAX;
+    float acch = -FLT_MAX;
+    float limit_mod = (float)limit / 255.0F;
+    shift /= 255.0;
+    if (ctx) shift -= 0.5;
+    
+    for (int y = 0; y < dst_h; y++) {
+        for (int i = 0; i < target_size; i++) {
+            acct += (double)ptrd[target[i]];
+        }
+        for (int i = 0; i < donor_size; i++) {
+            float temp = ptrd[donor[i]];
+            accd += (double)temp;
+            if (temp < accl) accl = temp;
+            if (temp > acch) acch = temp;
+        }
+        ptrd += stride;
+    }
+    
+    double divt = acct / (double)(dst_h * target_size) - shift;
+    double corr = (accd / (double)(dst_h * donor_size) - shift) / (divt == 0.0 ? 1e-16 : divt);
+    ptrd = dstp;
+    
+    if (!clamp) {
+        if (ctx) {
+            accl = -0.5F;
+            acch = 0.5F;
+        } else {
+            accl = 0.0F;
+            acch = 1.0F;
+        }
+    }
+    
+    if (limit > 0) {
+        for (int y = 0; y < dst_h; y++) {
+            for (int i = 0; i < target_size; i++) {
+                float src = ptrd[target[i]];
+                float draft = fma(src - shift, corr, shift);
+                draft = fmaxf(fminf(draft, acch), accl);
+                ptrd[target[i]] = fmaxf(fminf(draft, src + limit_mod), src);
+            }
+            ptrd += stride;
+        }
+    } else if (limit < 0) {
+        for (int y = 0; y < dst_h; y++) {
+            for (int i = 0; i < target_size; i++) {
+                float src = ptrd[target[i]];
+                float draft = fma(src - shift, corr, shift);
+                draft = fmaxf(fminf(draft, acch), accl);
+                ptrd[target[i]] = fmaxf(fminf(draft, src), src + limit_mod);
+            }
+            ptrd += stride;
+        }
+    } else {
+        for (int y = 0; y < dst_h; y++) {
+            for (int i = 0; i < target_size; i++) {
+                float src = ptrd[target[i]];
+                float draft = fma(src - shift, corr, shift);
+                draft = fmaxf(fminf(draft, acch), accl);
+                ptrd[target[i]] = draft;
+            }
+            ptrd += stride;
+        }
+    }
+}
+
+static void get_fix_border_y_32(
+    void *restrict dstp, int dst_w, int dst_h UNUSED, ptrdiff_t stride, int *target, int *donor,
+    int target_size, int donor_size, int limit, int ctx, double shift, bool clamp
+) {
+    float *restrict ptrd = dstp;
+    double acct = 0.0;
+    double accd = 0.0;
+    float accl = FLT_MAX;
+    float acch = -FLT_MAX;
+    float limit_mod = (float)limit / 255.0F;
+    shift /= 255.0;
+    if (ctx) shift -= 0.5;
+    
+    for (int i = 0; i < target_size; i++) {
+        ptrd = (float *)dstp + stride * target[i];
+        for (int x = 0; x < dst_w; x++) {
+            acct += (double)ptrd[x];
+        }
+    }
+    for (int i = 0; i < donor_size; i++) {
+        ptrd = (float *)dstp + stride * donor[i];
+        for (int x = 0; x < dst_w; x++) {
+            float temp = ptrd[x];
+            accd += (double)temp;
+            if (temp < accl) accl = temp;
+            if (temp > acch) acch = temp;
+        }
+    }
+    
+    double divt = acct / (double)(dst_w * target_size) - shift;
+    double corr = (accd / (double)(dst_w * donor_size) - shift) / (divt == 0.0 ? 1e-16 : divt);
+    
+    if (!clamp) {
+        if (ctx) {
+            accl = -0.5F;
+            acch = 0.5F;
+        } else {
+            accl = 0.0F;
+            acch = 1.0F;
+        }
+    }
+    
+    if (limit > 0) {
+        for (int i = 0; i < target_size; i++) {
+            ptrd = (float *)dstp + stride * target[i];
+            for (int x = 0; x < dst_w; x++) {
+                float src = ptrd[x];
+                float draft = fma(src - shift, corr, shift);
+                draft = fmaxf(fminf(draft, acch), accl);
+                ptrd[x] = fmaxf(fminf(draft, src + limit_mod), src);
+            }
+        }
+    } else if (limit < 0) {
+        for (int i = 0; i < target_size; i++) {
+            ptrd = (float *)dstp + stride * target[i];
+            for (int x = 0; x < dst_w; x++) {
+                float src = ptrd[x];
+                float draft = fma(src - shift, corr, shift);
+                draft = fmaxf(fminf(draft, acch), accl);
+                ptrd[x] = fmaxf(fminf(draft, src), src + limit_mod);
+            }
+        }
+    } else {
+        for (int i = 0; i < target_size; i++) {
+            ptrd = (float *)dstp + stride * target[i];
+            for (int x = 0; x < dst_w; x++) {
+                float src = ptrd[x];
+                float draft = fma(src - shift, corr, shift);
+                draft = fmaxf(fminf(draft, acch), accl);
+                ptrd[x] = draft;
+            }
+        }
+    }
+}
+
+static const VSFrame *VS_CC FixBorderGetFrame(
+    int n, int activationReason, void *instanceData, void **frameData UNUSED,
+    VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi
+) {
+    FixBorderData *d = (FixBorderData *)instanceData;
+    
+    if (activationReason == arInitial) {
+        vsapi->requestFrameFilter(n, d->node, frameCtx);
+    } else if (activationReason == arAllFramesReady) {
+        const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
+        const VSVideoFormat *fi = vsapi->getVideoFrameFormat(src);
+        VSFrame *dst = vsapi->copyFrame(src, core);
+        
+        for (int k = 0; k < d->size; k++) {
+            int plane = d->lanes[k].plane;
+            int ctx = (fi->sampleType == stInteger) ? fi->bitsPerSample : ((fi->colorFamily == cfYUV) ? plane : 0);
+            void *restrict dstp = vsapi->getWritePtr(dst, plane);
+            ptrdiff_t dst_stride = vsapi->getStride(dst, plane) / fi->bytesPerSample;
+            int dst_w = vsapi->getFrameWidth(dst, plane);
+            int dst_h = vsapi->getFrameHeight(dst, plane);
+            d->lanes[k].f(
+                dstp, dst_w, dst_h, dst_stride, d->lanes[k].target, d->lanes[k].donor, d->lanes[k].target_size,
+                d->lanes[k].donor_size, d->lanes[k].limit, ctx, d->lanes[k].shift, d->lanes[k].clamp
+            );
+        }
+        
+        vsapi->freeFrame(src);
+        return dst;
+    }
+    return NULL;
+}
+
+static void VS_CC FixBorderFree(void *instanceData, VSCore *core UNUSED, const VSAPI *vsapi) {
+    FixBorderData *d = (FixBorderData *)instanceData;
+    vsapi->freeNode(d->node);
+    free_fix_border(d->lanes, d->size);
+    free(d);
+}
+
+static void VS_CC FixBorderCreate(
+    const VSMap *in, VSMap *out, void *userData UNUSED, VSCore *core, const VSAPI *vsapi
+) {
+    FixBorderData d;
+    d.node = vsapi->mapGetNode(in, "clip", 0, NULL);
+    const VSVideoInfo *vi = vsapi->getVideoInfo(d.node);
+    
+    if (
+        !vsh_isConstantVideoFormat(vi) ||
+        (vi->format.sampleType == stInteger && (vi->format.bitsPerSample < 8 || vi->format.bitsPerSample > 16)) ||
+        (vi->format.sampleType == stFloat && vi->format.bitsPerSample != 32)
+    ) {
+        vsapi->mapSetError(out, "FixBorder: only constant format 8-16bit integer or 32bit float input supported");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    get_fix_border_func axis_x, axis_y;
+    switch (vi->format.bytesPerSample) {
+        case 1: axis_x = get_fix_border_x_8; axis_y = get_fix_border_y_8; break;
+        case 2: axis_x = get_fix_border_x_16; axis_y = get_fix_border_y_16; break;
+        default: axis_x = get_fix_border_x_32; axis_y = get_fix_border_y_32; break;
+    }
+    
+    d.size = vsapi->mapNumElements(in, "fix");
+    if (d.size <= 0) {
+        vsapi->mapSetError(out, "FixBorder: the \"fix\" is mandatory");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    d.lanes = (fix_border_t *)malloc(sizeof(fix_border_t) * d.size);
+    
+    for (int k = 0; k < d.size; k++) {
+        d.lanes[k].target = NULL;
+        d.lanes[k].donor = NULL;
+        d.lanes[k].target_size = 0;
+        d.lanes[k].donor_size = 0;
+    }
+    
+    for (int k = 0; k < d.size; k++) {
+        const char *fix = vsapi->mapGetData(in, "fix", k, NULL);
+        char *buf = strdup(fix);
+        char *ctx0;
+        char *current = strtok_r(buf, " ", &ctx0);
+        if (current == NULL) {
+            vsapi->mapSetError(out, "FixBorder: the \"plane\" parameter is mandatory");
+            vsapi->freeNode(d.node);
+            free(buf);
+            free_fix_border(d.lanes, d.size);
+            return;
+        }
+        
+        char *ctx1;
+        d.lanes[k].plane = strtol(current, &ctx1, 10);
+        if (*ctx1 != '\0' || d.lanes[k].plane < 0 || d.lanes[k].plane >= vi->format.numPlanes) {
+            vsapi->mapSetError(out, "FixBorder: plane index is out of range");
+            vsapi->freeNode(d.node);
+            free(buf);
+            free_fix_border(d.lanes, d.size);
+            return;
+        }
+        
+        int max_idx = 0;
+        current = strtok_r(NULL, " ", &ctx0);
+        if (current == NULL) {
+            vsapi->mapSetError(out, "FixBorder: the \"axis\" parameter is mandatory");
+            vsapi->freeNode(d.node);
+            free(buf);
+            free_fix_border(d.lanes, d.size);
+            return;
+        }
+        if (!strcmp(current, "x")) {
+            d.lanes[k].f = axis_x;
+            max_idx = (d.lanes[k].plane ? (vi->width >> vi->format.subSamplingW) : vi->width) - 1;
+        } else if (!strcmp(current, "y")) {
+            d.lanes[k].f = axis_y;
+            max_idx = (d.lanes[k].plane ? (vi->height >> vi->format.subSamplingH) : vi->height) - 1;
+        } else {
+            vsapi->mapSetError(out, "FixBorder: invalid axis specified");
+            vsapi->freeNode(d.node);
+            free(buf);
+            free_fix_border(d.lanes, d.size);
+            return;
+        }
+        
+        current = strtok_r(NULL, " ", &ctx0);
+        if (current == NULL) {
+            vsapi->mapSetError(out, "FixBorder: the \"target\" parameter is mandatory");
+            vsapi->freeNode(d.node);
+            free(buf);
+            free_fix_border(d.lanes, d.size);
+            return;
+        }
+        
+        char *ctx2;
+        current = strtok_r(current, ",", &ctx2);
+        
+        for (int i = 0; i < 256; i++) {
+            int n = strtol(current, &ctx1, 10);
+            if (n < 0) {
+                n = max_idx - ~n;
+            }
+            if (*ctx1 != '\0' || n < 0 || n > max_idx) {
+                vsapi->mapSetError(out, "FixBorder: target is out of range");
+                vsapi->freeNode(d.node);
+                free(buf);
+                free_fix_border(d.lanes, d.size);
+                return;
+            }
+            for (int j = 0; j < i; j++) {
+                if (d.lanes[k].target[j] == n) {
+                    vsapi->mapSetError(out, "FixBorder: target specified twice");
+                    vsapi->freeNode(d.node);
+                    free(buf);
+                    free_fix_border(d.lanes, d.size);
+                    return;
+                }
+            }
+            d.lanes[k].target = realloc(d.lanes[k].target, sizeof(int) * ++d.lanes[k].target_size);
+            d.lanes[k].target[i] = n;
+            
+            current = strtok_r(NULL, ",", &ctx2);
+            if (current == NULL) break;
+        }
+        
+        if (current != NULL) {
+            vsapi->mapSetError(out, "FixBorder: the number of indexes in the target must not exceed 256");
+            vsapi->freeNode(d.node);
+            free(buf);
+            free_fix_border(d.lanes, d.size);
+            return;
+        }
+        
+        current = strtok_r(NULL, " ", &ctx0);
+        if (current == NULL) {
+            vsapi->mapSetError(out, "FixBorder: the \"donor\" parameter is mandatory");
+            vsapi->freeNode(d.node);
+            free(buf);
+            free_fix_border(d.lanes, d.size);
+            return;
+        }
+        
+        current = strtok_r(current, ",", &ctx2);
+        
+        for (int i = 0; i < 256; i++) {
+            int n = strtol(current, &ctx1, 10);
+            if (n < 0) {
+                n = max_idx - ~n;
+            }
+            if (*ctx1 != '\0' || n < 0 || n > max_idx) {
+                vsapi->mapSetError(out, "FixBorder: donor is out of range");
+                vsapi->freeNode(d.node);
+                free(buf);
+                free_fix_border(d.lanes, d.size);
+                return;
+            }
+            for (int j = 0; j < i; j++) {
+                if (d.lanes[k].donor[j] == n) {
+                    vsapi->mapSetError(out, "FixBorder: donor specified twice");
+                    vsapi->freeNode(d.node);
+                    free(buf);
+                    free_fix_border(d.lanes, d.size);
+                    return;
+                }
+            }
+            for (int j = 0; j < d.lanes[k].target_size; j++) {
+                if (d.lanes[k].target[j] == n) {
+                    vsapi->mapSetError(out, "FixBorder: donor cannot match target");
+                    vsapi->freeNode(d.node);
+                    free(buf);
+                    free_fix_border(d.lanes, d.size);
+                    return;
+                }
+            }
+            d.lanes[k].donor = realloc(d.lanes[k].donor, sizeof(int) * ++d.lanes[k].donor_size);
+            d.lanes[k].donor[i] = n;
+            
+            current = strtok_r(NULL, ",", &ctx2);
+            if (current == NULL) break;
+        }
+        
+        if (current != NULL) {
+            vsapi->mapSetError(out, "FixBorder: the number of indexes in the donor must not exceed 256");
+            vsapi->freeNode(d.node);
+            free(buf);
+            free_fix_border(d.lanes, d.size);
+            return;
+        }
+        
+        current = strtok_r(NULL, " ", &ctx0);
+        if (current == NULL) {
+            d.lanes[k].limit = 0;
+        } else {
+            d.lanes[k].limit = strtol(current, &ctx1, 10);
+            if (*ctx1 != '\0' || d.lanes[k].limit < -255 || d.lanes[k].limit > 255) {
+                vsapi->mapSetError(out, "FixBorder: limit must be between -255 and 255");
+                vsapi->freeNode(d.node);
+                free(buf);
+                free_fix_border(d.lanes, d.size);
+                return;
+            }
+        }
+        
+        current = strtok_r(NULL, " ", &ctx0);
+        if (current == NULL) {
+            d.lanes[k].shift = 0.0;
+        } else {
+            d.lanes[k].shift = strtod(current, &ctx1);
+            if (*ctx1 != '\0' || d.lanes[k].shift < -19.0 || d.lanes[k].shift > 279.0) {
+                vsapi->mapSetError(out, "FixBorder: shift must be between -19.0 and 279.0");
+                vsapi->freeNode(d.node);
+                free(buf);
+                free_fix_border(d.lanes, d.size);
+                return;
+            }
+        }
+        
+        current = strtok_r(NULL, " ", &ctx0);
+        if (current == NULL) {
+            d.lanes[k].clamp = true;
+        } else {
+            d.lanes[k].clamp = !!strtol(current, &ctx1, 10);
+            if (*ctx1 != '\0') {
+                vsapi->mapSetError(out, "FixBorder: clamp must be 0 or 1");
+                vsapi->freeNode(d.node);
+                free(buf);
+                free_fix_border(d.lanes, d.size);
+                return;
+            }
+        }
+        
+        current = strtok_r(NULL, " ", &ctx0);
+        if (current != NULL) {
+            vsapi->mapSetError(out, "FixBorder: too many parameters specified");
+            vsapi->freeNode(d.node);
+            free(buf);
+            free_fix_border(d.lanes, d.size);
+            return;
+        }
+        
+        free(buf);
+    }
+    
+    FixBorderData *data = (FixBorderData *)malloc(sizeof d);
+    *data = d;
+    
+    VSFilterDependency deps[] = {{d.node, rpStrictSpatial}};
+    vsapi->createVideoFilter(out, "FixBorder", vi, FixBorderGetFrame, FixBorderFree, fmParallel, deps, 1, data, core);
+}
+
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
     vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(18, 3), VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction("Resize",
@@ -6027,6 +6767,13 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
                              "direct:int:opt;",
                              "clip:vnode;",
                              BitDepthCreate,
+                             NULL,
+                             plugin);
+    vspapi->registerFunction("FixBorder",
+                             "clip:vnode;"
+                             "fix:data[];",
+                             "clip:vnode;",
+                             FixBorderCreate,
                              NULL,
                              plugin);
 }

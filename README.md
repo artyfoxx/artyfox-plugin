@@ -128,5 +128,19 @@ Converting the bit depth of a clip.
 * `bits`: The bit depth of the target clip. It can be from `8` to `16` or `32`. When converting from integer to float or vice versa, a color range conversion may also occur, since in the 32-bit float format, the concept of a limited range does not exist. The range is converted according to the frame's `"_ColorRange"` and `"_Range"` properties. If these properties do not exist, the range is considered full for RGB and limited for YUV and GRAY. Conversion between integers occurs without regard to range. Downconversion of bit depth occurs with arithmetic rounding and saturation.
 * `direct`: If `True`, conversion from integer to float or vice versa always uses the full range and ignores the `"_ColorRange"` and `"_Range"` properties. Defaults to `False`.
 
+## FixBorder
+`artyfox.FixBorder(clip clip, str[] fix)`
+
+Function for correcting brightness artifacts at frame borders.
+* `clip`: The clip that needs correction.
+* `fix`: A list containing strings with instructions for correction. The string has the following format: "`plane` `axis` `target` `donor` `limit` `shift` `clamp`". The first four values are mandatory.
+  * `plane`: The target plane.
+  * `axis`: The axis along which the correction is performed. 'x' - columns, 'y' - rows.
+  * `target`: The target column/row that needs correction. Counted from the upper left corner of the frame. Can be an integer or several comma-separated numbers (no more than 256). Can be negative, in which case it is counted from the lower right corner.
+  * `donor`: The donor column/row on which the correction is based. Counted from the upper left corner of the frame. Can be an integer or several comma-separated numbers (no more than 256). Can be negative, in which case it is counted from the lower right corner.
+  * `limit`: Limit on the maximum brightness change. If the value is positive, the brightness cannot rise above or fall, if negative, it cannot fall below the specified value or rise. Specified in 8-bit notation. Default is 0 (no limit). The allowed range of values ​​is from -255 to 255.
+  * `shift`: Shift the zero point of the correction curve relative to the beginning of the range. Specified in 8-bit notation. Default is 0.0. The allowed range of values ​​is from -19.0 to 279.0. Note: The function that converts a string to a double can take the fraction separator from the system locale settings. If a period separator causes an error, use the separator set in your system.
+  * `clamp`: Clamps the brightness of the corrected target column/row between the maximum and minimum of the donor column/row. Defaults to True.
+
 ## License
 This project is licensed under the MIT License - see the LICENSE file for details.
