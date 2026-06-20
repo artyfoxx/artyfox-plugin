@@ -6258,7 +6258,6 @@ static void get_fix_border_x_32(
     float acch = -FLT_MAX;
     float limit_mod = (float)limit / 255.0F;
     shift /= 255.0;
-    if (ctx) shift -= 0.5;
     
     for (int y = 0; y < dst_h; y++) {
         for (int i = 0; i < target_size; i++) {
@@ -6331,7 +6330,6 @@ static void get_fix_border_y_32(
     float acch = -FLT_MAX;
     float limit_mod = (float)limit / 255.0F;
     shift /= 255.0;
-    if (ctx) shift -= 0.5;
     
     for (int i = 0; i < target_size; i++) {
         ptrd = (float *)dstp + stride * target[i];
@@ -6650,6 +6648,9 @@ static void VS_CC FixBorderCreate(
                 free_fix_border(d.lanes, d.size);
                 return;
             }
+        }
+        if (vi->format.colorFamily == cfYUV && d.lanes[k].plane) {
+            d.lanes[k].shift = (vi->format.sampleType == stInteger) ? 128.0 : 0.0;
         }
         
         current = strtok_r(NULL, " ", &ctx0);
