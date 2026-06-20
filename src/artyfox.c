@@ -1380,8 +1380,8 @@ static const VSFrame *VS_CC ResizeGetFrame(
             const void *restrict srcp = (const void *)vsapi->getReadPtr(src, plane);
             ptrdiff_t src_stride = vsapi->getStride(src, plane) / fi->bytesPerSample;
             
-            void *restrict dstp = NULL;
-            ptrdiff_t dst_stride = 0;
+            void *restrict dstp = (void *)vsapi->getWritePtr(dst, plane);
+            ptrdiff_t dst_stride = vsapi->getStride(dst, plane) / fi->bytesPerSample;
             
             int src_w = vsapi->getFrameWidth(src, plane);
             int src_h = vsapi->getFrameHeight(src, plane);
@@ -1392,27 +1392,24 @@ static const VSFrame *VS_CC ResizeGetFrame(
             bool sub_h = plane && fi->subSamplingH;
             
             if (bit_convert) {
-                float *restrict bcup = (float *)vsapi->getWritePtr(bcu, plane);
+                void *restrict bcup = (void *)vsapi->getWritePtr(bcu, plane);
                 ptrdiff_t bcu_stride = vsapi->getStride(bcu, plane) / sizeof(float);
                 d->conv_up(srcp, bcup, src_stride, bcu_stride, src_w, src_h, fi->bitsPerSample, 32, range, chroma);
                 srcp = bcup;
                 src_stride = bcu_stride;
                 dstp = (void *)vsapi->getWritePtr(bcd, plane);
                 dst_stride = vsapi->getStride(bcd, plane) / sizeof(float);
-            } else {
-                dstp = (void *)vsapi->getWritePtr(dst, plane);
-                dst_stride = vsapi->getStride(dst, plane) / sizeof(float);
             }
             
             if (d->linear) {
-                float *restrict linp = (float *)vsapi->getWritePtr(lin, plane);
+                void *restrict linp = (void *)vsapi->getWritePtr(lin, plane);
                 to_linear(srcp, linp, src_stride, src_w, src_h, d->gamma);
                 srcp = linp;
                 dstp = (void *)vsapi->getWritePtr(gcr, plane);
             }
             
             if (d->process_w && d->process_h) {
-                float *restrict tmpp = (float *)vsapi->getWritePtr(tmp, plane);
+                void *restrict tmpp = (void *)vsapi->getWritePtr(tmp, plane);
                 resize_width(srcp, tmpp, src_stride, dst_stride, src_w, src_h, dst_w, sub_w ? chroma_w : d->luma_w);
                 resize_height(tmpp, dstp, dst_stride, dst_w, src_h, dst_h, sub_h ? chroma_h : d->luma_h);
             } else if (d->process_w) {
@@ -1424,19 +1421,19 @@ static const VSFrame *VS_CC ResizeGetFrame(
             }
             
             if (d->sharp != 1.0F) {
-                float *restrict shrp = (float *)vsapi->getWritePtr(shr, plane);
+                void *restrict shrp = (void *)vsapi->getWritePtr(shr, plane);
                 sharp_width(dstp, shrp, dst_stride, dst_w, dst_h, d->sharp);
                 sharp_height(shrp, dstp, dst_stride, dst_w, dst_h, d->sharp);
             }
             
             if (d->linear) {
-                float *restrict gcrp = dstp;
+                void *restrict gcrp = dstp;
                 dstp = bit_convert ? (void *)vsapi->getWritePtr(bcd, plane) : (void *)vsapi->getWritePtr(dst, plane);
                 from_linear(gcrp, dstp, dst_stride, dst_w, dst_h, d->gamma);
             }
             
             if (bit_convert) {
-                float *restrict bcdp = dstp;
+                void *restrict bcdp = dstp;
                 dstp = (void *)vsapi->getWritePtr(dst, plane);
                 ptrdiff_t bcd_stride = dst_stride;
                 dst_stride = vsapi->getStride(dst, plane) / fi->bytesPerSample;
