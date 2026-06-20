@@ -1,6 +1,18 @@
 # artyfox-plugin
 A disjointed set of filters for VapourSynth, I write everything that seems interesting.  
 The library is written using AVX2 and FMA3 intrinsics, so processors older than Haswell and Zen 1 are not supported.
+
+## Filters
+* [**Resize**](#resize)  
+* [**Descale**](#descale)  
+* [**Mean**](#mean)  
+* [**Metric**](#metric)  
+* [**Linearize**](#linearize)  
+* [**GammaCorr**](#gammacorr)  
+* [**BitDepth**](#bitdepth)  
+* [**FixBorder**](#fixborder)  
+* [**AverageFields**](#averagefields)
+
 ## Resize
 `artyfox.Resize(clip clip, int width, int height[, float src_left=0.0, float src_top=0.0, float src_width=clip.width, float src_height=clip.height, str kernel="area", float b=1/3, float c=1/3, float taps=3.0, str confine='inf', str gamma='srgb' or 'smpte170m', float sharp=1.0])`
 
@@ -56,10 +68,28 @@ Descaling via Tikhonov regularization and Cholesky decomposition (U.T @ U) using
 * `src_top`: The `y` coordinate of the point where the destination region after descaling starts. Defaults to 0.0
 * `src_width`: The width of the destination region after descaling relative to `src_left`. Defaults to `width`.
 * `src_height`: The height of the destination region after descaling relative to `src_top`. Defaults to `height`.
-* `kernel`: Selecting a kernel for deconvolution. See `Resize` for possible values.
+* `kernel`: Selecting a kernel for deconvolution. Possible values:
+  * `area`: Area Resize, used by default.
+  * `bicubic`: Bicubic interpolation.
+  * `bilinear`: Bilinear interpolation.
+  * `blackman`: Blackman windowed sinc.
+  * `box`: Box interpolation.
+  * `gauss`: Gaussian kernel. `p` is specified via the `b` parameter, it must be between 1 and 100, the default value is 30.0. `taps` must be in the range from 1 to 128, the default value is 4.0.
+  * `kaiser`: Kaiser–Bessel windowed sinc. `beta` (`Pi` * `alpha`) is specified via the `b` parameter, it must be between 0 and 32, the default value is 4.0.
+  * `lanczos`: Lanczos windowed sinc.
+  * `magic`: Magic Kernel.
+  * `magic13`: Magic Kernel Sharp 2013.
+  * `magic21`: Magic Kernel Sharp 2021.
+  * `nuttall`: Nuttall windowed sinc.
+  * `point`: Nearest neighbour interpolation.
+  * `spline16`: Cubic spline with 4 sample points.
+  * `spline36`: Cubic spline with 6 sample points.
+  * `spline64`: Cubic spline with 8 sample points.
+  * `spline100`: Cubic spline with 10 sample points.
+  * `spline144`: Cubic spline with 12 sample points.
 * `b`: The `b` parameter in the `bicubic` kernel. Defaults to 1/3.
 * `c`: The `c` parameter in the `bicubic` kernel. Defaults to 1/3.
-* `taps`: Window radius value for `blackman`, `gauss`, `kaiser`, `lanczos` and `nuttall` kernels, it must be between 1 and 128, the default value is 3.0 (except for `gauss`).
+* `taps`: Window radius value for `blackman`, `box`, `gauss`, `kaiser`, `lanczos` and `nuttall` kernels, it must be between 1 and 128, the default value is 3.0 (except for `gauss`).
 * `confine`: A method for representing pixels that are outside the frame. Possible values:
   * `zero`: Pixels outside the frame are considered zero.
   * `inf`: Pixels outside the frame are replaced with the nearest pixels within the frame, used by default.
