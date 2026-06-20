@@ -139,8 +139,16 @@ Function for correcting brightness artifacts at frame borders.
   * `target`: The target column/row that needs correction. Counted from the upper left corner of the frame. Can be an integer or several comma-separated numbers (no more than 256). Can be negative, in which case it is counted from the lower right corner.
   * `donor`: The donor column/row on which the correction is based. Counted from the upper left corner of the frame. Can be an integer or several comma-separated numbers (no more than 256). Can be negative, in which case it is counted from the lower right corner.
   * `limit`: Limit on the maximum brightness change. If the value is positive, the brightness cannot rise above or fall, if negative, it cannot fall below the specified value or rise. Specified in 8-bit notation. Default is 0 (no limit). The allowed range of values ​​is from -255 to 255.
-  * `shift`: Shift the zero point of the correction curve relative to the beginning of the range. Specified in 8-bit notation. Default is 0.0. The allowed range of values ​​is from -19.0 to 279.0. Note: The function that converts a string to a double can take the fraction separator from the system locale settings. If a period separator causes an error, use the separator set in your system.
+  * `shift`: Shift the zero point of the correction curve relative to the beginning of the range. For YUV, it applies to luma only. Specified in 8-bit notation. Default is 0.0. The allowed range of values ​​is from -19.0 to 279.0. Note: The function that converts a string to a double can take the fraction separator from the system locale settings. If a period separator causes an error, use the separator set in your system.
   * `clamp`: Clamps the brightness of the corrected target column/row between the maximum and minimum of the donor column/row. Defaults to True.
+
+## AverageFields
+`artyfox.AverageFields(clip clip[, float weight=0.5, float shift=0.0])`
+
+A function for correcting interlaced fades. It works by averaging the fields of a frame based on their average brightness ratio.
+* `clip`: The clip that needs correction.
+* `weight`: The ratio of the contribution of fields to the resulting clip. 0.0 means the top field remains unchanged, and the bottom field is adjusted based on the top field. 1.0 means the bottom field remains unchanged, and the top field is adjusted based on the bottom field. Anything in between means the fields are mutually adjusted based on the set ratio. Default is 0.5. The allowed range of values ​​is from 0.0 to 1.0.
+* `shift`: Shift the zero point of the correction curve relative to the beginning of the range. For YUV, it applies to luma only. Specified in 8-bit notation. Default is 0.0. The allowed range of values ​​is from -19.0 to 279.0.
 
 ## License
 This project is licensed under the MIT License - see the LICENSE file for details.
