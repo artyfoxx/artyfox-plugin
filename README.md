@@ -2,16 +2,42 @@
 A disjointed set of filters for VapourSynth, I write everything that seems interesting.  
 The library is written using AVX2 and FMA3 intrinsics, so processors older than Haswell and Zen 1 are not supported.
 
-## Filters
+## Filters:
+* [**BitDepth**](#bitdepth)  
+* [**Linearize**](#linearize)  
+* [**GammaCorr**](#gammacorr)  
 * [**Resize**](#resize)  
 * [**Descale**](#descale)  
 * [**Mean**](#mean)  
 * [**Metric**](#metric)  
-* [**Linearize**](#linearize)  
-* [**GammaCorr**](#gammacorr)  
-* [**BitDepth**](#bitdepth)  
 * [**FixBorder**](#fixborder)  
 * [**AverageFields**](#averagefields)
+
+## BitDepth
+`artyfox.BitDepth(clip clip, int bits[, bool direct=False])`
+
+Converting the bit depth of a clip.
+* `clip`: Source clip to be converted to bit depth. Must be RGB, YUV or GRAY. 8-16-bit integer or 32-bit float sample type.
+* `bits`: The bit depth of the target clip. It can be from `8` to `16` or `32`. When converting from integer to float or vice versa, a color range conversion may also occur, since in the 32-bit float format, the concept of a limited range does not exist. The range is converted according to the frame's `"_ColorRange"` and `"_Range"` properties. If these properties do not exist, the range is considered full for RGB and limited for YUV and GRAY. Conversion between integers occurs without regard to range. Downconversion of bit depth occurs with arithmetic rounding and saturation.
+* `direct`: If `True`, conversion from integer to float or vice versa always uses the full range and ignores the `"_ColorRange"` and `"_Range"` properties. Defaults to `False`.
+
+## Linearize
+`artyfox.Linearize(clip clip[, str gamma='srgb' or 'smpte170m', int[] planes=[0, 1, 2]])`
+
+Inverse gamma correction (linearization) of the color space.
+* `clip`: Source clip to linearize. Must be RGB, YUV or GRAY. 32-bit float sample type only. The range must be converted to full.
+* `gamma`: The inverse and forward gamma correction value. Correction is performed before and after resizing, in order to produce the resize itself in a linear color space. The default values ​​are `'srgb'` for RGB and `'smpte170m'` for YUV and GRAY. Two different formulas are used for RGB and YUV/GRAY. The formula for YUV/GRAY is suitable for SMPTE 170M, BT.601, BT.709, BT.2020.
+Other supported values ​​are: `'adobe'` (Adobe RGB), `'dcip3'` (DCI-P3) and `'smpte240m'` (SMPTE 240M).
+* `planes`: List of planes to linearize. Default is all.
+
+## GammaCorr
+`artyfox.GammaCorr(clip clip[, str gamma='srgb' or 'smpte170m', int[] planes=[0, 1, 2]])`
+
+Gamma correction of the color space.
+* `clip`: Source clip for gamma correction. Must be RGB, YUV or GRAY. 32-bit float sample type only. The range must be converted to full.
+* `gamma`: The inverse and forward gamma correction value. Correction is performed before and after resizing, in order to produce the resize itself in a linear color space. The default values ​​are `'srgb'` for RGB and `'smpte170m'` for YUV and GRAY. Two different formulas are used for RGB and YUV/GRAY. The formula for YUV/GRAY is suitable for SMPTE 170M, BT.601, BT.709, BT.2020.
+Other supported values ​​are: `'adobe'` (Adobe RGB), `'dcip3'` (DCI-P3) and `'smpte240m'` (SMPTE 240M).
+* `planes`: List of planes to be gamma corrected. Default is all.
 
 ## Resize
 `artyfox.Resize(clip clip, int width, int height[, float src_left=0.0, float src_top=0.0, float src_width=clip.width, float src_height=clip.height, str kernel="area", float b=1/3, float c=1/3, float taps=3.0, str confine='inf', str gamma='srgb' or 'smpte170m', float sharp=1.0])`
@@ -131,32 +157,6 @@ Compares two video clips and calculates the specified difference metric. The met
   * `pcc`: Pearson correlation coefficient (`PCC`).
   * `ssim`: Structural similarity index measure (`SSIM`).
 * `thr`: The absolute difference threshold above which the difference is considered significant; everything else is set to zero. This allows noise to be filtered out. Doesn't work for `pcc` and `ssim`. The default is 0.
-
-## Linearize
-`artyfox.Linearize(clip clip[, str gamma='srgb' or 'smpte170m', int[] planes=[0, 1, 2]])`
-
-Inverse gamma correction (linearization) of the color space.
-* `clip`: Source clip to linearize. Must be RGB, YUV or GRAY. 32-bit float sample type only. The range must be converted to full.
-* `gamma`: The inverse and forward gamma correction value. Correction is performed before and after resizing, in order to produce the resize itself in a linear color space. The default values ​​are `'srgb'` for RGB and `'smpte170m'` for YUV and GRAY. Two different formulas are used for RGB and YUV/GRAY. The formula for YUV/GRAY is suitable for SMPTE 170M, BT.601, BT.709, BT.2020.
-Other supported values ​​are: `'adobe'` (Adobe RGB), `'dcip3'` (DCI-P3) and `'smpte240m'` (SMPTE 240M).
-* `planes`: List of planes to linearize. Default is all.
-
-## GammaCorr
-`artyfox.GammaCorr(clip clip[, str gamma='srgb' or 'smpte170m', int[] planes=[0, 1, 2]])`
-
-Gamma correction of the color space.
-* `clip`: Source clip for gamma correction. Must be RGB, YUV or GRAY. 32-bit float sample type only. The range must be converted to full.
-* `gamma`: The inverse and forward gamma correction value. Correction is performed before and after resizing, in order to produce the resize itself in a linear color space. The default values ​​are `'srgb'` for RGB and `'smpte170m'` for YUV and GRAY. Two different formulas are used for RGB and YUV/GRAY. The formula for YUV/GRAY is suitable for SMPTE 170M, BT.601, BT.709, BT.2020.
-Other supported values ​​are: `'adobe'` (Adobe RGB), `'dcip3'` (DCI-P3) and `'smpte240m'` (SMPTE 240M).
-* `planes`: List of planes to be gamma corrected. Default is all.
-
-## BitDepth
-`artyfox.BitDepth(clip clip, int bits[, bool direct=False])`
-
-Converting the bit depth of a clip.
-* `clip`: Source clip to be converted to bit depth. Must be RGB, YUV or GRAY. 8-16-bit integer or 32-bit float sample type.
-* `bits`: The bit depth of the target clip. It can be from `8` to `16` or `32`. When converting from integer to float or vice versa, a color range conversion may also occur, since in the 32-bit float format, the concept of a limited range does not exist. The range is converted according to the frame's `"_ColorRange"` and `"_Range"` properties. If these properties do not exist, the range is considered full for RGB and limited for YUV and GRAY. Conversion between integers occurs without regard to range. Downconversion of bit depth occurs with arithmetic rounding and saturation.
-* `direct`: If `True`, conversion from integer to float or vice versa always uses the full range and ignores the `"_ColorRange"` and `"_Range"` properties. Defaults to `False`.
 
 ## FixBorder
 `artyfox.FixBorder(clip clip, str[] fix)`

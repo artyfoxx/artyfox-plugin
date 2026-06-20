@@ -9,6 +9,795 @@
 
 #define UNUSED __attribute__((unused))
 
+typedef void (*convert_func)(
+    const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
+    int src_w, int src_h, int src_bits, int dst_bits, bool range, bool chroma
+);
+
+typedef struct {
+    VSNode *node;
+    VSVideoInfo vi;
+    convert_func f;
+    bool direct;
+} BitDepthData;
+
+static void uint8_to_uint16(
+    const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
+    int src_w, int src_h, int src_bits, int dst_bits, bool range UNUSED, bool chroma UNUSED
+) {
+    const uint8_t *restrict srcp = ptrs;
+    uint16_t *restrict dstp = ptrd;
+    int count = dst_bits - src_bits;
+    
+    for (int y = 0; y < src_h; y++) {
+        for (int x = 0; x < src_w; x += 16) {
+            __m256i pix = _mm256_cvtepu8_epi16(_mm_load_si128((const __m128i *)(srcp + x)));
+            __m256i res = _mm256_slli_epi16(pix, count);
+            _mm256_stream_si256((__m256i *)(dstp + x), res);
+        }
+        srcp += src_stride;
+        dstp += dst_stride;
+    }
+    _mm_sfence();
+}
+
+static void uint8_to_float(
+    const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
+    int src_w, int src_h, int src_bits UNUSED, int dst_bits UNUSED, bool range, bool chroma
+) {
+    const uint8_t *restrict srcp = ptrs;
+    float *restrict dstp = ptrd;
+    
+    __m256 v_low, v_high;
+    if (range) {
+        v_low = _mm256_set1_ps(chroma ? 128.0F : 16.0F);
+        v_high = _mm256_set1_ps(chroma ? 224.0F : 219.0F);
+    } else {
+        v_low = _mm256_set1_ps(chroma ? 128.0F : 0.0F);
+        v_high = _mm256_set1_ps(chroma ? 256.0F : 255.0F);
+    }
+    
+    for (int y = 0; y < src_h; y++) {
+        for (int x = 0; x < src_w; x += 8) {
+            __m256 pix = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(srcp + x))));
+            __m256 res = _mm256_div_ps(_mm256_sub_ps(pix, v_low), v_high);
+            _mm256_stream_ps(dstp + x, res);
+        }
+        srcp += src_stride;
+        dstp += dst_stride;
+    }
+    _mm_sfence();
+}
+
+static void uint16_to_uint8(
+    const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
+    int src_w, int src_h, int src_bits, int dst_bits, bool range UNUSED, bool chroma UNUSED
+) {
+    const uint16_t *restrict srcp = ptrs;
+    uint8_t *restrict dstp = ptrd;
+    int count = src_bits - dst_bits;
+    
+    __m256i v_half = _mm256_set1_epi16(1 << (count - 1));
+    
+    for (int y = 0; y < src_h; y++) {
+        for (int x = 0; x < src_w; x += 16) {
+            __m256i pix = _mm256_load_si256((const __m256i *)(srcp + x));
+            __m256i res = _mm256_srli_epi16(_mm256_adds_epu16(pix, v_half), count);
+            __m128i res2 = _mm_packus_epi16(_mm256_extracti128_si256(res, 0), _mm256_extracti128_si256(res, 1));
+            _mm_stream_si128((__m128i *)(dstp + x), res2);
+        }
+        srcp += src_stride;
+        dstp += dst_stride;
+    }
+    _mm_sfence();
+}
+
+static void uint16_to_uint16(
+    const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
+    int src_w, int src_h, int src_bits, int dst_bits, bool range UNUSED, bool chroma UNUSED
+) {
+    const uint16_t *restrict srcp = ptrs;
+    uint16_t *restrict dstp = ptrd;
+    
+    if (src_bits < dst_bits) {
+        int count = dst_bits - src_bits;
+        for (int y = 0; y < src_h; y++) {
+            for (int x = 0; x < src_w; x += 16) {
+                __m256i pix = _mm256_load_si256((const __m256i *)(srcp + x));
+                __m256i res = _mm256_slli_epi16(pix, count);
+                _mm256_stream_si256((__m256i *)(dstp + x), res);
+            }
+            srcp += src_stride;
+            dstp += dst_stride;
+        }
+    } else {
+        int count = src_bits - dst_bits;
+        __m256i v_half = _mm256_set1_epi16(1 << (count - 1));
+        __m256i v_max = _mm256_set1_epi16((1 << dst_bits) - 1);
+        for (int y = 0; y < src_h; y++) {
+            for (int x = 0; x < src_w; x += 16) {
+                __m256i pix = _mm256_load_si256((const __m256i *)(srcp + x));
+                __m256i res = _mm256_min_epu16(_mm256_srli_epi16(_mm256_adds_epu16(pix, v_half), count), v_max);
+                _mm256_stream_si256((__m256i *)(dstp + x), res);
+            }
+            srcp += src_stride;
+            dstp += dst_stride;
+        }
+    }
+    _mm_sfence();
+}
+
+static void uint16_to_float(
+    const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
+    int src_w, int src_h, int src_bits, int dst_bits UNUSED, bool range, bool chroma
+) {
+    const uint16_t *restrict srcp = ptrs;
+    float *restrict dstp = ptrd;
+    
+    __m256 v_low, v_high;
+    if (range) {
+        v_low = _mm256_set1_ps((chroma ? 128 : 16) << (src_bits - 8));
+        v_high = _mm256_set1_ps((chroma ? 224 : 219) << (src_bits - 8));
+    } else {
+        v_low = _mm256_set1_ps(chroma ? (128 << (src_bits - 8)) : 0);
+        v_high = _mm256_set1_ps((chroma ? 256 : 255) << (src_bits - 8));
+    }
+    
+    for (int y = 0; y < src_h; y++) {
+        for (int x = 0; x < src_w; x += 8) {
+            __m256 pix = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm_load_si128((const __m128i *)(srcp + x))));
+            __m256 res = _mm256_div_ps(_mm256_sub_ps(pix, v_low), v_high);
+            _mm256_stream_ps(dstp + x, res);
+        }
+        srcp += src_stride;
+        dstp += dst_stride;
+    }
+    _mm_sfence();
+}
+
+static void float_to_uint8(
+    const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
+    int src_w, int src_h, int src_bits UNUSED, int dst_bits UNUSED, bool range, bool chroma
+) {
+    const float *restrict srcp = ptrs;
+    uint8_t *restrict dstp = ptrd;
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((const __m256i *)mask_arr);
+    
+    __m256 v_low, v_high;
+    if (range) {
+        v_low = _mm256_set1_ps(chroma ? 128.5F : 16.5F);
+        v_high = _mm256_set1_ps(chroma ? 224.0F : 219.0F);
+    } else {
+        v_low = _mm256_set1_ps(chroma ? 128.5F : 0.5F);
+        v_high = _mm256_set1_ps(chroma ? 256.0F : 255.0F);
+    }
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m256 pix_f = _mm256_load_ps(srcp + x);
+            __m256i pix_i = _mm256_cvttps_epi32(_mm256_fmadd_ps(pix_f, v_high, v_low));
+            __m128i pix_u = _mm_packus_epi32(_mm256_extracti128_si256(pix_i, 0), _mm256_extracti128_si256(pix_i, 1));
+            _mm_stream_si64((__int64 *)(dstp + x), _mm_cvtsi128_si64(_mm_packus_epi16(pix_u, pix_u)));
+        }
+        if (tail) {
+            __m256 pix_f = _mm256_maskload_ps(srcp + x, tail_mask);
+            __m256i pix_i = _mm256_cvttps_epi32(_mm256_fmadd_ps(pix_f, v_high, v_low));
+            __m128i pix_u = _mm_packus_epi32(_mm256_extracti128_si256(pix_i, 0), _mm256_extracti128_si256(pix_i, 1));
+            _mm_stream_si64((__int64 *)(dstp + x), _mm_cvtsi128_si64(_mm_packus_epi16(pix_u, pix_u)));
+        }
+        srcp += src_stride;
+        dstp += dst_stride;
+    }
+    _mm_sfence();
+}
+
+static void float_to_uint16(
+    const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
+    int src_w, int src_h, int src_bits UNUSED, int dst_bits, bool range, bool chroma
+) {
+    const float *restrict srcp = ptrs;
+    uint16_t *restrict dstp = ptrd;
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((const __m256i *)mask_arr);
+    
+    __m256i v_max = _mm256_set1_epi32((1 << dst_bits) - 1);
+    __m256 v_low, v_high;
+    if (range) {
+        v_low = _mm256_set1_ps(0.5F + ((chroma ? 128 : 16) << (dst_bits - 8)));
+        v_high = _mm256_set1_ps((chroma ? 224 : 219) << (dst_bits - 8));
+    } else {
+        v_low = _mm256_set1_ps(chroma ? (0.5F + (128 << (dst_bits - 8))) : 0.5F);
+        v_high = _mm256_set1_ps((chroma ? 256 : 255) << (dst_bits - 8));
+    }
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m256 pix_f = _mm256_load_ps(srcp + x);
+            __m256i pix_i = _mm256_min_epi32(_mm256_cvttps_epi32(_mm256_fmadd_ps(pix_f, v_high, v_low)), v_max);
+            __m128i pix_u = _mm_packus_epi32(_mm256_extracti128_si256(pix_i, 0), _mm256_extracti128_si256(pix_i, 1));
+            _mm_stream_si128((__m128i *)(dstp + x), pix_u);
+        }
+        if (tail) {
+            __m256 pix_f = _mm256_maskload_ps(srcp + x, tail_mask);
+            __m256i pix_i = _mm256_min_epi32(_mm256_cvttps_epi32(_mm256_fmadd_ps(pix_f, v_high, v_low)), v_max);
+            __m128i pix_u = _mm_packus_epi32(_mm256_extracti128_si256(pix_i, 0), _mm256_extracti128_si256(pix_i, 1));
+            _mm_stream_si128((__m128i *)(dstp + x), pix_u);
+        }
+        srcp += src_stride;
+        dstp += dst_stride;
+    }
+    _mm_sfence();
+}
+
+static const VSFrame *VS_CC BitDepthGetFrame(
+    int n, int activationReason, void *instanceData, void **frameData UNUSED,
+    VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi
+) {
+    BitDepthData *d = (BitDepthData *)instanceData;
+    
+    if (activationReason == arInitial) {
+        vsapi->requestFrameFilter(n, d->node, frameCtx);
+    } else if (activationReason == arAllFramesReady) {
+        const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
+        const VSVideoFormat *fi = vsapi->getVideoFrameFormat(src);
+        VSFrame *dst = vsapi->newVideoFrame(&d->vi.format, d->vi.width, d->vi.height, src, core);
+        
+        const VSMap *props = vsapi->getFramePropertiesRO(src);
+        
+        int err;
+        bool range = !vsapi->mapGetIntSaturated(props, "_Range", 0, &err);
+        if (d->direct) {
+            range = false;
+        } else if (err) {
+            range = !!vsapi->mapGetIntSaturated(props, "_ColorRange", 0, &err);
+            if (err) range = (fi->colorFamily != cfRGB);
+        }
+        
+        for (int plane = 0; plane < fi->numPlanes; plane++) {
+            const void *restrict srcp = (const void *)vsapi->getReadPtr(src, plane);
+            ptrdiff_t src_stride = vsapi->getStride(src, plane) / fi->bytesPerSample;
+            void *restrict dstp = (void *)vsapi->getWritePtr(dst, plane);
+            ptrdiff_t dst_stride = vsapi->getStride(dst, plane) / d->vi.format.bytesPerSample;
+            
+            int src_w = vsapi->getFrameWidth(src, plane);
+            int src_h = vsapi->getFrameHeight(src, plane);
+            bool chroma = plane && (fi->colorFamily == cfYUV);
+            
+            d->f(srcp, dstp, src_stride, dst_stride, src_w, src_h, fi->bitsPerSample, d->vi.format.bitsPerSample, range, chroma);
+        }
+        vsapi->freeFrame(src);
+        return dst;
+    }
+    return NULL;
+}
+
+static void VS_CC BitDepthFree(void *instanceData, VSCore *core UNUSED, const VSAPI *vsapi) {
+    BitDepthData *d = (BitDepthData *)instanceData;
+    vsapi->freeNode(d->node);
+    free(d);
+}
+
+static void VS_CC BitDepthCreate(
+    const VSMap *in, VSMap *out, void *userData UNUSED, VSCore *core, const VSAPI *vsapi
+) {
+    BitDepthData d;
+    d.node = vsapi->mapGetNode(in, "clip", 0, NULL);
+    d.vi = *vsapi->getVideoInfo(d.node);
+    
+    if (
+        !vsh_isConstantVideoFormat(&d.vi) ||
+        (d.vi.format.sampleType == stInteger && (d.vi.format.bitsPerSample < 8 || d.vi.format.bitsPerSample > 16)) ||
+        (d.vi.format.sampleType == stFloat && d.vi.format.bitsPerSample != 32)
+    ) {
+        vsapi->mapSetError(out, "BitDepth: only constant format 8-16bit integer or 32bit float input supported");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    if (d.vi.width < 1 || d.vi.height < 1) {
+        vsapi->mapSetError(out, "BitDepth: the width and height of the frame cannot be less than 1");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    int bits = vsapi->mapGetIntSaturated(in, "bits", 0, NULL);
+    
+    if (bits == d.vi.format.bitsPerSample) {
+        vsapi->mapSetError(out, "BitDepth: same \"bits\" as input format is not allowed");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    if (bits < 8 || (bits > 16 && bits < 32) || bits > 32) {
+        vsapi->mapSetError(out, "BitDepth: \"bits\" must be between 8 and 16 or 32");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    int bytes = (bits + 7) / 8;
+    
+    if ((d.vi.format.bytesPerSample == 1) && (bytes == 4)) {
+        d.f = uint8_to_float;
+    } else if ((d.vi.format.bytesPerSample == 2) && (bytes == 4)) {
+        d.f = uint16_to_float;
+    } else if ((d.vi.format.bytesPerSample == 4) && (bytes == 1)) {
+        d.f = float_to_uint8;
+    } else if ((d.vi.format.bytesPerSample == 4) && (bytes == 2)) {
+        d.f = float_to_uint16;
+    } else if ((d.vi.format.bytesPerSample == 1) && (bytes == 2)) {
+        d.f = uint8_to_uint16;
+    } else if ((d.vi.format.bytesPerSample == 2) && (bytes == 1)) {
+        d.f = uint16_to_uint8;
+    } else {
+        d.f = uint16_to_uint16;
+    }
+    
+    int err;
+    d.direct = !!vsapi->mapGetIntSaturated(in, "direct", 0, &err);
+    if (err) {
+        d.direct = false;
+    }
+    
+    d.vi.format.bitsPerSample = bits;
+    d.vi.format.bytesPerSample = bytes;
+    d.vi.format.sampleType = (bits == 32) ? stFloat : stInteger;
+    
+    BitDepthData *data = (BitDepthData *)malloc(sizeof d);
+    *data = d;
+    
+    VSFilterDependency deps[] = {{d.node, rpStrictSpatial}};
+    vsapi->createVideoFilter(out, "BitDepth", &d.vi, BitDepthGetFrame, BitDepthFree, fmParallel, deps, 1, data, core);
+}
+
+typedef struct {
+    double gamma;
+    float thr_to, thr_from, corr, div;
+    bool strict;
+} GammaData;
+
+typedef struct {
+    VSNode *node;
+    VSVideoInfo vi;
+    GammaData gamma;
+    bool process[3];
+} LinearData;
+
+// exp2(log2(x) * y); 0.5 ulp
+// Based on: https://jrfonseca.blogspot.com/2008/09/fast-sse2-pow-tables-or-polynomials.html
+// All checks are removed because ffast-math is used.
+// x = 0 returns 0, which satisfies the use case.
+// x < 0 and y <= 0 contradict the conditions of the use case and are not processed.
+static __m256 ffast_pow(__m256 x, __m256d y) {
+    __m256i i = _mm256_castps_si256(x);
+    __m256i bias = _mm256_set1_epi32(127);
+    __m256i exp = _mm256_sub_epi32(_mm256_srli_epi32(_mm256_and_si256(i, _mm256_set1_epi32(0x7F800000)), 23), bias);
+    __m256 mant = _mm256_or_ps(_mm256_castsi256_ps(_mm256_and_si256(i, _mm256_set1_epi32(0x007FFFFF))), _mm256_set1_ps(1.0F));
+    __m256d m0 = _mm256_cvtps_pd(_mm256_extractf128_ps(mant, 0));
+    __m256d m1 = _mm256_cvtps_pd(_mm256_extractf128_ps(mant, 1));
+    __m256d temp = _mm256_set1_pd(0.0029290200848161477), p0 = temp, p1 = temp;
+    temp = _mm256_set1_pd(-0.048633183278885168), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
+    temp = _mm256_set1_pd(0.36573319077073368), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
+    temp = _mm256_set1_pd(-1.6454916622598008), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
+    temp = _mm256_set1_pd(4.9271656462993851), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
+    temp = _mm256_set1_pd(-10.331415641012363), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
+    temp = _mm256_set1_pd(15.540128043817649), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
+    temp = _mm256_set1_pd(-16.905304327891724), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
+    temp = _mm256_set1_pd(13.296487881230806), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
+    temp = _mm256_set1_pd(-7.6638533210657123), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
+    temp = _mm256_set1_pd(3.9049493931218771), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
+    temp = _mm256_set1_pd(1.0);
+    p0 = _mm256_fmadd_pd(p0, _mm256_sub_pd(m0, temp), _mm256_cvtepi32_pd(_mm256_extracti128_si256(exp, 0)));
+    p1 = _mm256_fmadd_pd(p1, _mm256_sub_pd(m1, temp), _mm256_cvtepi32_pd(_mm256_extracti128_si256(exp, 1)));
+    p0 = _mm256_mul_pd(p0, y), p1 = _mm256_mul_pd(p1, y);
+    temp = _mm256_set1_pd(127.0), p0 = _mm256_min_pd(p0, temp), p1 = _mm256_min_pd(p1, temp);
+    temp = _mm256_set1_pd(-127.0), p0 = _mm256_max_pd(p0, temp), p1 = _mm256_max_pd(p1, temp);
+    __m256d i0 = _mm256_floor_pd(p0), i1 = _mm256_floor_pd(p1);
+    __m256d f0 = _mm256_sub_pd(p0, i0), f1 = _mm256_sub_pd(p1, i1);
+    __m256d ei0 = _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_add_epi32(_mm256_cvttpd_epi32(i0), _mm256_castsi256_si128(bias)), 23)));
+    __m256d ei1 = _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_add_epi32(_mm256_cvttpd_epi32(i1), _mm256_castsi256_si128(bias)), 23)));
+    temp = _mm256_set1_pd(1.0150336705309649e-07), p0 = temp, p1 = temp;
+    temp = _mm256_set1_pd(1.3259405609345135e-06), p0 = _mm256_fmadd_pd(p0, f0, temp), p1 = _mm256_fmadd_pd(p1, f1, temp);
+    temp = _mm256_set1_pd(1.5252984838653427e-05), p0 = _mm256_fmadd_pd(p0, f0, temp), p1 = _mm256_fmadd_pd(p1, f1, temp);
+    temp = _mm256_set1_pd(0.00015403434948071791), p0 = _mm256_fmadd_pd(p0, f0, temp), p1 = _mm256_fmadd_pd(p1, f1, temp);
+    temp = _mm256_set1_pd(0.0013333557617604443), p0 = _mm256_fmadd_pd(p0, f0, temp), p1 = _mm256_fmadd_pd(p1, f1, temp);
+    temp = _mm256_set1_pd(0.0096181291920672454), p0 = _mm256_fmadd_pd(p0, f0, temp), p1 = _mm256_fmadd_pd(p1, f1, temp);
+    temp = _mm256_set1_pd(0.05550410866868561), p0 = _mm256_fmadd_pd(p0, f0, temp), p1 = _mm256_fmadd_pd(p1, f1, temp);
+    temp = _mm256_set1_pd(0.24022650695649653), p0 = _mm256_fmadd_pd(p0, f0, temp), p1 = _mm256_fmadd_pd(p1, f1, temp);
+    temp = _mm256_set1_pd(0.69314718055987101), p0 = _mm256_fmadd_pd(p0, f0, temp), p1 = _mm256_fmadd_pd(p1, f1, temp);
+    temp = _mm256_set1_pd(1.0000000000000127), p0 = _mm256_fmadd_pd(p0, f0, temp), p1 = _mm256_fmadd_pd(p1, f1, temp);
+    p0 = _mm256_mul_pd(ei0, p0), p1 = _mm256_mul_pd(ei1, p1);
+    return _mm256_setr_m128(_mm256_cvtpd_ps(p0), _mm256_cvtpd_ps(p1));
+}
+
+static void to_linear(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h, GammaData d
+) {
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((const __m256i *)mask_arr);
+    
+    __m256 v_thr = _mm256_set1_ps(d.thr_to);
+    __m256 v_corr = _mm256_set1_ps(d.corr);
+    __m256 v_corr_one = _mm256_set1_ps(1.0F + d.corr);
+    __m256d v_gamma = _mm256_set1_pd(d.gamma);
+    __m256 v_div = _mm256_set1_ps(d.div);
+    __m256 v_abs = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    
+    if (d.strict) {
+        for (int y = 0; y < src_h; y++) {
+            int x = 0;
+            for (; x < mod8_w; x += 8) {
+                __m256 pix = _mm256_load_ps(srcp + x);
+                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
+                __m256 branch_0 = ffast_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
+                __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
+                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
+            }
+            if (tail) {
+                __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
+                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
+                __m256 branch_0 = ffast_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
+                __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
+                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
+            }
+            srcp += stride;
+            dstp += stride;
+        }
+    } else {
+        for (int y = 0; y < src_h; y++) {
+            int x = 0;
+            for (; x < mod8_w; x += 8) {
+                __m256 pix = _mm256_load_ps(srcp + x);
+                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
+                __m256 branch_0 = ffast_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
+                __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
+                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
+            }
+            if (tail) {
+                __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
+                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
+                __m256 branch_0 = ffast_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
+                __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
+                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
+            }
+            srcp += stride;
+            dstp += stride;
+        }
+    }
+    _mm_sfence();
+}
+
+static void from_linear(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h, GammaData d
+) {
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((const __m256i *)mask_arr);
+    
+    __m256 v_thr = _mm256_set1_ps(d.thr_from);
+    __m256 v_corr = _mm256_set1_ps(d.corr);
+    __m256 v_corr_one = _mm256_set1_ps(1.0F + d.corr);
+    __m256d v_gamma = _mm256_set1_pd(1.0 / d.gamma);
+    __m256 v_div = _mm256_set1_ps(d.div);
+    __m256 v_abs = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    
+    if (d.strict) {
+        for (int y = 0; y < src_h; y++) {
+            int x = 0;
+            for (; x < mod8_w; x += 8) {
+                __m256 pix = _mm256_load_ps(srcp + x);
+                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
+                __m256 branch_0 = _mm256_fmsub_ps(ffast_pow(pix_abs, v_gamma), v_corr_one, v_corr);
+                __m256 branch_1 = _mm256_mul_ps(pix_abs, v_div);
+                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
+            }
+            if (tail) {
+                __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
+                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
+                __m256 branch_0 = _mm256_fmsub_ps(ffast_pow(pix_abs, v_gamma), v_corr_one, v_corr);
+                __m256 branch_1 = _mm256_mul_ps(pix_abs, v_div);
+                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
+            }
+            srcp += stride;
+            dstp += stride;
+        }
+    } else {
+        for (int y = 0; y < src_h; y++) {
+            int x = 0;
+            for (; x < mod8_w; x += 8) {
+                __m256 pix = _mm256_load_ps(srcp + x);
+                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
+                __m256 branch_0 = _mm256_fmsub_ps(ffast_pow(pix_abs, v_gamma), v_corr_one, v_corr);
+                __m256 branch_1 = _mm256_mul_ps(pix_abs, v_div);
+                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
+            }
+            if (tail) {
+                __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
+                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
+                __m256 branch_0 = _mm256_fmsub_ps(ffast_pow(pix_abs, v_gamma), v_corr_one, v_corr);
+                __m256 branch_1 = _mm256_mul_ps(pix_abs, v_div);
+                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
+            }
+            srcp += stride;
+            dstp += stride;
+        }
+    }
+    _mm_sfence();
+}
+
+static void vector_plane_copy(
+    const void *restrict srcp, void *restrict dstp, size_t size
+) {
+    const uint8_t *restrict ptrs = srcp;
+    uint8_t *restrict ptrd = dstp;
+    
+    for (size_t i = 0; i < size; i += 32) {
+        _mm256_stream_si256((__m256i *)(ptrd + i), _mm256_load_si256((const __m256i *)(ptrs + i)));
+    }
+    _mm_sfence();
+}
+
+static const VSFrame *VS_CC LinearizeGetFrame(
+    int n, int activationReason, void *instanceData, void **frameData UNUSED,
+    VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi
+) {
+    LinearData *d = (LinearData *)instanceData;
+    
+    if (activationReason == arInitial) {
+        vsapi->requestFrameFilter(n, d->node, frameCtx);
+    } else if (activationReason == arAllFramesReady) {
+        const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
+        const VSVideoFormat *fi = vsapi->getVideoFrameFormat(src);
+        VSFrame *dst = vsapi->newVideoFrame(fi, d->vi.width, d->vi.height, src, core);
+        
+        for (int plane = 0; plane < fi->numPlanes; plane++) {
+            const float *restrict srcp = (const float *)vsapi->getReadPtr(src, plane);
+            ptrdiff_t src_stride = vsapi->getStride(src, plane) / sizeof(float);
+            float *restrict dstp = (float *)vsapi->getWritePtr(dst, plane);
+            
+            int src_w = vsapi->getFrameWidth(src, plane);
+            int src_h = vsapi->getFrameHeight(src, plane);
+            
+            if (d->process[plane]) {
+                to_linear(srcp, dstp, src_stride, src_w, src_h, d->gamma);
+            } else {
+                vector_plane_copy(srcp, dstp, sizeof(float) * src_stride * src_h);
+            }
+        }
+        vsapi->freeFrame(src);
+        return dst;
+    }
+    return NULL;
+}
+
+static void VS_CC LinearizeFree(void *instanceData, VSCore *core UNUSED, const VSAPI *vsapi) {
+    LinearData *d = (LinearData *)instanceData;
+    vsapi->freeNode(d->node);
+    free(d);
+}
+
+static void VS_CC LinearizeCreate(
+    const VSMap *in, VSMap *out, void *userData UNUSED, VSCore *core, const VSAPI *vsapi
+) {
+    LinearData d;
+    d.node = vsapi->mapGetNode(in, "clip", 0, NULL);
+    d.vi = *vsapi->getVideoInfo(d.node);
+    
+    if (!vsh_isConstantVideoFormat(&d.vi) || d.vi.format.sampleType != stFloat || d.vi.format.bitsPerSample != 32) {
+        vsapi->mapSetError(out, "Linearize: only constant format 32bit float input supported");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    if (d.vi.width < 1 || d.vi.height < 1) {
+        vsapi->mapSetError(out, "Linearize: the width and height of the frame cannot be less than 1");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    int err;
+    
+    const char *gamma = vsapi->mapGetData(in, "gamma", 0, &err);
+    if (err) {
+        if (d.vi.format.colorFamily == cfRGB) {
+            d.gamma = (GammaData){2.4, 0.04045F, 0.0031308F, 0.055F, 12.92F, true};
+        } else {
+            d.gamma = (GammaData){1.0 / 0.45, 0.081F, 0.018F, 0.099F, 4.5F, false};
+        }
+    } else if (!strcmp(gamma, "srgb")) {
+        d.gamma = (GammaData){2.4, 0.04045F, 0.0031308F, 0.055F, 12.92F, true};
+    } else if (!strcmp(gamma, "smpte170m")) {
+        d.gamma = (GammaData){1.0 / 0.45, 0.081F, 0.018F, 0.099F, 4.5F, false};
+    } else if (!strcmp(gamma, "adobe")) {
+        d.gamma = (GammaData){2.19921875, 0.0F, 0.0F, 0.0F, 1.0F, true};
+    } else if (!strcmp(gamma, "dcip3")) {
+        d.gamma = (GammaData){2.6, 0.0F, 0.0F, 0.0F, 1.0F, true};
+    } else if (!strcmp(gamma, "smpte240m")) {
+        d.gamma = (GammaData){1.0 / 0.45, 0.0913F, 0.0228F, 0.1115F, 4.0F, false};
+    } else {
+        vsapi->mapSetError(out, "Linearize: invalid gamma specified");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    const int m = vsapi->mapNumElements(in, "planes");
+    
+    for (int i = 0; i < 3; i++) {
+        d.process[i] = (m <= 0);
+    }
+    
+    for (int i = 0; i < m; i++) {
+        const int n = vsapi->mapGetIntSaturated(in, "planes", i, NULL);
+        
+        if (n < 0 || n >= d.vi.format.numPlanes) {
+            vsapi->mapSetError(out, "Linearize: plane index is out of range");
+            vsapi->freeNode(d.node);
+            return;
+        }
+        
+        if (d.process[n]) {
+            vsapi->mapSetError(out, "Linearize: plane specified twice");
+            vsapi->freeNode(d.node);
+            return;
+        }
+         
+        d.process[n] = true;
+    }
+    
+    LinearData *data = (LinearData *)malloc(sizeof d);
+    *data = d;
+    
+    VSFilterDependency deps[] = {{d.node, rpStrictSpatial}};
+    vsapi->createVideoFilter(out, "Linearize", &d.vi, LinearizeGetFrame, LinearizeFree, fmParallel, deps, 1, data, core);
+}
+
+static const VSFrame *VS_CC GammaCorrGetFrame(
+    int n, int activationReason, void *instanceData, void **frameData UNUSED,
+    VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi
+) {
+    LinearData *d = (LinearData *)instanceData;
+    
+    if (activationReason == arInitial) {
+        vsapi->requestFrameFilter(n, d->node, frameCtx);
+    } else if (activationReason == arAllFramesReady) {
+        const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
+        const VSVideoFormat *fi = vsapi->getVideoFrameFormat(src);
+        VSFrame *dst = vsapi->newVideoFrame(fi, d->vi.width, d->vi.height, src, core);
+        
+        for (int plane = 0; plane < fi->numPlanes; plane++) {
+            const float *restrict srcp = (const float *)vsapi->getReadPtr(src, plane);
+            ptrdiff_t src_stride = vsapi->getStride(src, plane) / sizeof(float);
+            float *restrict dstp = (float *)vsapi->getWritePtr(dst, plane);
+            
+            int src_w = vsapi->getFrameWidth(src, plane);
+            int src_h = vsapi->getFrameHeight(src, plane);
+            
+            if (d->process[plane]) {
+                from_linear(srcp, dstp, src_stride, src_w, src_h, d->gamma);
+            } else {
+                vector_plane_copy(srcp, dstp, sizeof(float) * src_stride * src_h);
+            }
+        }
+        vsapi->freeFrame(src);
+        return dst;
+    }
+    return NULL;
+}
+
+static void VS_CC GammaCorrFree(void *instanceData, VSCore *core UNUSED, const VSAPI *vsapi) {
+    LinearData *d = (LinearData *)instanceData;
+    vsapi->freeNode(d->node);
+    free(d);
+}
+
+static void VS_CC GammaCorrCreate(
+    const VSMap *in, VSMap *out, void *userData UNUSED, VSCore *core, const VSAPI *vsapi
+) {
+    LinearData d;
+    d.node = vsapi->mapGetNode(in, "clip", 0, NULL);
+    d.vi = *vsapi->getVideoInfo(d.node);
+    
+    if (!vsh_isConstantVideoFormat(&d.vi) || d.vi.format.sampleType != stFloat || d.vi.format.bitsPerSample != 32) {
+        vsapi->mapSetError(out, "GammaCorr: only constant format 32bit float input supported");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    if (d.vi.width < 1 || d.vi.height < 1) {
+        vsapi->mapSetError(out, "GammaCorr: the width and height of the frame cannot be less than 1");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    int err;
+    
+    const char *gamma = vsapi->mapGetData(in, "gamma", 0, &err);
+    if (err) {
+        if (d.vi.format.colorFamily == cfRGB) {
+            d.gamma = (GammaData){2.4, 0.04045F, 0.0031308F, 0.055F, 12.92F, true};
+        } else {
+            d.gamma = (GammaData){1.0 / 0.45, 0.081F, 0.018F, 0.099F, 4.5F, false};
+        }
+    } else if (!strcmp(gamma, "srgb")) {
+        d.gamma = (GammaData){2.4, 0.04045F, 0.0031308F, 0.055F, 12.92F, true};
+    } else if (!strcmp(gamma, "smpte170m")) {
+        d.gamma = (GammaData){1.0 / 0.45, 0.081F, 0.018F, 0.099F, 4.5F, false};
+    } else if (!strcmp(gamma, "adobe")) {
+        d.gamma = (GammaData){2.19921875, 0.0F, 0.0F, 0.0F, 1.0F, true};
+    } else if (!strcmp(gamma, "dcip3")) {
+        d.gamma = (GammaData){2.6, 0.0F, 0.0F, 0.0F, 1.0F, true};
+    } else if (!strcmp(gamma, "smpte240m")) {
+        d.gamma = (GammaData){1.0 / 0.45, 0.0913F, 0.0228F, 0.1115F, 4.0F, false};
+    } else {
+        vsapi->mapSetError(out, "GammaCorr: invalid gamma specified");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    const int m = vsapi->mapNumElements(in, "planes");
+    
+    for (int i = 0; i < 3; i++) {
+        d.process[i] = (m <= 0);
+    }
+    
+    for (int i = 0; i < m; i++) {
+        const int n = vsapi->mapGetIntSaturated(in, "planes", i, NULL);
+        
+        if (n < 0 || n >= d.vi.format.numPlanes) {
+            vsapi->mapSetError(out, "GammaCorr: plane index is out of range");
+            vsapi->freeNode(d.node);
+            return;
+        }
+        
+        if (d.process[n]) {
+            vsapi->mapSetError(out, "GammaCorr: plane specified twice");
+            vsapi->freeNode(d.node);
+            return;
+        }
+        
+        d.process[n] = true;
+    }
+    
+    LinearData *data = (LinearData *)malloc(sizeof d);
+    *data = d;
+    
+    VSFilterDependency deps[] = {{d.node, rpStrictSpatial}};
+    vsapi->createVideoFilter(out, "GammaCorr", &d.vi, GammaCorrGetFrame, GammaCorrFree, fmParallel, deps, 1, data, core);
+}
+
 typedef double (*kernel_func)(double x, void *ctx);
 
 typedef struct {
@@ -29,17 +818,6 @@ typedef struct {
     int col_n, row_n, ku;
     double *values;
 } banded_t;
-
-typedef struct {
-    double gamma;
-    float thr_to, thr_from, corr, div;
-    bool strict;
-} GammaData;
-
-typedef void (*convert_func)(
-    const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, int src_bits, int dst_bits, bool range, bool chroma
-);
 
 typedef struct {
     VSNode *node;
@@ -426,410 +1204,6 @@ static double box_kernel(double x, void *ctx) {
         return 1.0;
     }
     return 0.0;
-}
-
-// exp2(log2(x) * y); 0.5 ulp
-// Based on: https://jrfonseca.blogspot.com/2008/09/fast-sse2-pow-tables-or-polynomials.html
-// All checks are removed because ffast-math is used.
-// x = 0 returns 0, which satisfies the use case.
-// x < 0 and y <= 0 contradict the conditions of the use case and are not processed.
-static __m256 ffast_pow(__m256 x, __m256d y) {
-    __m256i i = _mm256_castps_si256(x);
-    __m256i bias = _mm256_set1_epi32(127);
-    __m256i exp = _mm256_sub_epi32(_mm256_srli_epi32(_mm256_and_si256(i, _mm256_set1_epi32(0x7F800000)), 23), bias);
-    __m256 mant = _mm256_or_ps(_mm256_castsi256_ps(_mm256_and_si256(i, _mm256_set1_epi32(0x007FFFFF))), _mm256_set1_ps(1.0F));
-    __m256d m0 = _mm256_cvtps_pd(_mm256_extractf128_ps(mant, 0));
-    __m256d m1 = _mm256_cvtps_pd(_mm256_extractf128_ps(mant, 1));
-    __m256d temp = _mm256_set1_pd(0.0029290200848161477), p0 = temp, p1 = temp;
-    temp = _mm256_set1_pd(-0.048633183278885168), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
-    temp = _mm256_set1_pd(0.36573319077073368), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
-    temp = _mm256_set1_pd(-1.6454916622598008), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
-    temp = _mm256_set1_pd(4.9271656462993851), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
-    temp = _mm256_set1_pd(-10.331415641012363), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
-    temp = _mm256_set1_pd(15.540128043817649), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
-    temp = _mm256_set1_pd(-16.905304327891724), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
-    temp = _mm256_set1_pd(13.296487881230806), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
-    temp = _mm256_set1_pd(-7.6638533210657123), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
-    temp = _mm256_set1_pd(3.9049493931218771), p0 = _mm256_fmadd_pd(p0, m0, temp), p1 = _mm256_fmadd_pd(p1, m1, temp);
-    temp = _mm256_set1_pd(1.0);
-    p0 = _mm256_fmadd_pd(p0, _mm256_sub_pd(m0, temp), _mm256_cvtepi32_pd(_mm256_extracti128_si256(exp, 0)));
-    p1 = _mm256_fmadd_pd(p1, _mm256_sub_pd(m1, temp), _mm256_cvtepi32_pd(_mm256_extracti128_si256(exp, 1)));
-    p0 = _mm256_mul_pd(p0, y), p1 = _mm256_mul_pd(p1, y);
-    temp = _mm256_set1_pd(127.0), p0 = _mm256_min_pd(p0, temp), p1 = _mm256_min_pd(p1, temp);
-    temp = _mm256_set1_pd(-127.0), p0 = _mm256_max_pd(p0, temp), p1 = _mm256_max_pd(p1, temp);
-    __m256d i0 = _mm256_floor_pd(p0), i1 = _mm256_floor_pd(p1);
-    __m256d f0 = _mm256_sub_pd(p0, i0), f1 = _mm256_sub_pd(p1, i1);
-    __m256d ei0 = _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_add_epi32(_mm256_cvttpd_epi32(i0), _mm256_castsi256_si128(bias)), 23)));
-    __m256d ei1 = _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_add_epi32(_mm256_cvttpd_epi32(i1), _mm256_castsi256_si128(bias)), 23)));
-    temp = _mm256_set1_pd(1.0150336705309649e-07), p0 = temp, p1 = temp;
-    temp = _mm256_set1_pd(1.3259405609345135e-06), p0 = _mm256_fmadd_pd(p0, f0, temp), p1 = _mm256_fmadd_pd(p1, f1, temp);
-    temp = _mm256_set1_pd(1.5252984838653427e-05), p0 = _mm256_fmadd_pd(p0, f0, temp), p1 = _mm256_fmadd_pd(p1, f1, temp);
-    temp = _mm256_set1_pd(0.00015403434948071791), p0 = _mm256_fmadd_pd(p0, f0, temp), p1 = _mm256_fmadd_pd(p1, f1, temp);
-    temp = _mm256_set1_pd(0.0013333557617604443), p0 = _mm256_fmadd_pd(p0, f0, temp), p1 = _mm256_fmadd_pd(p1, f1, temp);
-    temp = _mm256_set1_pd(0.0096181291920672454), p0 = _mm256_fmadd_pd(p0, f0, temp), p1 = _mm256_fmadd_pd(p1, f1, temp);
-    temp = _mm256_set1_pd(0.05550410866868561), p0 = _mm256_fmadd_pd(p0, f0, temp), p1 = _mm256_fmadd_pd(p1, f1, temp);
-    temp = _mm256_set1_pd(0.24022650695649653), p0 = _mm256_fmadd_pd(p0, f0, temp), p1 = _mm256_fmadd_pd(p1, f1, temp);
-    temp = _mm256_set1_pd(0.69314718055987101), p0 = _mm256_fmadd_pd(p0, f0, temp), p1 = _mm256_fmadd_pd(p1, f1, temp);
-    temp = _mm256_set1_pd(1.0000000000000127), p0 = _mm256_fmadd_pd(p0, f0, temp), p1 = _mm256_fmadd_pd(p1, f1, temp);
-    p0 = _mm256_mul_pd(ei0, p0), p1 = _mm256_mul_pd(ei1, p1);
-    return _mm256_setr_m128(_mm256_cvtpd_ps(p0), _mm256_cvtpd_ps(p1));
-}
-
-static void to_linear(
-    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h, GammaData d
-) {
-    int tail = src_w % 8;
-    int mod8_w = src_w - tail;
-    
-    int32_t mask_arr[8] = {0};
-    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
-    __m256i tail_mask = _mm256_loadu_si256((const __m256i *)mask_arr);
-    
-    __m256 v_thr = _mm256_set1_ps(d.thr_to);
-    __m256 v_corr = _mm256_set1_ps(d.corr);
-    __m256 v_corr_one = _mm256_set1_ps(1.0F + d.corr);
-    __m256d v_gamma = _mm256_set1_pd(d.gamma);
-    __m256 v_div = _mm256_set1_ps(d.div);
-    __m256 v_abs = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
-    
-    if (d.strict) {
-        for (int y = 0; y < src_h; y++) {
-            int x = 0;
-            for (; x < mod8_w; x += 8) {
-                __m256 pix = _mm256_load_ps(srcp + x);
-                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
-                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
-                __m256 branch_0 = ffast_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
-                __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
-                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
-            }
-            if (tail) {
-                __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
-                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
-                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
-                __m256 branch_0 = ffast_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
-                __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
-                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
-            }
-            srcp += stride;
-            dstp += stride;
-        }
-    } else {
-        for (int y = 0; y < src_h; y++) {
-            int x = 0;
-            for (; x < mod8_w; x += 8) {
-                __m256 pix = _mm256_load_ps(srcp + x);
-                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
-                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
-                __m256 branch_0 = ffast_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
-                __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
-                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
-            }
-            if (tail) {
-                __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
-                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
-                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
-                __m256 branch_0 = ffast_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
-                __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
-                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
-            }
-            srcp += stride;
-            dstp += stride;
-        }
-    }
-    _mm_sfence();
-}
-
-static void from_linear(
-    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h, GammaData d
-) {
-    int tail = src_w % 8;
-    int mod8_w = src_w - tail;
-    
-    int32_t mask_arr[8] = {0};
-    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
-    __m256i tail_mask = _mm256_loadu_si256((const __m256i *)mask_arr);
-    
-    __m256 v_thr = _mm256_set1_ps(d.thr_from);
-    __m256 v_corr = _mm256_set1_ps(d.corr);
-    __m256 v_corr_one = _mm256_set1_ps(1.0F + d.corr);
-    __m256d v_gamma = _mm256_set1_pd(1.0 / d.gamma);
-    __m256 v_div = _mm256_set1_ps(d.div);
-    __m256 v_abs = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
-    
-    if (d.strict) {
-        for (int y = 0; y < src_h; y++) {
-            int x = 0;
-            for (; x < mod8_w; x += 8) {
-                __m256 pix = _mm256_load_ps(srcp + x);
-                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
-                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
-                __m256 branch_0 = _mm256_fmsub_ps(ffast_pow(pix_abs, v_gamma), v_corr_one, v_corr);
-                __m256 branch_1 = _mm256_mul_ps(pix_abs, v_div);
-                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
-            }
-            if (tail) {
-                __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
-                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
-                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
-                __m256 branch_0 = _mm256_fmsub_ps(ffast_pow(pix_abs, v_gamma), v_corr_one, v_corr);
-                __m256 branch_1 = _mm256_mul_ps(pix_abs, v_div);
-                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
-            }
-            srcp += stride;
-            dstp += stride;
-        }
-    } else {
-        for (int y = 0; y < src_h; y++) {
-            int x = 0;
-            for (; x < mod8_w; x += 8) {
-                __m256 pix = _mm256_load_ps(srcp + x);
-                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
-                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
-                __m256 branch_0 = _mm256_fmsub_ps(ffast_pow(pix_abs, v_gamma), v_corr_one, v_corr);
-                __m256 branch_1 = _mm256_mul_ps(pix_abs, v_div);
-                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
-            }
-            if (tail) {
-                __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
-                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
-                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
-                __m256 branch_0 = _mm256_fmsub_ps(ffast_pow(pix_abs, v_gamma), v_corr_one, v_corr);
-                __m256 branch_1 = _mm256_mul_ps(pix_abs, v_div);
-                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
-            }
-            srcp += stride;
-            dstp += stride;
-        }
-    }
-    _mm_sfence();
-}
-
-static void uint8_to_uint16(
-    const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, int src_bits, int dst_bits, bool range UNUSED, bool chroma UNUSED
-) {
-    const uint8_t *restrict srcp = ptrs;
-    uint16_t *restrict dstp = ptrd;
-    int count = dst_bits - src_bits;
-    
-    for (int y = 0; y < src_h; y++) {
-        for (int x = 0; x < src_w; x += 16) {
-            __m256i pix = _mm256_cvtepu8_epi16(_mm_load_si128((const __m128i *)(srcp + x)));
-            __m256i res = _mm256_slli_epi16(pix, count);
-            _mm256_stream_si256((__m256i *)(dstp + x), res);
-        }
-        srcp += src_stride;
-        dstp += dst_stride;
-    }
-    _mm_sfence();
-}
-
-static void uint8_to_float(
-    const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, int src_bits UNUSED, int dst_bits UNUSED, bool range, bool chroma
-) {
-    const uint8_t *restrict srcp = ptrs;
-    float *restrict dstp = ptrd;
-    
-    __m256 v_low, v_high;
-    if (range) {
-        v_low = _mm256_set1_ps(chroma ? 128.0F : 16.0F);
-        v_high = _mm256_set1_ps(chroma ? 224.0F : 219.0F);
-    } else {
-        v_low = _mm256_set1_ps(chroma ? 128.0F : 0.0F);
-        v_high = _mm256_set1_ps(chroma ? 256.0F : 255.0F);
-    }
-    
-    for (int y = 0; y < src_h; y++) {
-        for (int x = 0; x < src_w; x += 8) {
-            __m256 pix = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(srcp + x))));
-            __m256 res = _mm256_div_ps(_mm256_sub_ps(pix, v_low), v_high);
-            _mm256_stream_ps(dstp + x, res);
-        }
-        srcp += src_stride;
-        dstp += dst_stride;
-    }
-    _mm_sfence();
-}
-
-static void uint16_to_uint8(
-    const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, int src_bits, int dst_bits, bool range UNUSED, bool chroma UNUSED
-) {
-    const uint16_t *restrict srcp = ptrs;
-    uint8_t *restrict dstp = ptrd;
-    int count = src_bits - dst_bits;
-    
-    __m256i v_half = _mm256_set1_epi16(1 << (count - 1));
-    
-    for (int y = 0; y < src_h; y++) {
-        for (int x = 0; x < src_w; x += 16) {
-            __m256i pix = _mm256_load_si256((const __m256i *)(srcp + x));
-            __m256i res = _mm256_srli_epi16(_mm256_adds_epu16(pix, v_half), count);
-            __m128i res2 = _mm_packus_epi16(_mm256_extracti128_si256(res, 0), _mm256_extracti128_si256(res, 1));
-            _mm_stream_si128((__m128i *)(dstp + x), res2);
-        }
-        srcp += src_stride;
-        dstp += dst_stride;
-    }
-    _mm_sfence();
-}
-
-static void uint16_to_uint16(
-    const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, int src_bits, int dst_bits, bool range UNUSED, bool chroma UNUSED
-) {
-    const uint16_t *restrict srcp = ptrs;
-    uint16_t *restrict dstp = ptrd;
-    
-    if (src_bits < dst_bits) {
-        int count = dst_bits - src_bits;
-        for (int y = 0; y < src_h; y++) {
-            for (int x = 0; x < src_w; x += 16) {
-                __m256i pix = _mm256_load_si256((const __m256i *)(srcp + x));
-                __m256i res = _mm256_slli_epi16(pix, count);
-                _mm256_stream_si256((__m256i *)(dstp + x), res);
-            }
-            srcp += src_stride;
-            dstp += dst_stride;
-        }
-    } else {
-        int count = src_bits - dst_bits;
-        __m256i v_half = _mm256_set1_epi16(1 << (count - 1));
-        __m256i v_max = _mm256_set1_epi16((1 << dst_bits) - 1);
-        for (int y = 0; y < src_h; y++) {
-            for (int x = 0; x < src_w; x += 16) {
-                __m256i pix = _mm256_load_si256((const __m256i *)(srcp + x));
-                __m256i res = _mm256_min_epu16(_mm256_srli_epi16(_mm256_adds_epu16(pix, v_half), count), v_max);
-                _mm256_stream_si256((__m256i *)(dstp + x), res);
-            }
-            srcp += src_stride;
-            dstp += dst_stride;
-        }
-    }
-    _mm_sfence();
-}
-
-static void uint16_to_float(
-    const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, int src_bits, int dst_bits UNUSED, bool range, bool chroma
-) {
-    const uint16_t *restrict srcp = ptrs;
-    float *restrict dstp = ptrd;
-    
-    __m256 v_low, v_high;
-    if (range) {
-        v_low = _mm256_set1_ps((chroma ? 128 : 16) << (src_bits - 8));
-        v_high = _mm256_set1_ps((chroma ? 224 : 219) << (src_bits - 8));
-    } else {
-        v_low = _mm256_set1_ps(chroma ? (128 << (src_bits - 8)) : 0);
-        v_high = _mm256_set1_ps((chroma ? 256 : 255) << (src_bits - 8));
-    }
-    
-    for (int y = 0; y < src_h; y++) {
-        for (int x = 0; x < src_w; x += 8) {
-            __m256 pix = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm_load_si128((const __m128i *)(srcp + x))));
-            __m256 res = _mm256_div_ps(_mm256_sub_ps(pix, v_low), v_high);
-            _mm256_stream_ps(dstp + x, res);
-        }
-        srcp += src_stride;
-        dstp += dst_stride;
-    }
-    _mm_sfence();
-}
-
-static void float_to_uint8(
-    const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, int src_bits UNUSED, int dst_bits UNUSED, bool range, bool chroma
-) {
-    const float *restrict srcp = ptrs;
-    uint8_t *restrict dstp = ptrd;
-    int tail = src_w % 8;
-    int mod8_w = src_w - tail;
-    
-    int32_t mask_arr[8] = {0};
-    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
-    __m256i tail_mask = _mm256_loadu_si256((const __m256i *)mask_arr);
-    
-    __m256 v_low, v_high;
-    if (range) {
-        v_low = _mm256_set1_ps(chroma ? 128.5F : 16.5F);
-        v_high = _mm256_set1_ps(chroma ? 224.0F : 219.0F);
-    } else {
-        v_low = _mm256_set1_ps(chroma ? 128.5F : 0.5F);
-        v_high = _mm256_set1_ps(chroma ? 256.0F : 255.0F);
-    }
-    
-    for (int y = 0; y < src_h; y++) {
-        int x = 0;
-        for (; x < mod8_w; x += 8) {
-            __m256 pix_f = _mm256_load_ps(srcp + x);
-            __m256i pix_i = _mm256_cvttps_epi32(_mm256_fmadd_ps(pix_f, v_high, v_low));
-            __m128i pix_u = _mm_packus_epi32(_mm256_extracti128_si256(pix_i, 0), _mm256_extracti128_si256(pix_i, 1));
-            _mm_stream_si64((__int64 *)(dstp + x), _mm_cvtsi128_si64(_mm_packus_epi16(pix_u, pix_u)));
-        }
-        if (tail) {
-            __m256 pix_f = _mm256_maskload_ps(srcp + x, tail_mask);
-            __m256i pix_i = _mm256_cvttps_epi32(_mm256_fmadd_ps(pix_f, v_high, v_low));
-            __m128i pix_u = _mm_packus_epi32(_mm256_extracti128_si256(pix_i, 0), _mm256_extracti128_si256(pix_i, 1));
-            _mm_stream_si64((__int64 *)(dstp + x), _mm_cvtsi128_si64(_mm_packus_epi16(pix_u, pix_u)));
-        }
-        srcp += src_stride;
-        dstp += dst_stride;
-    }
-    _mm_sfence();
-}
-
-static void float_to_uint16(
-    const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, int src_bits UNUSED, int dst_bits, bool range, bool chroma
-) {
-    const float *restrict srcp = ptrs;
-    uint16_t *restrict dstp = ptrd;
-    int tail = src_w % 8;
-    int mod8_w = src_w - tail;
-    
-    int32_t mask_arr[8] = {0};
-    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
-    __m256i tail_mask = _mm256_loadu_si256((const __m256i *)mask_arr);
-    
-    __m256i v_max = _mm256_set1_epi32((1 << dst_bits) - 1);
-    __m256 v_low, v_high;
-    if (range) {
-        v_low = _mm256_set1_ps(0.5F + ((chroma ? 128 : 16) << (dst_bits - 8)));
-        v_high = _mm256_set1_ps((chroma ? 224 : 219) << (dst_bits - 8));
-    } else {
-        v_low = _mm256_set1_ps(chroma ? (0.5F + (128 << (dst_bits - 8))) : 0.5F);
-        v_high = _mm256_set1_ps((chroma ? 256 : 255) << (dst_bits - 8));
-    }
-    
-    for (int y = 0; y < src_h; y++) {
-        int x = 0;
-        for (; x < mod8_w; x += 8) {
-            __m256 pix_f = _mm256_load_ps(srcp + x);
-            __m256i pix_i = _mm256_min_epi32(_mm256_cvttps_epi32(_mm256_fmadd_ps(pix_f, v_high, v_low)), v_max);
-            __m128i pix_u = _mm_packus_epi32(_mm256_extracti128_si256(pix_i, 0), _mm256_extracti128_si256(pix_i, 1));
-            _mm_stream_si128((__m128i *)(dstp + x), pix_u);
-        }
-        if (tail) {
-            __m256 pix_f = _mm256_maskload_ps(srcp + x, tail_mask);
-            __m256i pix_i = _mm256_min_epi32(_mm256_cvttps_epi32(_mm256_fmadd_ps(pix_f, v_high, v_low)), v_max);
-            __m128i pix_u = _mm_packus_epi32(_mm256_extracti128_si256(pix_i, 0), _mm256_extracti128_si256(pix_i, 1));
-            _mm_stream_si128((__m128i *)(dstp + x), pix_u);
-        }
-        srcp += src_stride;
-        dstp += dst_stride;
-    }
-    _mm_sfence();
 }
 
 static void sharp_width(
@@ -1274,18 +1648,6 @@ static void resize_height(
             _mm256_stream_ps(dstp + x, _mm256_setr_m128(_mm256_cvtpd_ps(v_acc_0), _mm256_cvtpd_ps(v_acc_1)));
         }
         dstp += dst_stride;
-    }
-    _mm_sfence();
-}
-
-static void vector_plane_copy(
-    const void *restrict srcp, void *restrict dstp, size_t size
-) {
-    const uint8_t *restrict ptrs = srcp;
-    uint8_t *restrict ptrd = dstp;
-    
-    for (size_t i = 0; i < size; i += 32) {
-        _mm256_stream_si256((__m256i *)(ptrd + i), _mm256_load_si256((const __m256i *)(ptrs + i)));
     }
     _mm_sfence();
 }
@@ -5583,368 +5945,6 @@ static void VS_CC MetricCreate(
     vsapi->createVideoFilter(out, "Metric", vi0, MetricGetFrame, MetricFree, fmParallel, deps, 2, data, core);
 }
 
-typedef struct {
-    VSNode *node;
-    VSVideoInfo vi;
-    GammaData gamma;
-    bool process[3];
-} LinearData;
-
-static const VSFrame *VS_CC LinearizeGetFrame(
-    int n, int activationReason, void *instanceData, void **frameData UNUSED,
-    VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi
-) {
-    LinearData *d = (LinearData *)instanceData;
-    
-    if (activationReason == arInitial) {
-        vsapi->requestFrameFilter(n, d->node, frameCtx);
-    } else if (activationReason == arAllFramesReady) {
-        const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
-        const VSVideoFormat *fi = vsapi->getVideoFrameFormat(src);
-        VSFrame *dst = vsapi->newVideoFrame(fi, d->vi.width, d->vi.height, src, core);
-        
-        for (int plane = 0; plane < fi->numPlanes; plane++) {
-            const float *restrict srcp = (const float *)vsapi->getReadPtr(src, plane);
-            ptrdiff_t src_stride = vsapi->getStride(src, plane) / sizeof(float);
-            float *restrict dstp = (float *)vsapi->getWritePtr(dst, plane);
-            
-            int src_w = vsapi->getFrameWidth(src, plane);
-            int src_h = vsapi->getFrameHeight(src, plane);
-            
-            if (d->process[plane]) {
-                to_linear(srcp, dstp, src_stride, src_w, src_h, d->gamma);
-            } else {
-                vector_plane_copy(srcp, dstp, sizeof(float) * src_stride * src_h);
-            }
-        }
-        vsapi->freeFrame(src);
-        return dst;
-    }
-    return NULL;
-}
-
-static void VS_CC LinearizeFree(void *instanceData, VSCore *core UNUSED, const VSAPI *vsapi) {
-    LinearData *d = (LinearData *)instanceData;
-    vsapi->freeNode(d->node);
-    free(d);
-}
-
-static void VS_CC LinearizeCreate(
-    const VSMap *in, VSMap *out, void *userData UNUSED, VSCore *core, const VSAPI *vsapi
-) {
-    LinearData d;
-    d.node = vsapi->mapGetNode(in, "clip", 0, NULL);
-    d.vi = *vsapi->getVideoInfo(d.node);
-    
-    if (!vsh_isConstantVideoFormat(&d.vi) || d.vi.format.sampleType != stFloat || d.vi.format.bitsPerSample != 32) {
-        vsapi->mapSetError(out, "Linearize: only constant format 32bit float input supported");
-        vsapi->freeNode(d.node);
-        return;
-    }
-    
-    if (d.vi.width < 1 || d.vi.height < 1) {
-        vsapi->mapSetError(out, "Linearize: the width and height of the frame cannot be less than 1");
-        vsapi->freeNode(d.node);
-        return;
-    }
-    
-    int err;
-    
-    const char *gamma = vsapi->mapGetData(in, "gamma", 0, &err);
-    if (err) {
-        if (d.vi.format.colorFamily == cfRGB) {
-            d.gamma = (GammaData){2.4, 0.04045F, 0.0031308F, 0.055F, 12.92F, true};
-        } else {
-            d.gamma = (GammaData){1.0 / 0.45, 0.081F, 0.018F, 0.099F, 4.5F, false};
-        }
-    } else if (!strcmp(gamma, "srgb")) {
-        d.gamma = (GammaData){2.4, 0.04045F, 0.0031308F, 0.055F, 12.92F, true};
-    } else if (!strcmp(gamma, "smpte170m")) {
-        d.gamma = (GammaData){1.0 / 0.45, 0.081F, 0.018F, 0.099F, 4.5F, false};
-    } else if (!strcmp(gamma, "adobe")) {
-        d.gamma = (GammaData){2.19921875, 0.0F, 0.0F, 0.0F, 1.0F, true};
-    } else if (!strcmp(gamma, "dcip3")) {
-        d.gamma = (GammaData){2.6, 0.0F, 0.0F, 0.0F, 1.0F, true};
-    } else if (!strcmp(gamma, "smpte240m")) {
-        d.gamma = (GammaData){1.0 / 0.45, 0.0913F, 0.0228F, 0.1115F, 4.0F, false};
-    } else {
-        vsapi->mapSetError(out, "Linearize: invalid gamma specified");
-        vsapi->freeNode(d.node);
-        return;
-    }
-    
-    const int m = vsapi->mapNumElements(in, "planes");
-    
-    for (int i = 0; i < 3; i++) {
-        d.process[i] = (m <= 0);
-    }
-    
-    for (int i = 0; i < m; i++) {
-        const int n = vsapi->mapGetIntSaturated(in, "planes", i, NULL);
-        
-        if (n < 0 || n >= d.vi.format.numPlanes) {
-            vsapi->mapSetError(out, "Linearize: plane index is out of range");
-            vsapi->freeNode(d.node);
-            return;
-        }
-        
-        if (d.process[n]) {
-            vsapi->mapSetError(out, "Linearize: plane specified twice");
-            vsapi->freeNode(d.node);
-            return;
-        }
-         
-        d.process[n] = true;
-    }
-    
-    LinearData *data = (LinearData *)malloc(sizeof d);
-    *data = d;
-    
-    VSFilterDependency deps[] = {{d.node, rpStrictSpatial}};
-    vsapi->createVideoFilter(out, "Linearize", &d.vi, LinearizeGetFrame, LinearizeFree, fmParallel, deps, 1, data, core);
-}
-
-static const VSFrame *VS_CC GammaCorrGetFrame(
-    int n, int activationReason, void *instanceData, void **frameData UNUSED,
-    VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi
-) {
-    LinearData *d = (LinearData *)instanceData;
-    
-    if (activationReason == arInitial) {
-        vsapi->requestFrameFilter(n, d->node, frameCtx);
-    } else if (activationReason == arAllFramesReady) {
-        const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
-        const VSVideoFormat *fi = vsapi->getVideoFrameFormat(src);
-        VSFrame *dst = vsapi->newVideoFrame(fi, d->vi.width, d->vi.height, src, core);
-        
-        for (int plane = 0; plane < fi->numPlanes; plane++) {
-            const float *restrict srcp = (const float *)vsapi->getReadPtr(src, plane);
-            ptrdiff_t src_stride = vsapi->getStride(src, plane) / sizeof(float);
-            float *restrict dstp = (float *)vsapi->getWritePtr(dst, plane);
-            
-            int src_w = vsapi->getFrameWidth(src, plane);
-            int src_h = vsapi->getFrameHeight(src, plane);
-            
-            if (d->process[plane]) {
-                from_linear(srcp, dstp, src_stride, src_w, src_h, d->gamma);
-            } else {
-                vector_plane_copy(srcp, dstp, sizeof(float) * src_stride * src_h);
-            }
-        }
-        vsapi->freeFrame(src);
-        return dst;
-    }
-    return NULL;
-}
-
-static void VS_CC GammaCorrFree(void *instanceData, VSCore *core UNUSED, const VSAPI *vsapi) {
-    LinearData *d = (LinearData *)instanceData;
-    vsapi->freeNode(d->node);
-    free(d);
-}
-
-static void VS_CC GammaCorrCreate(
-    const VSMap *in, VSMap *out, void *userData UNUSED, VSCore *core, const VSAPI *vsapi
-) {
-    LinearData d;
-    d.node = vsapi->mapGetNode(in, "clip", 0, NULL);
-    d.vi = *vsapi->getVideoInfo(d.node);
-    
-    if (!vsh_isConstantVideoFormat(&d.vi) || d.vi.format.sampleType != stFloat || d.vi.format.bitsPerSample != 32) {
-        vsapi->mapSetError(out, "GammaCorr: only constant format 32bit float input supported");
-        vsapi->freeNode(d.node);
-        return;
-    }
-    
-    if (d.vi.width < 1 || d.vi.height < 1) {
-        vsapi->mapSetError(out, "GammaCorr: the width and height of the frame cannot be less than 1");
-        vsapi->freeNode(d.node);
-        return;
-    }
-    
-    int err;
-    
-    const char *gamma = vsapi->mapGetData(in, "gamma", 0, &err);
-    if (err) {
-        if (d.vi.format.colorFamily == cfRGB) {
-            d.gamma = (GammaData){2.4, 0.04045F, 0.0031308F, 0.055F, 12.92F, true};
-        } else {
-            d.gamma = (GammaData){1.0 / 0.45, 0.081F, 0.018F, 0.099F, 4.5F, false};
-        }
-    } else if (!strcmp(gamma, "srgb")) {
-        d.gamma = (GammaData){2.4, 0.04045F, 0.0031308F, 0.055F, 12.92F, true};
-    } else if (!strcmp(gamma, "smpte170m")) {
-        d.gamma = (GammaData){1.0 / 0.45, 0.081F, 0.018F, 0.099F, 4.5F, false};
-    } else if (!strcmp(gamma, "adobe")) {
-        d.gamma = (GammaData){2.19921875, 0.0F, 0.0F, 0.0F, 1.0F, true};
-    } else if (!strcmp(gamma, "dcip3")) {
-        d.gamma = (GammaData){2.6, 0.0F, 0.0F, 0.0F, 1.0F, true};
-    } else if (!strcmp(gamma, "smpte240m")) {
-        d.gamma = (GammaData){1.0 / 0.45, 0.0913F, 0.0228F, 0.1115F, 4.0F, false};
-    } else {
-        vsapi->mapSetError(out, "GammaCorr: invalid gamma specified");
-        vsapi->freeNode(d.node);
-        return;
-    }
-    
-    const int m = vsapi->mapNumElements(in, "planes");
-    
-    for (int i = 0; i < 3; i++) {
-        d.process[i] = (m <= 0);
-    }
-    
-    for (int i = 0; i < m; i++) {
-        const int n = vsapi->mapGetIntSaturated(in, "planes", i, NULL);
-        
-        if (n < 0 || n >= d.vi.format.numPlanes) {
-            vsapi->mapSetError(out, "GammaCorr: plane index is out of range");
-            vsapi->freeNode(d.node);
-            return;
-        }
-        
-        if (d.process[n]) {
-            vsapi->mapSetError(out, "GammaCorr: plane specified twice");
-            vsapi->freeNode(d.node);
-            return;
-        }
-        
-        d.process[n] = true;
-    }
-    
-    LinearData *data = (LinearData *)malloc(sizeof d);
-    *data = d;
-    
-    VSFilterDependency deps[] = {{d.node, rpStrictSpatial}};
-    vsapi->createVideoFilter(out, "GammaCorr", &d.vi, GammaCorrGetFrame, GammaCorrFree, fmParallel, deps, 1, data, core);
-}
-
-typedef struct {
-    VSNode *node;
-    VSVideoInfo vi;
-    convert_func f;
-    bool direct;
-} BitDepthData;
-
-static const VSFrame *VS_CC BitDepthGetFrame(
-    int n, int activationReason, void *instanceData, void **frameData UNUSED,
-    VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi
-) {
-    BitDepthData *d = (BitDepthData *)instanceData;
-    
-    if (activationReason == arInitial) {
-        vsapi->requestFrameFilter(n, d->node, frameCtx);
-    } else if (activationReason == arAllFramesReady) {
-        const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
-        const VSVideoFormat *fi = vsapi->getVideoFrameFormat(src);
-        VSFrame *dst = vsapi->newVideoFrame(&d->vi.format, d->vi.width, d->vi.height, src, core);
-        
-        const VSMap *props = vsapi->getFramePropertiesRO(src);
-        
-        int err;
-        bool range = !vsapi->mapGetIntSaturated(props, "_Range", 0, &err);
-        if (d->direct) {
-            range = false;
-        } else if (err) {
-            range = !!vsapi->mapGetIntSaturated(props, "_ColorRange", 0, &err);
-            if (err) range = (fi->colorFamily != cfRGB);
-        }
-        
-        for (int plane = 0; plane < fi->numPlanes; plane++) {
-            const void *restrict srcp = (const void *)vsapi->getReadPtr(src, plane);
-            ptrdiff_t src_stride = vsapi->getStride(src, plane) / fi->bytesPerSample;
-            void *restrict dstp = (void *)vsapi->getWritePtr(dst, plane);
-            ptrdiff_t dst_stride = vsapi->getStride(dst, plane) / d->vi.format.bytesPerSample;
-            
-            int src_w = vsapi->getFrameWidth(src, plane);
-            int src_h = vsapi->getFrameHeight(src, plane);
-            bool chroma = plane && (fi->colorFamily == cfYUV);
-            
-            d->f(srcp, dstp, src_stride, dst_stride, src_w, src_h, fi->bitsPerSample, d->vi.format.bitsPerSample, range, chroma);
-        }
-        vsapi->freeFrame(src);
-        return dst;
-    }
-    return NULL;
-}
-
-static void VS_CC BitDepthFree(void *instanceData, VSCore *core UNUSED, const VSAPI *vsapi) {
-    BitDepthData *d = (BitDepthData *)instanceData;
-    vsapi->freeNode(d->node);
-    free(d);
-}
-
-static void VS_CC BitDepthCreate(
-    const VSMap *in, VSMap *out, void *userData UNUSED, VSCore *core, const VSAPI *vsapi
-) {
-    BitDepthData d;
-    d.node = vsapi->mapGetNode(in, "clip", 0, NULL);
-    d.vi = *vsapi->getVideoInfo(d.node);
-    
-    if (
-        !vsh_isConstantVideoFormat(&d.vi) ||
-        (d.vi.format.sampleType == stInteger && (d.vi.format.bitsPerSample < 8 || d.vi.format.bitsPerSample > 16)) ||
-        (d.vi.format.sampleType == stFloat && d.vi.format.bitsPerSample != 32)
-    ) {
-        vsapi->mapSetError(out, "BitDepth: only constant format 8-16bit integer or 32bit float input supported");
-        vsapi->freeNode(d.node);
-        return;
-    }
-    
-    if (d.vi.width < 1 || d.vi.height < 1) {
-        vsapi->mapSetError(out, "BitDepth: the width and height of the frame cannot be less than 1");
-        vsapi->freeNode(d.node);
-        return;
-    }
-    
-    int bits = vsapi->mapGetIntSaturated(in, "bits", 0, NULL);
-    
-    if (bits == d.vi.format.bitsPerSample) {
-        vsapi->mapSetError(out, "BitDepth: same \"bits\" as input format is not allowed");
-        vsapi->freeNode(d.node);
-        return;
-    }
-    
-    if (bits < 8 || (bits > 16 && bits < 32) || bits > 32) {
-        vsapi->mapSetError(out, "BitDepth: \"bits\" must be between 8 and 16 or 32");
-        vsapi->freeNode(d.node);
-        return;
-    }
-    
-    int bytes = (bits + 7) / 8;
-    
-    if ((d.vi.format.bytesPerSample == 1) && (bytes == 4)) {
-        d.f = uint8_to_float;
-    } else if ((d.vi.format.bytesPerSample == 2) && (bytes == 4)) {
-        d.f = uint16_to_float;
-    } else if ((d.vi.format.bytesPerSample == 4) && (bytes == 1)) {
-        d.f = float_to_uint8;
-    } else if ((d.vi.format.bytesPerSample == 4) && (bytes == 2)) {
-        d.f = float_to_uint16;
-    } else if ((d.vi.format.bytesPerSample == 1) && (bytes == 2)) {
-        d.f = uint8_to_uint16;
-    } else if ((d.vi.format.bytesPerSample == 2) && (bytes == 1)) {
-        d.f = uint16_to_uint8;
-    } else {
-        d.f = uint16_to_uint16;
-    }
-    
-    int err;
-    d.direct = !!vsapi->mapGetIntSaturated(in, "direct", 0, &err);
-    if (err) {
-        d.direct = false;
-    }
-    
-    d.vi.format.bitsPerSample = bits;
-    d.vi.format.bytesPerSample = bytes;
-    d.vi.format.sampleType = (bits == 32) ? stFloat : stInteger;
-    
-    BitDepthData *data = (BitDepthData *)malloc(sizeof d);
-    *data = d;
-    
-    VSFilterDependency deps[] = {{d.node, rpStrictSpatial}};
-    vsapi->createVideoFilter(out, "BitDepth", &d.vi, BitDepthGetFrame, BitDepthFree, fmParallel, deps, 1, data, core);
-}
-
 typedef void (*get_fix_border_func)(
     void *restrict dstp, int dst_w, int dst_h, ptrdiff_t stride, int *target, int *donor,
     int target_size, int donor_size, int limit, int ctx, double shift, bool clamp
@@ -7592,99 +7592,117 @@ static void VS_CC AverageFieldsCreate(
 }
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
-    vspapi->configPlugin("ru.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(20, 0), VAPOURSYNTH_API_VERSION, 0, plugin);
-    vspapi->registerFunction("Resize",
-                             "clip:vnode;"
-                             "width:int;"
-                             "height:int;"
-                             "src_left:float:opt;"
-                             "src_top:float:opt;"
-                             "src_width:float:opt;"
-                             "src_height:float:opt;"
-                             "kernel:data:opt;"
-                             "b:float:opt;"
-                             "c:float:opt;"
-                             "taps:float:opt;"
-                             "confine:data:opt;"
-                             "gamma:data:opt;"
-                             "sharp:float:opt;",
-                             "clip:vnode;",
-                             ResizeCreate,
-                             NULL,
-                             plugin);
-    vspapi->registerFunction("Descale",
-                             "clip:vnode;"
-                             "width:int;"
-                             "height:int;"
-                             "src_left:float:opt;"
-                             "src_top:float:opt;"
-                             "src_width:float:opt;"
-                             "src_height:float:opt;"
-                             "kernel:data:opt;"
-                             "b:float:opt;"
-                             "c:float:opt;"
-                             "taps:float:opt;"
-                             "confine:data:opt;"
-                             "reg:float:opt;",
-                             "clip:vnode;",
-                             DescaleCreate,
-                             NULL,
-                             plugin);
-    vspapi->registerFunction("Mean",
-                             "clip:vnode;"
-                             "mode:data:opt;"
-                             "plane:int:opt;"
-                             "norm:int:opt;",
-                             "clip:vnode;",
-                             MeanCreate,
-                             NULL,
-                             plugin);
-    vspapi->registerFunction("Metric",
-                             "clip0:vnode;"
-                             "clip1:vnode;"
-                             "mode:data:opt;"
-                             "thr:float:opt;",
-                             "clip:vnode;",
-                             MetricCreate,
-                             NULL,
-                             plugin);
-    vspapi->registerFunction("Linearize",
-                             "clip:vnode;"
-                             "gamma:data:opt;"
-                             "planes:int[]:opt;",
-                             "clip:vnode;",
-                             LinearizeCreate,
-                             NULL,
-                             plugin);
-    vspapi->registerFunction("GammaCorr",
-                             "clip:vnode;"
-                             "gamma:data:opt;"
-                             "planes:int[]:opt;",
-                             "clip:vnode;",
-                             GammaCorrCreate,
-                             NULL,
-                             plugin);
-    vspapi->registerFunction("BitDepth",
-                             "clip:vnode;"
-                             "bits:int;"
-                             "direct:int:opt;",
-                             "clip:vnode;",
-                             BitDepthCreate,
-                             NULL,
-                             plugin);
-    vspapi->registerFunction("FixBorder",
-                             "clip:vnode;"
-                             "fix:data[];",
-                             "clip:vnode;",
-                             FixBorderCreate,
-                             NULL,
-                             plugin);
-    vspapi->registerFunction("AverageFields",
-                             "clip:vnode;"
-                             "weight:float:opt;"
-                             "shift:float:opt;",
-                             "clip:vnode;",
-                             AverageFieldsCreate,
-                             NULL,
-                             plugin);
+    vspapi->configPlugin("com.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(20, 1), VAPOURSYNTH_API_VERSION, 0, plugin);
+    vspapi->registerFunction(
+        "BitDepth",
+        "clip:vnode;"
+        "bits:int;"
+        "direct:int:opt;",
+        "clip:vnode;",
+        BitDepthCreate,
+        NULL,
+        plugin
+    );
+    vspapi->registerFunction(
+        "Linearize",
+        "clip:vnode;"
+        "gamma:data:opt;"
+        "planes:int[]:opt;",
+        "clip:vnode;",
+        LinearizeCreate,
+        NULL,
+        plugin
+    );
+    vspapi->registerFunction(
+        "GammaCorr",
+        "clip:vnode;"
+        "gamma:data:opt;"
+        "planes:int[]:opt;",
+        "clip:vnode;",
+        GammaCorrCreate,
+        NULL,
+        plugin
+    );
+    vspapi->registerFunction(
+        "Resize",
+        "clip:vnode;"
+        "width:int;"
+        "height:int;"
+        "src_left:float:opt;"
+        "src_top:float:opt;"
+        "src_width:float:opt;"
+        "src_height:float:opt;"
+        "kernel:data:opt;"
+        "b:float:opt;"
+        "c:float:opt;"
+        "taps:float:opt;"
+        "confine:data:opt;"
+        "gamma:data:opt;"
+        "sharp:float:opt;",
+        "clip:vnode;",
+        ResizeCreate,
+        NULL,
+        plugin
+    );
+    vspapi->registerFunction(
+        "Descale",
+        "clip:vnode;"
+        "width:int;"
+        "height:int;"
+        "src_left:float:opt;"
+        "src_top:float:opt;"
+        "src_width:float:opt;"
+        "src_height:float:opt;"
+        "kernel:data:opt;"
+        "b:float:opt;"
+        "c:float:opt;"
+        "taps:float:opt;"
+        "confine:data:opt;"
+        "reg:float:opt;",
+        "clip:vnode;",
+        DescaleCreate,
+        NULL,
+        plugin
+    );
+    vspapi->registerFunction(
+        "Mean",
+        "clip:vnode;"
+         "mode:data:opt;"
+        "plane:int:opt;"
+        "norm:int:opt;",
+        "clip:vnode;",
+        MeanCreate,
+        NULL,
+        plugin
+    );
+    vspapi->registerFunction(
+        "Metric",
+        "clip0:vnode;"
+        "clip1:vnode;"
+        "mode:data:opt;"
+        "thr:float:opt;",
+        "clip:vnode;",
+        MetricCreate,
+        NULL,
+        plugin
+    );
+    vspapi->registerFunction(
+        "FixBorder",
+        "clip:vnode;"
+        "fix:data[];",
+        "clip:vnode;",
+        FixBorderCreate,
+        NULL,
+        plugin
+    );
+    vspapi->registerFunction(
+        "AverageFields",
+        "clip:vnode;"
+        "weight:float:opt;"
+        "shift:float:opt;",
+        "clip:vnode;",
+        AverageFieldsCreate,
+        NULL,
+        plugin
+    );
 }
