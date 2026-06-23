@@ -22,22 +22,20 @@ Converting the bit depth of a clip.
 * `direct`: If `True`, conversion from integer to float or vice versa always uses the full range and ignores the `"_ColorRange"` and `"_Range"` properties. Defaults to `False`.
 
 ## Linearize
-`artyfox.Linearize(clip clip[, str gamma='srgb' or 'smpte170m', int[] planes=[0, 1, 2]])`
+`artyfox.Linearize(clip clip[, str gamma='srgb' or 'smpte170m'])`
 
-Inverse gamma correction (linearization) of the color space.
+Inverse gamma correction (linearization) of the color space. For YUV, a simplified procedure is used, based on the assumption that the chroma is much less sensitive to gamma correction than the luma.
 * `clip`: Source clip to linearize. Must be RGB, YUV or GRAY. 32-bit float sample type only. The range must be converted to full.
 * `gamma`: The inverse and forward gamma correction value. Correction is performed before and after resizing, in order to produce the resize itself in a linear color space. The default values ​​are `'srgb'` for RGB and `'smpte170m'` for YUV and GRAY. Two different formulas are used for RGB and YUV/GRAY. The formula for YUV/GRAY is suitable for SMPTE 170M, BT.601, BT.709, BT.2020.
 Other supported values ​​are: `'adobe'` (Adobe RGB), `'dcip3'` (DCI-P3) and `'smpte240m'` (SMPTE 240M).
-* `planes`: List of planes to linearize. Default is all.
 
 ## GammaCorr
-`artyfox.GammaCorr(clip clip[, str gamma='srgb' or 'smpte170m', int[] planes=[0, 1, 2]])`
+`artyfox.GammaCorr(clip clip[, str gamma='srgb' or 'smpte170m'])`
 
-Gamma correction of the color space.
+Gamma correction of the color space. For YUV, a simplified procedure is used, based on the assumption that the chroma is much less sensitive to gamma correction than the luma.
 * `clip`: Source clip for gamma correction. Must be RGB, YUV or GRAY. 32-bit float sample type only. The range must be converted to full.
 * `gamma`: The inverse and forward gamma correction value. Correction is performed before and after resizing, in order to produce the resize itself in a linear color space. The default values ​​are `'srgb'` for RGB and `'smpte170m'` for YUV and GRAY. Two different formulas are used for RGB and YUV/GRAY. The formula for YUV/GRAY is suitable for SMPTE 170M, BT.601, BT.709, BT.2020.
 Other supported values ​​are: `'adobe'` (Adobe RGB), `'dcip3'` (DCI-P3) and `'smpte240m'` (SMPTE 240M).
-* `planes`: List of planes to be gamma corrected. Default is all.
 
 ## Resize
 `artyfox.Resize(clip clip, int width, int height[, float src_left=0.0, float src_top=0.0, float src_width=clip.width, float src_height=clip.height, str kernel="area", float b=1/3, float c=1/3, float taps=3.0, str confine='inf', str gamma='srgb' or 'smpte170m', float sharp=1.0])`

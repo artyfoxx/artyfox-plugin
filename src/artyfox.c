@@ -653,28 +653,11 @@ static void VS_CC LinearizeCreate(
         return;
     }
     
-    const int m = vsapi->mapNumElements(in, "planes");
-    
-    for (int i = 0; i < 3; i++) {
-        d.process[i] = (m <= 0);
-    }
-    
-    for (int i = 0; i < m; i++) {
-        const int n = vsapi->mapGetIntSaturated(in, "planes", i, NULL);
-        
-        if (n < 0 || n >= d.vi.format.numPlanes) {
-            vsapi->mapSetError(out, "Linearize: plane index is out of range");
-            vsapi->freeNode(d.node);
-            return;
-        }
-        
-        if (d.process[n]) {
-            vsapi->mapSetError(out, "Linearize: plane specified twice");
-            vsapi->freeNode(d.node);
-            return;
-        }
-         
-        d.process[n] = true;
+    if (d.vi.format.colorFamily == cfYUV) {
+        d.process[0] = true;
+        d.process[2] = d.process[1] = false;
+    } else {
+        d.process[2] = d.process[1] = d.process[0] = true;
     }
     
     LinearData *data = (LinearData *)malloc(sizeof d);
@@ -767,28 +750,11 @@ static void VS_CC GammaCorrCreate(
         return;
     }
     
-    const int m = vsapi->mapNumElements(in, "planes");
-    
-    for (int i = 0; i < 3; i++) {
-        d.process[i] = (m <= 0);
-    }
-    
-    for (int i = 0; i < m; i++) {
-        const int n = vsapi->mapGetIntSaturated(in, "planes", i, NULL);
-        
-        if (n < 0 || n >= d.vi.format.numPlanes) {
-            vsapi->mapSetError(out, "GammaCorr: plane index is out of range");
-            vsapi->freeNode(d.node);
-            return;
-        }
-        
-        if (d.process[n]) {
-            vsapi->mapSetError(out, "GammaCorr: plane specified twice");
-            vsapi->freeNode(d.node);
-            return;
-        }
-        
-        d.process[n] = true;
+    if (d.vi.format.colorFamily == cfYUV) {
+        d.process[0] = true;
+        d.process[2] = d.process[1] = false;
+    } else {
+        d.process[2] = d.process[1] = d.process[0] = true;
     }
     
     LinearData *data = (LinearData *)malloc(sizeof d);
@@ -1664,7 +1630,7 @@ static const VSFrame *VS_CC ResizeGetFrame(
         const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
         const VSVideoFormat *fi = vsapi->getVideoFrameFormat(src);
         const VSMap *props = vsapi->getFramePropertiesRO(src);
-        bool bit_convert = fi->sampleType == stInteger;
+        bool bit_convert = (fi->sampleType == stInteger);
         
         int err;
         int chromaloc = vsapi->mapGetIntSaturated(props, "_ChromaLocation", 0, &err);
@@ -1763,7 +1729,7 @@ static const VSFrame *VS_CC ResizeGetFrame(
                 dst_stride = vsapi->getStride(bcd, plane) / sizeof(float);
             }
             
-            if (d->linear) {
+            if (d->linear && !chroma) {
                 void *restrict linp = (void *)vsapi->getWritePtr(lin, plane);
                 to_linear(srcp, linp, src_stride, src_w, src_h, d->gamma);
                 srcp = linp;
@@ -1788,7 +1754,7 @@ static const VSFrame *VS_CC ResizeGetFrame(
                 sharp_height(shrp, dstp, dst_stride, dst_w, dst_h, d->sharp);
             }
             
-            if (d->linear) {
+            if (d->linear && !chroma) {
                 void *restrict gcrp = dstp;
                 dstp = bit_convert ? (void *)vsapi->getWritePtr(bcd, plane) : (void *)vsapi->getWritePtr(dst, plane);
                 from_linear(gcrp, dstp, dst_stride, dst_w, dst_h, d->gamma);
@@ -7592,7 +7558,7 @@ static void VS_CC AverageFieldsCreate(
 }
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
-    vspapi->configPlugin("com.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(20, 1), VAPOURSYNTH_API_VERSION, 0, plugin);
+    vspapi->configPlugin("com.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(20, 2), VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction(
         "BitDepth",
         "clip:vnode;"
@@ -7606,8 +7572,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
     vspapi->registerFunction(
         "Linearize",
         "clip:vnode;"
-        "gamma:data:opt;"
-        "planes:int[]:opt;",
+        "gamma:data:opt;",
         "clip:vnode;",
         LinearizeCreate,
         NULL,
@@ -7616,8 +7581,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
     vspapi->registerFunction(
         "GammaCorr",
         "clip:vnode;"
-        "gamma:data:opt;"
-        "planes:int[]:opt;",
+        "gamma:data:opt;",
         "clip:vnode;",
         GammaCorrCreate,
         NULL,
