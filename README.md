@@ -38,9 +38,9 @@ Gamma correction of the color space. For YUV, a simplified procedure is used, ba
 Other supported values ​​are: `'adobe'` (Adobe RGB), `'dcip3'` (DCI-P3) and `'smpte240m'` (SMPTE 240M).
 
 ## Resize
-`artyfox.Resize(clip clip, int width, int height[, float src_left=0.0, float src_top=0.0, float src_width=clip.width, float src_height=clip.height, str kernel="area", float b=1/3, float c=1/3, float taps=3.0, str confine='inf', str gamma='srgb' or 'smpte170m', float sharp=1.0])`
+`artyfox.Resize(clip clip, int width, int height[, float src_left=0.0, float src_top=0.0, float src_width=clip.width, float src_height=clip.height, str kernel="bilinear", float b=1/3, float c=1/3, float taps=3.0, str confine='inf', str gamma='srgb' or 'smpte170m', float sharp=1.0])`
 
-Implementation of multiple resize functions using double-precision convolution method in a linear color space.
+Implementation of multiple resize functions using double-precision convolution method in a linear color space. For YUV, a simplified procedure is used, based on the assumption that the chroma is much less sensitive to gamma correction than the luma.
 * `clip`: Source clip to resize. Must be RGB, YUV or GRAY. 8-16-bit integer or 32-bit float sample type.
 * `width`: Target width. Must be integer and match the source clip's subsampling.
 * `height`: Target height. Must be integer and match the source clip's subsampling.
@@ -49,9 +49,9 @@ Implementation of multiple resize functions using double-precision convolution m
 * `src_width`: The width of the region to be resized relative to `src_left`. Defaults to the width of the source clip.
 * `src_height`: The height of the region to be resized relative to `src_top`. Defaults to the height of the source clip.
 * `kernel`: Selecting a kernel for convolution. Possible values:
-  * `area`: Area Resize, used by default.
+  * `area`: Area Resize.
   * `bicubic`: Bicubic interpolation.
-  * `bilinear`: Bilinear interpolation.
+  * `bilinear`: Bilinear interpolation, used by default.
   * `blackman`: Blackman windowed sinc.
   * `box`: Box interpolation.
   * `gauss`: Gaussian kernel. `p` is specified via the `b` parameter, it must be between 1 and 100, the default value is 30.0. `taps` must be in the range from 1 to 128, the default value is 4.0.
@@ -82,7 +82,7 @@ Chroma alignment in YUV with subsampling is performed based on the `"_ChromaLoca
 Resize and alignment by fields are not supported.
 
 ## Descale
-`artyfox.Descale(clip clip, int width, int height[, float src_left=0.0, float src_top=0.0, float src_width=width, float src_height=height, str kernel="area", float b=1/3, float c=1/3, float taps=3.0, str confine='inf', float reg=1e-8])`
+`artyfox.Descale(clip clip, int width, int height[, float src_left=0.0, float src_top=0.0, float src_width=width, float src_height=height, str kernel="bilinear", float b=1/3, float c=1/3, float taps=3.0, str confine='inf', float reg=1e-8])`
 
 Descaling via Tikhonov regularization and Cholesky decomposition (U.T @ U) using double-precision convolution method.
 * `clip`: Source clip to descale. Must be RGB, YUV or GRAY. 32-bit float sample type only.
@@ -93,9 +93,9 @@ Descaling via Tikhonov regularization and Cholesky decomposition (U.T @ U) using
 * `src_width`: The width of the destination region after descaling relative to `src_left`. Defaults to `width`.
 * `src_height`: The height of the destination region after descaling relative to `src_top`. Defaults to `height`.
 * `kernel`: Selecting a kernel for deconvolution. Possible values:
-  * `area`: Area Resize, used by default.
+  * `area`: Area Resize.
   * `bicubic`: Bicubic interpolation.
-  * `bilinear`: Bilinear interpolation.
+  * `bilinear`: Bilinear interpolation, used by default.
   * `blackman`: Blackman windowed sinc.
   * `box`: Box interpolation.
   * `gauss`: Gaussian kernel. `p` is specified via the `b` parameter, it must be between 1 and 100, the default value is 30.0. `taps` must be in the range from 1 to 128, the default value is 4.0.
