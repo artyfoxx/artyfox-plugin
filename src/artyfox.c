@@ -9,7 +9,7 @@
 
 #define UNUSED __attribute__((unused))
 
-typedef void (*convert_func)(
+typedef void (*bitdepth_func)(
     const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
     int src_w, int src_h, int src_bits, int dst_bits, bool range, bool chroma
 );
@@ -17,7 +17,7 @@ typedef void (*convert_func)(
 typedef struct {
     VSNode *node;
     VSVideoInfo vi;
-    convert_func f;
+    bitdepth_func f;
     bool direct;
 } BitDepthData;
 
@@ -360,18 +360,16 @@ static void VS_CC BitDepthCreate(
     vsapi->createVideoFilter(out, "BitDepth", &d.vi, BitDepthGetFrame, BitDepthFree, fmParallel, deps, 1, data, core);
 }
 
-typedef struct {
-    double gamma;
-    float thr_to, thr_from, corr, div;
-    bool strict;
-} GammaData;
+typedef void (*transfer_func)(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h
+);
 
 typedef struct {
     VSNode *node;
-    VSVideoInfo vi;
-    GammaData gamma;
+    const VSVideoInfo *vi;
+    transfer_func f;
     bool process[3];
-} LinearData;
+} TransferData;
 
 // exp2(log2(x) * y); 0.5 ulp
 // Based on: https://jrfonseca.blogspot.com/2008/09/fast-sse2-pow-tables-or-polynomials.html
@@ -420,8 +418,9 @@ static __m256 ffast_pow(__m256 x, __m256d y) {
     return _mm256_setr_m128(_mm256_cvtpd_ps(p0), _mm256_cvtpd_ps(p1));
 }
 
-static void to_linear(
-    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h, GammaData d
+// based on: https://www.kernel.org/doc/html/v4.8/media/uapi/v4l/pixfmt-007.html
+static void transfer_rec709_to_linear(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h
 ) {
     int tail = src_w % 8;
     int mod8_w = src_w - tail;
@@ -430,67 +429,41 @@ static void to_linear(
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
     __m256i tail_mask = _mm256_loadu_si256((const __m256i *)mask_arr);
     
-    __m256 v_thr = _mm256_set1_ps(d.thr_to);
-    __m256 v_corr = _mm256_set1_ps(d.corr);
-    __m256 v_corr_one = _mm256_set1_ps(1.0F + d.corr);
-    __m256d v_gamma = _mm256_set1_pd(d.gamma);
-    __m256 v_div = _mm256_set1_ps(d.div);
-    __m256 v_abs = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    const __m256 v_thr = _mm256_set1_ps(0.081F);
+    const __m256 v_corr = _mm256_set1_ps(0.099F);
+    const __m256 v_corr_one = _mm256_set1_ps(1.099F);
+    const __m256d v_gamma = _mm256_set1_pd(1.0 / 0.45);
+    const __m256 v_div = _mm256_set1_ps(4.5F);
+    const __m256 v_abs = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
     
-    if (d.strict) {
-        for (int y = 0; y < src_h; y++) {
-            int x = 0;
-            for (; x < mod8_w; x += 8) {
-                __m256 pix = _mm256_load_ps(srcp + x);
-                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
-                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
-                __m256 branch_0 = ffast_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
-                __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
-                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
-            }
-            if (tail) {
-                __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
-                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
-                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
-                __m256 branch_0 = ffast_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
-                __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
-                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
-            }
-            srcp += stride;
-            dstp += stride;
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m256 pix = _mm256_load_ps(srcp + x);
+            __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+            __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
+            __m256 branch_0 = ffast_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
+            __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
+            __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+            _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
         }
-    } else {
-        for (int y = 0; y < src_h; y++) {
-            int x = 0;
-            for (; x < mod8_w; x += 8) {
-                __m256 pix = _mm256_load_ps(srcp + x);
-                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
-                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
-                __m256 branch_0 = ffast_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
-                __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
-                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
-            }
-            if (tail) {
-                __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
-                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
-                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
-                __m256 branch_0 = ffast_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
-                __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
-                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
-            }
-            srcp += stride;
-            dstp += stride;
+        if (tail) {
+            __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
+            __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+            __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
+            __m256 branch_0 = ffast_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
+            __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
+            __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+            _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
         }
+        srcp += stride;
+        dstp += stride;
     }
     _mm_sfence();
 }
 
-static void from_linear(
-    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h, GammaData d
+static void transfer_srgb_to_linear(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h
 ) {
     int tail = src_w % 8;
     int mod8_w = src_w - tail;
@@ -499,61 +472,186 @@ static void from_linear(
     for (int i = 0; i < tail; i++) mask_arr[i] = -1;
     __m256i tail_mask = _mm256_loadu_si256((const __m256i *)mask_arr);
     
-    __m256 v_thr = _mm256_set1_ps(d.thr_from);
-    __m256 v_corr = _mm256_set1_ps(d.corr);
-    __m256 v_corr_one = _mm256_set1_ps(1.0F + d.corr);
-    __m256d v_gamma = _mm256_set1_pd(1.0 / d.gamma);
-    __m256 v_div = _mm256_set1_ps(d.div);
-    __m256 v_abs = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    const __m256 v_thr = _mm256_set1_ps(0.04045F);
+    const __m256 v_corr = _mm256_set1_ps(0.055F);
+    const __m256 v_corr_one = _mm256_set1_ps(1.055F);
+    const __m256d v_gamma = _mm256_set1_pd(2.4);
+    const __m256 v_div = _mm256_set1_ps(12.92F);
+    const __m256 v_abs = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
     
-    if (d.strict) {
-        for (int y = 0; y < src_h; y++) {
-            int x = 0;
-            for (; x < mod8_w; x += 8) {
-                __m256 pix = _mm256_load_ps(srcp + x);
-                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
-                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
-                __m256 branch_0 = _mm256_fmsub_ps(ffast_pow(pix_abs, v_gamma), v_corr_one, v_corr);
-                __m256 branch_1 = _mm256_mul_ps(pix_abs, v_div);
-                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
-            }
-            if (tail) {
-                __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
-                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
-                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
-                __m256 branch_0 = _mm256_fmsub_ps(ffast_pow(pix_abs, v_gamma), v_corr_one, v_corr);
-                __m256 branch_1 = _mm256_mul_ps(pix_abs, v_div);
-                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
-            }
-            srcp += stride;
-            dstp += stride;
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m256 pix = _mm256_load_ps(srcp + x);
+            __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+            __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
+            __m256 branch_0 = ffast_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
+            __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
+            __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+            _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
         }
-    } else {
-        for (int y = 0; y < src_h; y++) {
-            int x = 0;
-            for (; x < mod8_w; x += 8) {
-                __m256 pix = _mm256_load_ps(srcp + x);
-                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
-                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
-                __m256 branch_0 = _mm256_fmsub_ps(ffast_pow(pix_abs, v_gamma), v_corr_one, v_corr);
-                __m256 branch_1 = _mm256_mul_ps(pix_abs, v_div);
-                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
-            }
-            if (tail) {
-                __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
-                __m256 pix_abs = _mm256_and_ps(pix, v_abs);
-                __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
-                __m256 branch_0 = _mm256_fmsub_ps(ffast_pow(pix_abs, v_gamma), v_corr_one, v_corr);
-                __m256 branch_1 = _mm256_mul_ps(pix_abs, v_div);
-                __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
-                _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
-            }
-            srcp += stride;
-            dstp += stride;
+        if (tail) {
+            __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
+            __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+            __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
+            __m256 branch_0 = ffast_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
+            __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
+            __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+            _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
         }
+        srcp += stride;
+        dstp += stride;
+    }
+    _mm_sfence();
+}
+
+static void transfer_oprgb_to_linear(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h
+) {
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((const __m256i *)mask_arr);
+    
+    const __m256d v_gamma = _mm256_set1_pd(2.19921875);
+    const __m256 v_abs = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m256 pix = _mm256_load_ps(srcp + x);
+            __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+            __m256 res = ffast_pow(pix_abs, v_gamma);
+            _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
+        }
+        if (tail) {
+            __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
+            __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+            __m256 res = ffast_pow(pix_abs, v_gamma);
+            _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
+        }
+        srcp += stride;
+        dstp += stride;
+    }
+    _mm_sfence();
+}
+
+static void transfer_dcip3_to_linear(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h
+) {
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((const __m256i *)mask_arr);
+    
+    const __m256d v_gamma = _mm256_set1_pd(2.6);
+    const __m256 v_abs = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m256 pix = _mm256_load_ps(srcp + x);
+            __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+            __m256 res = ffast_pow(pix_abs, v_gamma);
+            _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
+        }
+        if (tail) {
+            __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
+            __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+            __m256 res = ffast_pow(pix_abs, v_gamma);
+            _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
+        }
+        srcp += stride;
+        dstp += stride;
+    }
+    _mm_sfence();
+}
+
+static void transfer_smpte240_to_linear(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h
+) {
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((const __m256i *)mask_arr);
+    
+    const __m256 v_thr = _mm256_set1_ps(0.0913F);
+    const __m256 v_corr = _mm256_set1_ps(0.1115F);
+    const __m256 v_corr_one = _mm256_set1_ps(1.1115F);
+    const __m256d v_gamma = _mm256_set1_pd(1.0 / 0.45);
+    const __m256 v_div = _mm256_set1_ps(4.0F);
+    const __m256 v_abs = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m256 pix = _mm256_load_ps(srcp + x);
+            __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+            __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
+            __m256 branch_0 = ffast_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
+            __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
+            __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+            _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
+        }
+        if (tail) {
+            __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
+            __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+            __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
+            __m256 branch_0 = ffast_pow(_mm256_div_ps(_mm256_add_ps(pix_abs, v_corr), v_corr_one), v_gamma);
+            __m256 branch_1 = _mm256_div_ps(pix_abs, v_div);
+            __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+            _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
+        }
+        srcp += stride;
+        dstp += stride;
+    }
+    _mm_sfence();
+}
+
+static void transfer_smpte2084_to_linear(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h
+) {
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((const __m256i *)mask_arr);
+    
+    const __m256d m1 = _mm256_set1_pd(1.0 / 0.1593017578125);
+    const __m256d m2 = _mm256_set1_pd(1.0 / 78.84375);
+    const __m256 c1 = _mm256_set1_ps(0.8359375F);
+    const __m256 c2 = _mm256_set1_ps(18.8515625F);
+    const __m256 c3 = _mm256_set1_ps(18.6875F);
+    const __m256 zero = _mm256_setzero_ps();
+    const __m256 v_abs = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m256 pix = _mm256_load_ps(srcp + x);
+            __m256 v_pow = ffast_pow(_mm256_and_ps(pix, v_abs), m2);
+            __m256 v_nom = _mm256_max_ps(_mm256_sub_ps(v_pow, c1), zero);
+            __m256 v_den = _mm256_sub_ps(c2, _mm256_mul_ps(c3, v_pow));
+            __m256 res = ffast_pow(_mm256_div_ps(v_nom, v_den), m1);
+            _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
+        }
+        if (tail) {
+            __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
+            __m256 v_pow = ffast_pow(_mm256_and_ps(pix, v_abs), m2);
+            __m256 v_nom = _mm256_max_ps(_mm256_sub_ps(v_pow, c1), zero);
+            __m256 v_den = _mm256_sub_ps(c2, _mm256_mul_ps(c3, v_pow));
+            __m256 res = ffast_pow(_mm256_div_ps(v_nom, v_den), m1);
+            _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
+        }
+        srcp += stride;
+        dstp += stride;
     }
     _mm_sfence();
 }
@@ -574,14 +672,40 @@ static const VSFrame *VS_CC LinearizeGetFrame(
     int n, int activationReason, void *instanceData, void **frameData UNUSED,
     VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi
 ) {
-    LinearData *d = (LinearData *)instanceData;
+    TransferData *d = (TransferData *)instanceData;
     
     if (activationReason == arInitial) {
         vsapi->requestFrameFilter(n, d->node, frameCtx);
     } else if (activationReason == arAllFramesReady) {
+        transfer_func f = d->f;
         const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
         const VSVideoFormat *fi = vsapi->getVideoFrameFormat(src);
-        VSFrame *dst = vsapi->newVideoFrame(fi, d->vi.width, d->vi.height, src, core);
+        
+        if (!f) {
+            const VSMap *props = vsapi->getFramePropertiesRO(src);
+            int err;
+            int transfer = vsapi->mapGetIntSaturated(props, "_Transfer", 0, &err);
+            if (err) {
+                vsapi->setFilterError("Linearize: frame property \"_Transfer\" missing, set \"gamma\" explicitly", frameCtx);
+                vsapi->freeFrame(src);
+                return NULL;
+            }
+            if (transfer == 1 || transfer == 6 || transfer == 14 || transfer == 15) {
+                f = transfer_rec709_to_linear;
+            } else if (transfer == 7) {
+                f = transfer_smpte240_to_linear;
+            } else if (transfer == 13) {
+                f = transfer_srgb_to_linear;
+            } else if (transfer == 16) {
+                f = transfer_smpte2084_to_linear;
+            } else {
+                vsapi->setFilterError("Linearize: frame property \"_Transfer\" has an unsupported value, set \"gamma\" explicitly", frameCtx);
+                vsapi->freeFrame(src);
+                return NULL;
+            }
+        }
+        
+        VSFrame *dst = vsapi->newVideoFrame(fi, d->vi->width, d->vi->height, src, core);
         
         for (int plane = 0; plane < fi->numPlanes; plane++) {
             const float *restrict srcp = (const float *)vsapi->getReadPtr(src, plane);
@@ -592,7 +716,7 @@ static const VSFrame *VS_CC LinearizeGetFrame(
             int src_h = vsapi->getFrameHeight(src, plane);
             
             if (d->process[plane]) {
-                to_linear(srcp, dstp, src_stride, src_w, src_h, d->gamma);
+                f(srcp, dstp, src_stride, src_w, src_h);
             } else {
                 vector_plane_copy(srcp, dstp, sizeof(float) * src_stride * src_h);
             }
@@ -604,7 +728,7 @@ static const VSFrame *VS_CC LinearizeGetFrame(
 }
 
 static void VS_CC LinearizeFree(void *instanceData, VSCore *core UNUSED, const VSAPI *vsapi) {
-    LinearData *d = (LinearData *)instanceData;
+    TransferData *d = (TransferData *)instanceData;
     vsapi->freeNode(d->node);
     free(d);
 }
@@ -612,17 +736,17 @@ static void VS_CC LinearizeFree(void *instanceData, VSCore *core UNUSED, const V
 static void VS_CC LinearizeCreate(
     const VSMap *in, VSMap *out, void *userData UNUSED, VSCore *core, const VSAPI *vsapi
 ) {
-    LinearData d;
+    TransferData d;
     d.node = vsapi->mapGetNode(in, "clip", 0, NULL);
-    d.vi = *vsapi->getVideoInfo(d.node);
+    d.vi = vsapi->getVideoInfo(d.node);
     
-    if (!vsh_isConstantVideoFormat(&d.vi) || d.vi.format.sampleType != stFloat || d.vi.format.bitsPerSample != 32) {
+    if (!vsh_isConstantVideoFormat(d.vi) || d.vi->format.sampleType != stFloat || d.vi->format.bitsPerSample != 32) {
         vsapi->mapSetError(out, "Linearize: only constant format 32bit float input supported");
         vsapi->freeNode(d.node);
         return;
     }
     
-    if (d.vi.width < 1 || d.vi.height < 1) {
+    if (d.vi->width < 1 || d.vi->height < 1) {
         vsapi->mapSetError(out, "Linearize: the width and height of the frame cannot be less than 1");
         vsapi->freeNode(d.node);
         return;
@@ -632,53 +756,314 @@ static void VS_CC LinearizeCreate(
     
     const char *gamma = vsapi->mapGetData(in, "gamma", 0, &err);
     if (err) {
-        if (d.vi.format.colorFamily == cfRGB) {
-            d.gamma = (GammaData){2.4, 0.04045F, 0.0031308F, 0.055F, 12.92F, true};
-        } else {
-            d.gamma = (GammaData){1.0 / 0.45, 0.081F, 0.018F, 0.099F, 4.5F, false};
-        }
+        d.f = NULL;
     } else if (!strcmp(gamma, "srgb")) {
-        d.gamma = (GammaData){2.4, 0.04045F, 0.0031308F, 0.055F, 12.92F, true};
+        d.f = transfer_srgb_to_linear;
     } else if (!strcmp(gamma, "smpte170m")) {
-        d.gamma = (GammaData){1.0 / 0.45, 0.081F, 0.018F, 0.099F, 4.5F, false};
+        d.f = transfer_rec709_to_linear;
     } else if (!strcmp(gamma, "adobe")) {
-        d.gamma = (GammaData){2.19921875, 0.0F, 0.0F, 0.0F, 1.0F, true};
+        d.f = transfer_oprgb_to_linear;
     } else if (!strcmp(gamma, "dcip3")) {
-        d.gamma = (GammaData){2.6, 0.0F, 0.0F, 0.0F, 1.0F, true};
+        d.f = transfer_dcip3_to_linear;
     } else if (!strcmp(gamma, "smpte240m")) {
-        d.gamma = (GammaData){1.0 / 0.45, 0.0913F, 0.0228F, 0.1115F, 4.0F, false};
+        d.f = transfer_smpte240_to_linear;
+    } else if (!strcmp(gamma, "smpte2084")) {
+        d.f = transfer_smpte2084_to_linear;
     } else {
         vsapi->mapSetError(out, "Linearize: invalid gamma specified");
         vsapi->freeNode(d.node);
         return;
     }
     
-    if (d.vi.format.colorFamily == cfYUV) {
+    if (d.vi->format.colorFamily == cfYUV) {
         d.process[0] = true;
         d.process[2] = d.process[1] = false;
     } else {
         d.process[2] = d.process[1] = d.process[0] = true;
     }
     
-    LinearData *data = (LinearData *)malloc(sizeof d);
+    TransferData *data = (TransferData *)malloc(sizeof d);
     *data = d;
     
     VSFilterDependency deps[] = {{d.node, rpStrictSpatial}};
-    vsapi->createVideoFilter(out, "Linearize", &d.vi, LinearizeGetFrame, LinearizeFree, fmParallel, deps, 1, data, core);
+    vsapi->createVideoFilter(out, "Linearize", d.vi, LinearizeGetFrame, LinearizeFree, fmParallel, deps, 1, data, core);
 }
 
-static const VSFrame *VS_CC GammaCorrGetFrame(
+static void transfer_linear_to_rec709(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h
+) {
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((const __m256i *)mask_arr);
+    
+    const __m256 v_thr = _mm256_set1_ps(0.018F);
+    const __m256 v_corr = _mm256_set1_ps(0.099F);
+    const __m256 v_corr_one = _mm256_set1_ps(1.099F);
+    const __m256d v_gamma = _mm256_set1_pd(0.45);
+    const __m256 v_mul = _mm256_set1_ps(4.5F);
+    const __m256 v_abs = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m256 pix = _mm256_load_ps(srcp + x);
+            __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+            __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
+            __m256 branch_0 = _mm256_fmsub_ps(ffast_pow(pix_abs, v_gamma), v_corr_one, v_corr);
+            __m256 branch_1 = _mm256_mul_ps(pix_abs, v_mul);
+            __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+            _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
+        }
+        if (tail) {
+            __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
+            __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+            __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
+            __m256 branch_0 = _mm256_fmsub_ps(ffast_pow(pix_abs, v_gamma), v_corr_one, v_corr);
+            __m256 branch_1 = _mm256_mul_ps(pix_abs, v_mul);
+            __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+            _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
+        }
+        srcp += stride;
+        dstp += stride;
+    }
+    _mm_sfence();
+}
+
+static void transfer_linear_to_srgb(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h
+) {
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((const __m256i *)mask_arr);
+    
+    const __m256 v_thr = _mm256_set1_ps(0.0031308F);
+    const __m256 v_corr = _mm256_set1_ps(0.055F);
+    const __m256 v_corr_one = _mm256_set1_ps(1.055F);
+    const __m256d v_gamma = _mm256_set1_pd(1.0 / 2.4);
+    const __m256 v_mul = _mm256_set1_ps(12.92F);
+    const __m256 v_abs = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m256 pix = _mm256_load_ps(srcp + x);
+            __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+            __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
+            __m256 branch_0 = _mm256_fmsub_ps(ffast_pow(pix_abs, v_gamma), v_corr_one, v_corr);
+            __m256 branch_1 = _mm256_mul_ps(pix_abs, v_mul);
+            __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+            _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
+        }
+        if (tail) {
+            __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
+            __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+            __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GT_OQ);
+            __m256 branch_0 = _mm256_fmsub_ps(ffast_pow(pix_abs, v_gamma), v_corr_one, v_corr);
+            __m256 branch_1 = _mm256_mul_ps(pix_abs, v_mul);
+            __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+            _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
+        }
+        srcp += stride;
+        dstp += stride;
+    }
+    _mm_sfence();
+}
+
+static void transfer_linear_to_oprgb(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h
+) {
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((const __m256i *)mask_arr);
+    
+    const __m256d v_gamma = _mm256_set1_pd(1.0 / 2.19921875);
+    const __m256 v_abs = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m256 pix = _mm256_load_ps(srcp + x);
+            __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+            __m256 res = ffast_pow(pix_abs, v_gamma);
+            _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
+        }
+        if (tail) {
+            __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
+            __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+            __m256 res = ffast_pow(pix_abs, v_gamma);
+            _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
+        }
+        srcp += stride;
+        dstp += stride;
+    }
+    _mm_sfence();
+}
+
+static void transfer_linear_to_dcip3(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h
+) {
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((const __m256i *)mask_arr);
+    
+    const __m256d v_gamma = _mm256_set1_pd(1.0 / 2.6);
+    const __m256 v_abs = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m256 pix = _mm256_load_ps(srcp + x);
+            __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+            __m256 res = ffast_pow(pix_abs, v_gamma);
+            _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
+        }
+        if (tail) {
+            __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
+            __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+            __m256 res = ffast_pow(pix_abs, v_gamma);
+            _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
+        }
+        srcp += stride;
+        dstp += stride;
+    }
+    _mm_sfence();
+}
+
+static void transfer_linear_to_smpte240(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h
+) {
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((const __m256i *)mask_arr);
+    
+    const __m256 v_thr = _mm256_set1_ps(0.0228F);
+    const __m256 v_corr = _mm256_set1_ps(0.1115F);
+    const __m256 v_corr_one = _mm256_set1_ps(1.1115F);
+    const __m256d v_gamma = _mm256_set1_pd(0.45);
+    const __m256 v_mul = _mm256_set1_ps(4.0F);
+    const __m256 v_abs = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m256 pix = _mm256_load_ps(srcp + x);
+            __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+            __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
+            __m256 branch_0 = _mm256_fmsub_ps(ffast_pow(pix_abs, v_gamma), v_corr_one, v_corr);
+            __m256 branch_1 = _mm256_mul_ps(pix_abs, v_mul);
+            __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+            _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
+        }
+        if (tail) {
+            __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
+            __m256 pix_abs = _mm256_and_ps(pix, v_abs);
+            __m256 mask_abs = _mm256_cmp_ps(pix_abs, v_thr, _CMP_GE_OQ);
+            __m256 branch_0 = _mm256_fmsub_ps(ffast_pow(pix_abs, v_gamma), v_corr_one, v_corr);
+            __m256 branch_1 = _mm256_mul_ps(pix_abs, v_mul);
+            __m256 res = _mm256_blendv_ps(branch_1, branch_0, mask_abs);
+            _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
+        }
+        srcp += stride;
+        dstp += stride;
+    }
+    _mm_sfence();
+}
+
+static void transfer_linear_to_smpte2084(
+    const float *restrict srcp, float *restrict dstp, ptrdiff_t stride, int src_w, int src_h
+) {
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((const __m256i *)mask_arr);
+    
+    const __m256d m1 = _mm256_set1_pd(0.1593017578125);
+    const __m256d m2 = _mm256_set1_pd(78.84375);
+    const __m256 c1 = _mm256_set1_ps(0.8359375F);
+    const __m256 c2 = _mm256_set1_ps(18.8515625F);
+    const __m256 c3 = _mm256_set1_ps(18.6875F);
+    const __m256 v_one = _mm256_set1_ps(1.0F);
+    const __m256 v_abs = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m256 pix = _mm256_load_ps(srcp + x);
+            __m256 v_pow = ffast_pow(_mm256_and_ps(pix, v_abs), m1);
+            __m256 v_nom = _mm256_add_ps(c1, _mm256_mul_ps(c2, v_pow));
+            __m256 v_den = _mm256_add_ps(v_one, _mm256_mul_ps(c3, v_pow));
+            __m256 res = ffast_pow(_mm256_div_ps(v_nom, v_den), m2);
+            _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
+        }
+        if (tail) {
+            __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
+            __m256 v_pow = ffast_pow(_mm256_and_ps(pix, v_abs), m1);
+            __m256 v_nom = _mm256_add_ps(c1, _mm256_mul_ps(c2, v_pow));
+            __m256 v_den = _mm256_add_ps(v_one, _mm256_mul_ps(c3, v_pow));
+            __m256 res = ffast_pow(_mm256_div_ps(v_nom, v_den), m2);
+            _mm256_stream_ps(dstp + x, _mm256_or_ps(_mm256_andnot_ps(v_abs, pix), res));
+        }
+        srcp += stride;
+        dstp += stride;
+    }
+    _mm_sfence();
+}
+
+static const VSFrame *VS_CC TransferGetFrame(
     int n, int activationReason, void *instanceData, void **frameData UNUSED,
     VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi
 ) {
-    LinearData *d = (LinearData *)instanceData;
+    TransferData *d = (TransferData *)instanceData;
     
     if (activationReason == arInitial) {
         vsapi->requestFrameFilter(n, d->node, frameCtx);
     } else if (activationReason == arAllFramesReady) {
+        transfer_func f = d->f;
         const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
         const VSVideoFormat *fi = vsapi->getVideoFrameFormat(src);
-        VSFrame *dst = vsapi->newVideoFrame(fi, d->vi.width, d->vi.height, src, core);
+        
+        if (!f) {
+            const VSMap *props = vsapi->getFramePropertiesRO(src);
+            int err;
+            int transfer = vsapi->mapGetIntSaturated(props, "_Transfer", 0, &err);
+            if (err) {
+                vsapi->setFilterError("Transfer: frame property \"_Transfer\" missing, set \"gamma\" explicitly", frameCtx);
+                vsapi->freeFrame(src);
+                return NULL;
+            }
+            if (transfer == 1 || transfer == 6 || transfer == 14 || transfer == 15) {
+                f = transfer_linear_to_rec709;
+            } else if (transfer == 7) {
+                f = transfer_linear_to_smpte240;
+            } else if (transfer == 13) {
+                f = transfer_linear_to_srgb;
+            } else if (transfer == 16) {
+                f = transfer_linear_to_smpte2084;
+            } else {
+                vsapi->setFilterError("Transfer: frame property \"_Transfer\" has an unsupported value, set \"gamma\" explicitly", frameCtx);
+                vsapi->freeFrame(src);
+                return NULL;
+            }
+        }
+        
+        VSFrame *dst = vsapi->newVideoFrame(fi, d->vi->width, d->vi->height, src, core);
         
         for (int plane = 0; plane < fi->numPlanes; plane++) {
             const float *restrict srcp = (const float *)vsapi->getReadPtr(src, plane);
@@ -689,7 +1074,7 @@ static const VSFrame *VS_CC GammaCorrGetFrame(
             int src_h = vsapi->getFrameHeight(src, plane);
             
             if (d->process[plane]) {
-                from_linear(srcp, dstp, src_stride, src_w, src_h, d->gamma);
+                f(srcp, dstp, src_stride, src_w, src_h);
             } else {
                 vector_plane_copy(srcp, dstp, sizeof(float) * src_stride * src_h);
             }
@@ -700,27 +1085,27 @@ static const VSFrame *VS_CC GammaCorrGetFrame(
     return NULL;
 }
 
-static void VS_CC GammaCorrFree(void *instanceData, VSCore *core UNUSED, const VSAPI *vsapi) {
-    LinearData *d = (LinearData *)instanceData;
+static void VS_CC TransferFree(void *instanceData, VSCore *core UNUSED, const VSAPI *vsapi) {
+    TransferData *d = (TransferData *)instanceData;
     vsapi->freeNode(d->node);
     free(d);
 }
 
-static void VS_CC GammaCorrCreate(
+static void VS_CC TransferCreate(
     const VSMap *in, VSMap *out, void *userData UNUSED, VSCore *core, const VSAPI *vsapi
 ) {
-    LinearData d;
+    TransferData d;
     d.node = vsapi->mapGetNode(in, "clip", 0, NULL);
-    d.vi = *vsapi->getVideoInfo(d.node);
+    d.vi = vsapi->getVideoInfo(d.node);
     
-    if (!vsh_isConstantVideoFormat(&d.vi) || d.vi.format.sampleType != stFloat || d.vi.format.bitsPerSample != 32) {
-        vsapi->mapSetError(out, "GammaCorr: only constant format 32bit float input supported");
+    if (!vsh_isConstantVideoFormat(d.vi) || d.vi->format.sampleType != stFloat || d.vi->format.bitsPerSample != 32) {
+        vsapi->mapSetError(out, "Transfer: only constant format 32bit float input supported");
         vsapi->freeNode(d.node);
         return;
     }
     
-    if (d.vi.width < 1 || d.vi.height < 1) {
-        vsapi->mapSetError(out, "GammaCorr: the width and height of the frame cannot be less than 1");
+    if (d.vi->width < 1 || d.vi->height < 1) {
+        vsapi->mapSetError(out, "Transfer: the width and height of the frame cannot be less than 1");
         vsapi->freeNode(d.node);
         return;
     }
@@ -729,39 +1114,37 @@ static void VS_CC GammaCorrCreate(
     
     const char *gamma = vsapi->mapGetData(in, "gamma", 0, &err);
     if (err) {
-        if (d.vi.format.colorFamily == cfRGB) {
-            d.gamma = (GammaData){2.4, 0.04045F, 0.0031308F, 0.055F, 12.92F, true};
-        } else {
-            d.gamma = (GammaData){1.0 / 0.45, 0.081F, 0.018F, 0.099F, 4.5F, false};
-        }
+        d.f = NULL;
     } else if (!strcmp(gamma, "srgb")) {
-        d.gamma = (GammaData){2.4, 0.04045F, 0.0031308F, 0.055F, 12.92F, true};
+        d.f = transfer_linear_to_srgb;
     } else if (!strcmp(gamma, "smpte170m")) {
-        d.gamma = (GammaData){1.0 / 0.45, 0.081F, 0.018F, 0.099F, 4.5F, false};
+        d.f = transfer_linear_to_rec709;
     } else if (!strcmp(gamma, "adobe")) {
-        d.gamma = (GammaData){2.19921875, 0.0F, 0.0F, 0.0F, 1.0F, true};
+        d.f = transfer_linear_to_oprgb;
     } else if (!strcmp(gamma, "dcip3")) {
-        d.gamma = (GammaData){2.6, 0.0F, 0.0F, 0.0F, 1.0F, true};
+        d.f = transfer_linear_to_dcip3;
     } else if (!strcmp(gamma, "smpte240m")) {
-        d.gamma = (GammaData){1.0 / 0.45, 0.0913F, 0.0228F, 0.1115F, 4.0F, false};
+        d.f = transfer_linear_to_smpte240;
+    } else if (!strcmp(gamma, "smpte2084")) {
+        d.f = transfer_linear_to_smpte2084;
     } else {
-        vsapi->mapSetError(out, "GammaCorr: invalid gamma specified");
+        vsapi->mapSetError(out, "Transfer: invalid gamma specified");
         vsapi->freeNode(d.node);
         return;
     }
     
-    if (d.vi.format.colorFamily == cfYUV) {
+    if (d.vi->format.colorFamily == cfYUV) {
         d.process[0] = true;
         d.process[2] = d.process[1] = false;
     } else {
         d.process[2] = d.process[1] = d.process[0] = true;
     }
     
-    LinearData *data = (LinearData *)malloc(sizeof d);
+    TransferData *data = (TransferData *)malloc(sizeof d);
     *data = d;
     
     VSFilterDependency deps[] = {{d.node, rpStrictSpatial}};
-    vsapi->createVideoFilter(out, "GammaCorr", &d.vi, GammaCorrGetFrame, GammaCorrFree, fmParallel, deps, 1, data, core);
+    vsapi->createVideoFilter(out, "Transfer", d.vi, TransferGetFrame, TransferFree, fmParallel, deps, 1, data, core);
 }
 
 typedef double (*kernel_func)(double x, void *ctx);
@@ -791,12 +1174,12 @@ typedef struct {
     int dst_width, dst_height;
     double start_w, start_h, real_w, real_h;
     kernel_t kernel_w, kernel_h;
-    GammaData gamma;
+    transfer_func f0, f1;
     float sharp;
     csr_get_weights_func csr_get_weights;
     bool linear, process_w, process_h;
     csr_t luma_w, luma_h;
-    convert_func conv_up, conv_down;
+    bitdepth_func conv_up, conv_down;
 } ResizeData;
 
 typedef struct {
@@ -1627,6 +2010,8 @@ static const VSFrame *VS_CC ResizeGetFrame(
     if (activationReason == arInitial) {
         vsapi->requestFrameFilter(n, d->node, frameCtx);
     } else if (activationReason == arAllFramesReady) {
+        transfer_func f0 = d->f0;
+        transfer_func f1 = d->f1;
         const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
         const VSVideoFormat *fi = vsapi->getVideoFrameFormat(src);
         const VSMap *props = vsapi->getFramePropertiesRO(src);
@@ -1644,6 +2029,32 @@ static const VSFrame *VS_CC ResizeGetFrame(
         } else if (err) {
             range = !!vsapi->mapGetIntSaturated(props, "_ColorRange", 0, &err);
             if (err) range = (fi->colorFamily != cfRGB);
+        }
+        
+        if (d->linear && (!f0 || !f1)) {
+            int transfer = vsapi->mapGetIntSaturated(props, "_Transfer", 0, &err);
+            if (err) {
+                vsapi->setFilterError("Resize: frame property \"_Transfer\" missing, set \"gamma\" explicitly", frameCtx);
+                vsapi->freeFrame(src);
+                return NULL;
+            }
+            if (transfer == 1 || transfer == 6 || transfer == 14 || transfer == 15) {
+                f0 = transfer_rec709_to_linear;
+                f1 = transfer_linear_to_rec709;
+            } else if (transfer == 7) {
+                f0 = transfer_smpte240_to_linear;
+                f1 = transfer_linear_to_smpte240;
+            } else if (transfer == 13) {
+                f0 = transfer_srgb_to_linear;
+                f1 = transfer_linear_to_srgb;
+            } else if (transfer == 16) {
+                f0 = transfer_smpte2084_to_linear;
+                f1 = transfer_linear_to_smpte2084;
+            } else {
+                vsapi->setFilterError("Resize: frame property \"_Transfer\" has an unsupported value, set \"gamma\" explicitly", frameCtx);
+                vsapi->freeFrame(src);
+                return NULL;
+            }
         }
         
         csr_t chroma_w, chroma_h;
@@ -1686,10 +2097,10 @@ static const VSFrame *VS_CC ResizeGetFrame(
         }
         
         VSFrame *lin = NULL;
-        VSFrame *gcr = NULL;
+        VSFrame *trf = NULL;
         if (d->linear) {
             lin = vsapi->newVideoFrame(&d->vi.format, d->vi.width, d->vi.height, NULL, core);
-            gcr = vsapi->newVideoFrame(&d->vi.format, d->dst_width, d->dst_height, NULL, core);
+            trf = vsapi->newVideoFrame(&d->vi.format, d->dst_width, d->dst_height, NULL, core);
         }
         
         VSFrame *tmp = NULL;
@@ -1731,9 +2142,9 @@ static const VSFrame *VS_CC ResizeGetFrame(
             
             if (d->linear && !chroma) {
                 void *restrict linp = (void *)vsapi->getWritePtr(lin, plane);
-                to_linear(srcp, linp, src_stride, src_w, src_h, d->gamma);
+                f0(srcp, linp, src_stride, src_w, src_h);
                 srcp = linp;
-                dstp = (void *)vsapi->getWritePtr(gcr, plane);
+                dstp = (void *)vsapi->getWritePtr(trf, plane);
             }
             
             if (d->process_w && d->process_h) {
@@ -1755,9 +2166,9 @@ static const VSFrame *VS_CC ResizeGetFrame(
             }
             
             if (d->linear && !chroma) {
-                void *restrict gcrp = dstp;
+                void *restrict trfp = dstp;
                 dstp = bit_convert ? (void *)vsapi->getWritePtr(bcd, plane) : (void *)vsapi->getWritePtr(dst, plane);
-                from_linear(gcrp, dstp, dst_stride, dst_w, dst_h, d->gamma);
+                f1(trfp, dstp, dst_stride, dst_w, dst_h);
             }
             
             if (bit_convert) {
@@ -1770,7 +2181,7 @@ static const VSFrame *VS_CC ResizeGetFrame(
         }
         vsapi->freeFrame(shr);
         vsapi->freeFrame(tmp);
-        vsapi->freeFrame(gcr);
+        vsapi->freeFrame(trf);
         vsapi->freeFrame(lin);
         vsapi->freeFrame(bcd);
         vsapi->freeFrame(bcu);
@@ -1901,23 +2312,29 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData UNUSE
     
     const char *gamma = vsapi->mapGetData(in, "gamma", 0, &err);
     if (err) {
-        if (d.vi.format.colorFamily == cfRGB) {
-            d.gamma = (GammaData){2.4, 0.04045F, 0.0031308F, 0.055F, 12.92F, true};
-        } else {
-            d.gamma = (GammaData){1.0 / 0.45, 0.081F, 0.018F, 0.099F, 4.5F, false};
-        }
+        d.f0 = NULL;
+        d.f1 = NULL;
     } else if (!strcmp(gamma, "srgb")) {
-        d.gamma = (GammaData){2.4, 0.04045F, 0.0031308F, 0.055F, 12.92F, true};
+        d.f0 = transfer_srgb_to_linear;
+        d.f1 = transfer_linear_to_srgb;
     } else if (!strcmp(gamma, "smpte170m")) {
-        d.gamma = (GammaData){1.0 / 0.45, 0.081F, 0.018F, 0.099F, 4.5F, false};
+        d.f0 = transfer_rec709_to_linear;
+        d.f1 = transfer_linear_to_rec709;
     } else if (!strcmp(gamma, "adobe")) {
-        d.gamma = (GammaData){2.19921875, 0.0F, 0.0F, 0.0F, 1.0F, true};
+        d.f0 = transfer_oprgb_to_linear;
+        d.f1 = transfer_linear_to_oprgb;
     } else if (!strcmp(gamma, "dcip3")) {
-        d.gamma = (GammaData){2.6, 0.0F, 0.0F, 0.0F, 1.0F, true};
+        d.f0 = transfer_dcip3_to_linear;
+        d.f1 = transfer_linear_to_dcip3;
     } else if (!strcmp(gamma, "smpte240m")) {
-        d.gamma = (GammaData){1.0 / 0.45, 0.0913F, 0.0228F, 0.1115F, 4.0F, false};
+        d.f0 = transfer_smpte240_to_linear;
+        d.f1 = transfer_linear_to_smpte240;
+    } else if (!strcmp(gamma, "smpte2084")) {
+        d.f0 = transfer_smpte2084_to_linear;
+        d.f1 = transfer_linear_to_smpte2084;
     } else if (!strcmp(gamma, "none")) {
-        d.gamma = (GammaData){1.0, 0.0F, 0.0F, 0.0F, 1.0F, true};
+        d.f0 = NULL;
+        d.f1 = NULL;
         d.linear = false;
     } else {
         vsapi->mapSetError(out, "Resize: invalid gamma specified");
@@ -9548,7 +9965,7 @@ static void VS_CC UnsharpMaskCreate(
 }
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
-    vspapi->configPlugin("com.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(20, 3), VAPOURSYNTH_API_VERSION, 0, plugin);
+    vspapi->configPlugin("com.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(20, 4), VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction(
         "BitDepth",
         "clip:vnode;"
@@ -9569,11 +9986,11 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
         plugin
     );
     vspapi->registerFunction(
-        "GammaCorr",
+        "Transfer",
         "clip:vnode;"
         "gamma:data:opt;",
         "clip:vnode;",
-        GammaCorrCreate,
+        TransferCreate,
         NULL,
         plugin
     );

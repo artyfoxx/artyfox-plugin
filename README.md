@@ -23,23 +23,35 @@ Converting the bit depth of a clip.
 * `direct`: If `True`, conversion from integer to float or vice versa always uses the full range and ignores the `"_ColorRange"` and `"_Range"` properties. Defaults to `False`.
 
 ## Linearize
-`artyfox.Linearize(clip clip[, str gamma='srgb' or 'smpte170m'])`
+`artyfox.Linearize(clip clip[, str gamma="_Transfer" frame property])`
 
-Inverse gamma correction (linearization) of the color space. For YUV, a simplified procedure is used, based on the assumption that the chroma is much less sensitive to gamma correction than the luma.
+Inverse transfer function (linearization) of the specified color space. For YUV, a simplified procedure is used, based on the assumption that the chroma is much less sensitive to gamma correction than the luma.
+It is used for subsequent mathematically correct operations with video in linear color space, such as convolution or resizing.
 * `clip`: Source clip to linearize. Must be RGB, YUV or GRAY. 32-bit float sample type only. The range must be converted to full.
-* `gamma`: The inverse and forward gamma correction value. Correction is performed before and after resizing, in order to produce the resize itself in a linear color space. The default values ​​are `'srgb'` for RGB and `'smpte170m'` for YUV and GRAY. Two different formulas are used for RGB and YUV/GRAY. The formula for YUV/GRAY is suitable for SMPTE 170M, BT.601, BT.709, BT.2020.
-Other supported values ​​are: `'adobe'` (Adobe RGB), `'dcip3'` (DCI-P3) and `'smpte240m'` (SMPTE 240M).
+* `gamma`: The transfer function that was applied to the video and that needs to be inverted. By default, it is taken from the frame property `"_Transfer"`. Possible values:
+  * `srgb`: `sRGB` inverse transfer function.
+  * `smpte170m`: `SMPTE 170M`, `BT.709`, `BT.601` and `BT.2020` inverse transfer functions.
+  * `adobe`: `Adobe RGB` and `opRGB` inverse transfer functions.
+  * `dcip3`: `DCI-P3` inverse transfer function.
+  * `smpte240m`: `SMPTE 240M` inverse transfer function.
+  * `smpte2084`: `SMPTE 2084` (`PQ HDR`) inverse transfer function.
 
 ## GammaCorr
-`artyfox.GammaCorr(clip clip[, str gamma='srgb' or 'smpte170m'])`
+`artyfox.GammaCorr(clip clip[, str gamma="_Transfer" frame property])`
 
-Gamma correction of the color space. For YUV, a simplified procedure is used, based on the assumption that the chroma is much less sensitive to gamma correction than the luma.
+Transfer function (gamma correction) to the specified color space. For YUV, a simplified procedure is used, based on the assumption that the chroma is much less sensitive to gamma correction than the luma.
+It is used for subsequent mathematically correct operations with video in linear color space, such as convolution or resizing.
 * `clip`: Source clip for gamma correction. Must be RGB, YUV or GRAY. 32-bit float sample type only. The range must be converted to full.
-* `gamma`: The inverse and forward gamma correction value. Correction is performed before and after resizing, in order to produce the resize itself in a linear color space. The default values ​​are `'srgb'` for RGB and `'smpte170m'` for YUV and GRAY. Two different formulas are used for RGB and YUV/GRAY. The formula for YUV/GRAY is suitable for SMPTE 170M, BT.601, BT.709, BT.2020.
-Other supported values ​​are: `'adobe'` (Adobe RGB), `'dcip3'` (DCI-P3) and `'smpte240m'` (SMPTE 240M).
+* `gamma`: The transfer function to be applied to the video. By default, it is taken from the frame property `"_Transfer"`. Possible values:
+  * `srgb`: `sRGB` transfer function.
+  * `smpte170m`: `SMPTE 170M`, `BT.709`, `BT.601` and `BT.2020` transfer functions.
+  * `adobe`: `Adobe RGB` and `opRGB` transfer functions.
+  * `dcip3`: `DCI-P3` transfer function.
+  * `smpte240m`: `SMPTE 240M` transfer function.
+  * `smpte2084`: `SMPTE 2084` (`PQ HDR`) transfer function.
 
 ## Resize
-`artyfox.Resize(clip clip, int width, int height[, float src_left=0.0, float src_top=0.0, float src_width=clip.width, float src_height=clip.height, str kernel="bilinear", float b=1/3, float c=1/3, float taps=3.0, str confine='inf', str gamma='srgb' or 'smpte170m', float sharp=1.0])`
+`artyfox.Resize(clip clip, int width, int height[, float src_left=0.0, float src_top=0.0, float src_width=clip.width, float src_height=clip.height, str kernel='bilinear', float b=1/3, float c=1/3, float taps=3.0, str confine='inf', str gamma="_Transfer" frame property, float sharp=1.0])`
 
 Implementation of multiple resize functions using double-precision convolution method in a linear color space. For YUV, a simplified procedure is used, based on the assumption that the chroma is much less sensitive to gamma correction than the luma.
 * `clip`: Source clip to resize. Must be RGB, YUV or GRAY. 8-16-bit integer or 32-bit float sample type.
@@ -75,15 +87,21 @@ Implementation of multiple resize functions using double-precision convolution m
   * `zero`: Pixels outside the frame are considered zero.
   * `inf`: Pixels outside the frame are replaced with the nearest pixels within the frame, used by default.
   * `mirror`: Pixels outside the frame are considered mirror images of pixels inside the frame.
-* `gamma`: The inverse and forward gamma correction value. Correction is performed before and after resizing, in order to produce the resize itself in a linear color space. The default values ​​are `'srgb'` for RGB and `'smpte170m'` for YUV and GRAY. Two different formulas are used for RGB and YUV/GRAY. The formula for YUV/GRAY is suitable for SMPTE 170M, BT.601, BT.709, BT.2020.
-Other supported values ​​are: `'adobe'` (Adobe RGB), `'dcip3'` (DCI-P3), `'smpte240m'` (SMPTE 240M) and `'none'` (completely disables correction, resizing occurs directly, in a logarithmic color space).
+* `gamma`: The inverse and forward transfer functions. Correction is performed before and after resizing, in order to produce the resize itself in a linear color space. By default, it is taken from the frame property `"_Transfer"`. Possible values:
+  * `srgb`: `sRGB` inverse and forward transfer functions.
+  * `smpte170m`: `SMPTE 170M`, `BT.709`, `BT.601` and `BT.2020` inverse and forward transfer functions.
+  * `adobe`: `Adobe RGB` and `opRGB` inverse and forward transfer functions.
+  * `dcip3`: `DCI-P3` inverse and forward transfer functions.
+  * `smpte240m`: `SMPTE 240M` inverse and forward transfer functions.
+  * `smpte2084`: `SMPTE 2084` (`PQ HDR`) inverse and forward transfer functions.
+  * `none`: completely disables transfer, resizing occurs directly, in a logarithmic color space.
 * `sharp`: Optional post sharp. It is performed after resizing, but before gamma correction. By default, 1.0 (sharp is disabled). Values ​​​​less than 1.0 - blur, more - sharp. The allowed range of values ​​is from 0.1 to 5.0
 
 Chroma alignment in YUV with subsampling is performed based on the `"_ChromaLocation"` property. If the property is missing, then alignment is performed along the left edge, as in MPEG2.  
 Resize and alignment by fields are not supported.
 
 ## Descale
-`artyfox.Descale(clip clip, int width, int height[, float src_left=0.0, float src_top=0.0, float src_width=width, float src_height=height, str kernel="bilinear", float b=1/3, float c=1/3, float taps=3.0, str confine='inf', float reg=1e-8])`
+`artyfox.Descale(clip clip, int width, int height[, float src_left=0.0, float src_top=0.0, float src_width=width, float src_height=height, str kernel='bilinear', float b=1/3, float c=1/3, float taps=3.0, str confine='inf', float reg=1e-8])`
 
 Descaling via Tikhonov regularization and Cholesky decomposition (U.T @ U) using double-precision convolution method.
 * `clip`: Source clip to descale. Must be RGB, YUV or GRAY. 32-bit float sample type only.
