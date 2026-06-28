@@ -12,6 +12,7 @@ The library is written using AVX2 and FMA3 intrinsics, so processors older than 
 * [**Metric**](#metric)  
 * [**FixBorder**](#fixborder)  
 * [**AverageFields**](#averagefields)
+* [**UnsharpMask**](#unsharpmask)
 
 ## BitDepth
 `artyfox.BitDepth(clip clip, int bits[, bool direct=False])`
@@ -177,6 +178,21 @@ A function for correcting interlaced fades. It works by averaging the fields of 
 * `clip`: The clip that needs correction.
 * `weight`: The ratio of the contribution of fields to the resulting clip. 0.0 means the top field remains unchanged, and the bottom field is adjusted based on the top field. 1.0 means the bottom field remains unchanged, and the top field is adjusted based on the bottom field. Anything in between means the fields are mutually adjusted based on the set ratio. Default is 0.5. The allowed range of values ​​is from 0.0 to 1.0.
 * `shift`: Shift the zero point of the correction curve relative to the beginning of the range. For YUV, it applies to luma only. Specified in 8-bit notation. Default is 0.0. The allowed range of values ​​is from -19.0 to 279.0.
+
+## UnsharpMask
+`artyfox.UnsharpMask(clip clip[, int strength=64, int radius=3, int threshold=8, str mode='box', int passes=1, bool rounding=False, int[] planes=[0, 1, 2] if clip.format.color_family == vs.RGB else 0])`
+
+A port of `UnsharpMask` from `AviSynth` with a few additions. By default, it completely replicates the original filter's algorithm.
+* `clip`: Target clip to receive the unsharp mask.
+* `strength`: Adjusts the amount of enhancement and attenuation of the unsharp mask effect. Valid range: 1 to 512. Default is 64.
+* `radius`: The blur radius used to create the unsharp mask. Valid range: 1 to 127. Default is 3.
+* `threshold`: A threshold for the absolute difference between the original and blurred clips, above which the difference is considered significant. Anything less than or equal to this value is passed unchanged. This allows for noise filtering. Specified in 8-bit notation. Valid range: 0 to 255. Default is 8.
+* `mode`: Blur mode:
+  * `box`: Box blur, used by default.
+  * `stack`: Stack blur (triangular core).
+* `passes`: The number of blur passes. This allows to emulate a Gaussian kernel with the desired degree of approximation. `passes=2, mode='box'` corresponds to `passes=1, mode='stack'`, taking into account the difference in rounding. Valid range: 1 to 16. Default is 1.
+* `rounding`: Rounding mode. `False` - round down (floor), `True` - arithmetic rounding. Default is `False`.
+* `planes`: List of planes for the unsharp mask. Defaults to `all` for RGB and `0` for other color families.
 
 ## License
 This project is licensed under the MIT License - see the LICENSE file for details.
