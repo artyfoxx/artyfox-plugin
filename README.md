@@ -5,7 +5,7 @@ The library is written using AVX2 and FMA3 intrinsics, so processors older than 
 ## Filters:
 * [**BitDepth**](#bitdepth)  
 * [**Linearize**](#linearize)  
-* [**GammaCorr**](#gammacorr)  
+* [**Transfer**](#transfer)  
 * [**Resize**](#resize)  
 * [**Descale**](#descale)  
 * [**Mean**](#mean)  
@@ -36,8 +36,8 @@ It is used for subsequent mathematically correct operations with video in linear
   * `smpte240m`: `SMPTE 240M` inverse transfer function.
   * `smpte2084`: `SMPTE 2084` (`PQ HDR`) inverse transfer function.
 
-## GammaCorr
-`artyfox.GammaCorr(clip clip[, str gamma="_Transfer" frame property])`
+## Transfer
+`artyfox.Transfer(clip clip[, str gamma="_Transfer" frame property])`
 
 Transfer function (gamma correction) to the specified color space. For YUV, a simplified procedure is used, based on the assumption that the chroma is much less sensitive to gamma correction than the luma.
 It is used for subsequent mathematically correct operations with video in linear color space, such as convolution or resizing.
