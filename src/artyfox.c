@@ -17,11 +17,11 @@ typedef void (*bitdepth_func)(
 typedef struct {
     VSNode *node;
     VSVideoInfo vi;
-    bitdepth_func f;
-    bool direct;
+    bitdepth_func bitdepth;
+    int range;
 } BitDepthData;
 
-static void uint8_to_uint16(
+static void bitdepth_uint8_to_uint16(
     const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
     int src_w, int src_h, int src_bits, int dst_bits, bool range UNUSED, bool chroma UNUSED
 ) {
@@ -41,7 +41,7 @@ static void uint8_to_uint16(
     _mm_sfence();
 }
 
-static void uint8_to_float(
+static void bitdepth_uint8_to_float(
     const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
     int src_w, int src_h, int src_bits UNUSED, int dst_bits UNUSED, bool range, bool chroma
 ) {
@@ -69,7 +69,7 @@ static void uint8_to_float(
     _mm_sfence();
 }
 
-static void uint16_to_uint8(
+static void bitdepth_uint16_to_uint8(
     const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
     int src_w, int src_h, int src_bits, int dst_bits, bool range UNUSED, bool chroma UNUSED
 ) {
@@ -92,7 +92,7 @@ static void uint16_to_uint8(
     _mm_sfence();
 }
 
-static void uint16_to_uint16(
+static void bitdepth_uint16_to_uint16(
     const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
     int src_w, int src_h, int src_bits, int dst_bits, bool range UNUSED, bool chroma UNUSED
 ) {
@@ -127,7 +127,7 @@ static void uint16_to_uint16(
     _mm_sfence();
 }
 
-static void uint16_to_float(
+static void bitdepth_uint16_to_float(
     const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
     int src_w, int src_h, int src_bits, int dst_bits UNUSED, bool range, bool chroma
 ) {
@@ -155,7 +155,7 @@ static void uint16_to_float(
     _mm_sfence();
 }
 
-static void float_to_uint8(
+static void bitdepth_float_to_uint8(
     const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
     int src_w, int src_h, int src_bits UNUSED, int dst_bits UNUSED, bool range, bool chroma
 ) {
@@ -197,7 +197,7 @@ static void float_to_uint8(
     _mm_sfence();
 }
 
-static void float_to_uint16(
+static void bitdepth_float_to_uint16(
     const void *restrict ptrs, void *restrict ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
     int src_w, int src_h, int src_bits UNUSED, int dst_bits, bool range, bool chroma
 ) {
@@ -251,18 +251,20 @@ static const VSFrame *VS_CC BitDepthGetFrame(
     } else if (activationReason == arAllFramesReady) {
         const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
         const VSVideoFormat *fi = vsapi->getVideoFrameFormat(src);
-        VSFrame *dst = vsapi->newVideoFrame(&d->vi.format, d->vi.width, d->vi.height, src, core);
         
-        const VSMap *props = vsapi->getFramePropertiesRO(src);
-        
-        int err;
-        bool range = !vsapi->mapGetIntSaturated(props, "_Range", 0, &err);
-        if (d->direct) {
-            range = false;
-        } else if (err) {
-            range = !!vsapi->mapGetIntSaturated(props, "_ColorRange", 0, &err);
-            if (err) range = (fi->colorFamily != cfRGB);
+        bool range = !d->range;
+        if (d->range == -1) {
+            const VSMap *props = vsapi->getFramePropertiesRO(src);
+            int err;
+            range = !vsapi->mapGetIntSaturated(props, "_Range", 0, &err);
+            if (err && d->vi.format.sampleType != fi->sampleType) {
+                vsapi->setFilterError("BitDepth: the \"_Range\" frame property is missing, set \"range\" explicitly", frameCtx);
+                vsapi->freeFrame(src);
+                return NULL;
+            }
         }
+        
+        VSFrame *dst = vsapi->newVideoFrame(&d->vi.format, d->vi.width, d->vi.height, src, core);
         
         for (int plane = 0; plane < fi->numPlanes; plane++) {
             const void *restrict srcp = (const void *)vsapi->getReadPtr(src, plane);
@@ -274,7 +276,7 @@ static const VSFrame *VS_CC BitDepthGetFrame(
             int src_h = vsapi->getFrameHeight(src, plane);
             bool chroma = plane && (fi->colorFamily == cfYUV);
             
-            d->f(srcp, dstp, src_stride, dst_stride, src_w, src_h, fi->bitsPerSample, d->vi.format.bitsPerSample, range, chroma);
+            d->bitdepth(srcp, dstp, src_stride, dst_stride, src_w, src_h, fi->bitsPerSample, d->vi.format.bitsPerSample, range, chroma);
         }
         vsapi->freeFrame(src);
         return dst;
@@ -328,25 +330,25 @@ static void VS_CC BitDepthCreate(
     int bytes = (bits + 7) / 8;
     
     if ((d.vi.format.bytesPerSample == 1) && (bytes == 4)) {
-        d.f = uint8_to_float;
+        d.bitdepth = bitdepth_uint8_to_float;
     } else if ((d.vi.format.bytesPerSample == 2) && (bytes == 4)) {
-        d.f = uint16_to_float;
+        d.bitdepth = bitdepth_uint16_to_float;
     } else if ((d.vi.format.bytesPerSample == 4) && (bytes == 1)) {
-        d.f = float_to_uint8;
+        d.bitdepth = bitdepth_float_to_uint8;
     } else if ((d.vi.format.bytesPerSample == 4) && (bytes == 2)) {
-        d.f = float_to_uint16;
+        d.bitdepth = bitdepth_float_to_uint16;
     } else if ((d.vi.format.bytesPerSample == 1) && (bytes == 2)) {
-        d.f = uint8_to_uint16;
+        d.bitdepth = bitdepth_uint8_to_uint16;
     } else if ((d.vi.format.bytesPerSample == 2) && (bytes == 1)) {
-        d.f = uint16_to_uint8;
+        d.bitdepth = bitdepth_uint16_to_uint8;
     } else {
-        d.f = uint16_to_uint16;
+        d.bitdepth = bitdepth_uint16_to_uint16;
     }
     
     int err;
-    d.direct = !!vsapi->mapGetIntSaturated(in, "direct", 0, &err);
+    d.range = !!vsapi->mapGetIntSaturated(in, "range", 0, &err);
     if (err) {
-        d.direct = false;
+        d.range = -1;
     }
     
     d.vi.format.bitsPerSample = bits;
@@ -367,7 +369,7 @@ typedef void (*transfer_func)(
 typedef struct {
     VSNode *node;
     const VSVideoInfo *vi;
-    transfer_func f;
+    transfer_func transfer;
     bool process[3];
 } TransferData;
 
@@ -677,29 +679,29 @@ static const VSFrame *VS_CC LinearizeGetFrame(
     if (activationReason == arInitial) {
         vsapi->requestFrameFilter(n, d->node, frameCtx);
     } else if (activationReason == arAllFramesReady) {
-        transfer_func f = d->f;
+        transfer_func transfer = d->transfer;
         const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
         const VSVideoFormat *fi = vsapi->getVideoFrameFormat(src);
         
-        if (!f) {
+        if (!transfer) {
             const VSMap *props = vsapi->getFramePropertiesRO(src);
             int err;
-            int transfer = vsapi->mapGetIntSaturated(props, "_Transfer", 0, &err);
+            int trn = vsapi->mapGetIntSaturated(props, "_Transfer", 0, &err);
             if (err) {
-                vsapi->setFilterError("Linearize: frame property \"_Transfer\" missing, set \"gamma\" explicitly", frameCtx);
+                vsapi->setFilterError("Linearize: the \"_Transfer\" frame property is missing, set \"gamma\" explicitly", frameCtx);
                 vsapi->freeFrame(src);
                 return NULL;
             }
-            if (transfer == 1 || transfer == 6 || transfer == 14 || transfer == 15) {
-                f = transfer_rec709_to_linear;
-            } else if (transfer == 7) {
-                f = transfer_smpte240_to_linear;
-            } else if (transfer == 13) {
-                f = transfer_srgb_to_linear;
-            } else if (transfer == 16) {
-                f = transfer_smpte2084_to_linear;
+            if (trn == 1 || trn == 6 || trn == 14 || trn == 15) {
+                transfer = transfer_rec709_to_linear;
+            } else if (trn == 7) {
+                transfer = transfer_smpte240_to_linear;
+            } else if (trn == 13) {
+                transfer = transfer_srgb_to_linear;
+            } else if (trn == 16) {
+                transfer = transfer_smpte2084_to_linear;
             } else {
-                vsapi->setFilterError("Linearize: frame property \"_Transfer\" has an unsupported value, set \"gamma\" explicitly", frameCtx);
+                vsapi->setFilterError("Linearize: the \"_Transfer\" frame property has an unsupported value, set \"gamma\" explicitly", frameCtx);
                 vsapi->freeFrame(src);
                 return NULL;
             }
@@ -716,7 +718,7 @@ static const VSFrame *VS_CC LinearizeGetFrame(
             int src_h = vsapi->getFrameHeight(src, plane);
             
             if (d->process[plane]) {
-                f(srcp, dstp, src_stride, src_w, src_h);
+                transfer(srcp, dstp, src_stride, src_w, src_h);
             } else {
                 vector_plane_copy(srcp, dstp, sizeof(float) * src_stride * src_h);
             }
@@ -756,19 +758,19 @@ static void VS_CC LinearizeCreate(
     
     const char *gamma = vsapi->mapGetData(in, "gamma", 0, &err);
     if (err) {
-        d.f = NULL;
+        d.transfer = NULL;
     } else if (!strcmp(gamma, "srgb")) {
-        d.f = transfer_srgb_to_linear;
+        d.transfer = transfer_srgb_to_linear;
     } else if (!strcmp(gamma, "smpte170m")) {
-        d.f = transfer_rec709_to_linear;
+        d.transfer = transfer_rec709_to_linear;
     } else if (!strcmp(gamma, "adobe")) {
-        d.f = transfer_oprgb_to_linear;
+        d.transfer = transfer_oprgb_to_linear;
     } else if (!strcmp(gamma, "dcip3")) {
-        d.f = transfer_dcip3_to_linear;
+        d.transfer = transfer_dcip3_to_linear;
     } else if (!strcmp(gamma, "smpte240m")) {
-        d.f = transfer_smpte240_to_linear;
+        d.transfer = transfer_smpte240_to_linear;
     } else if (!strcmp(gamma, "smpte2084")) {
-        d.f = transfer_smpte2084_to_linear;
+        d.transfer = transfer_smpte2084_to_linear;
     } else {
         vsapi->mapSetError(out, "Linearize: invalid gamma specified");
         vsapi->freeNode(d.node);
@@ -1035,29 +1037,29 @@ static const VSFrame *VS_CC TransferGetFrame(
     if (activationReason == arInitial) {
         vsapi->requestFrameFilter(n, d->node, frameCtx);
     } else if (activationReason == arAllFramesReady) {
-        transfer_func f = d->f;
+        transfer_func transfer = d->transfer;
         const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
         const VSVideoFormat *fi = vsapi->getVideoFrameFormat(src);
         
-        if (!f) {
+        if (!transfer) {
             const VSMap *props = vsapi->getFramePropertiesRO(src);
             int err;
-            int transfer = vsapi->mapGetIntSaturated(props, "_Transfer", 0, &err);
+            int trn = vsapi->mapGetIntSaturated(props, "_Transfer", 0, &err);
             if (err) {
-                vsapi->setFilterError("Transfer: frame property \"_Transfer\" missing, set \"gamma\" explicitly", frameCtx);
+                vsapi->setFilterError("Transfer: the \"_Transfer\" frame property is missing, set \"gamma\" explicitly", frameCtx);
                 vsapi->freeFrame(src);
                 return NULL;
             }
-            if (transfer == 1 || transfer == 6 || transfer == 14 || transfer == 15) {
-                f = transfer_linear_to_rec709;
-            } else if (transfer == 7) {
-                f = transfer_linear_to_smpte240;
-            } else if (transfer == 13) {
-                f = transfer_linear_to_srgb;
-            } else if (transfer == 16) {
-                f = transfer_linear_to_smpte2084;
+            if (trn == 1 || trn == 6 || trn == 14 || trn == 15) {
+                transfer = transfer_linear_to_rec709;
+            } else if (trn == 7) {
+                transfer = transfer_linear_to_smpte240;
+            } else if (trn == 13) {
+                transfer = transfer_linear_to_srgb;
+            } else if (trn == 16) {
+                transfer = transfer_linear_to_smpte2084;
             } else {
-                vsapi->setFilterError("Transfer: frame property \"_Transfer\" has an unsupported value, set \"gamma\" explicitly", frameCtx);
+                vsapi->setFilterError("Transfer: the \"_Transfer\" frame property has an unsupported value, set \"gamma\" explicitly", frameCtx);
                 vsapi->freeFrame(src);
                 return NULL;
             }
@@ -1074,7 +1076,7 @@ static const VSFrame *VS_CC TransferGetFrame(
             int src_h = vsapi->getFrameHeight(src, plane);
             
             if (d->process[plane]) {
-                f(srcp, dstp, src_stride, src_w, src_h);
+                transfer(srcp, dstp, src_stride, src_w, src_h);
             } else {
                 vector_plane_copy(srcp, dstp, sizeof(float) * src_stride * src_h);
             }
@@ -1114,19 +1116,19 @@ static void VS_CC TransferCreate(
     
     const char *gamma = vsapi->mapGetData(in, "gamma", 0, &err);
     if (err) {
-        d.f = NULL;
+        d.transfer = NULL;
     } else if (!strcmp(gamma, "srgb")) {
-        d.f = transfer_linear_to_srgb;
+        d.transfer = transfer_linear_to_srgb;
     } else if (!strcmp(gamma, "smpte170m")) {
-        d.f = transfer_linear_to_rec709;
+        d.transfer = transfer_linear_to_rec709;
     } else if (!strcmp(gamma, "adobe")) {
-        d.f = transfer_linear_to_oprgb;
+        d.transfer = transfer_linear_to_oprgb;
     } else if (!strcmp(gamma, "dcip3")) {
-        d.f = transfer_linear_to_dcip3;
+        d.transfer = transfer_linear_to_dcip3;
     } else if (!strcmp(gamma, "smpte240m")) {
-        d.f = transfer_linear_to_smpte240;
+        d.transfer = transfer_linear_to_smpte240;
     } else if (!strcmp(gamma, "smpte2084")) {
-        d.f = transfer_linear_to_smpte2084;
+        d.transfer = transfer_linear_to_smpte2084;
     } else {
         vsapi->mapSetError(out, "Transfer: invalid gamma specified");
         vsapi->freeNode(d.node);
@@ -1150,7 +1152,7 @@ static void VS_CC TransferCreate(
 typedef double (*kernel_func)(double x, void *ctx);
 
 typedef struct {
-    kernel_func f;
+    kernel_func kernel;
     double radius;
     void *ctx;
 } kernel_t;
@@ -1161,7 +1163,7 @@ typedef struct {
     int *col_idx, *row_ptr;
 } csr_t;
 
-typedef csr_t (*csr_get_weights_func)(kernel_t kernel, int src_n, int dst_n, double start_n, double real_n);
+typedef csr_t (*csr_weights_func)(kernel_t kernel, int src_n, int dst_n, double start_n, double real_n);
 
 typedef struct {
     int col_n, row_n, ku;
@@ -1174,12 +1176,12 @@ typedef struct {
     int dst_width, dst_height;
     double start_w, start_h, real_w, real_h;
     kernel_t kernel_w, kernel_h;
-    transfer_func f0, f1;
+    transfer_func transfer_lo, transfer_hi;
     float sharp;
-    csr_get_weights_func csr_get_weights;
+    csr_weights_func csr_weights;
     bool linear, process_w, process_h;
     csr_t luma_w, luma_h;
-    bitdepth_func conv_up, conv_down;
+    bitdepth_func bitdepth_up, bitdepth_down;
 } ResizeData;
 
 typedef struct {
@@ -1686,7 +1688,7 @@ static int clamp_mirror(int x, int border) {
     return x;
 }
 
-static csr_t csr_get_weights_zero(kernel_t kernel, int src_n, int dst_n, double start_n, double real_n) {
+static csr_t csr_weights_zero(kernel_t kernel, int src_n, int dst_n, double start_n, double real_n) {
     double factor = dst_n / real_n;
     double scale = fmin(factor, 1.0);
     int min_n = (int)floor(start_n);
@@ -1708,7 +1710,7 @@ static csr_t csr_get_weights_zero(kernel_t kernel, int src_n, int dst_n, double 
         int max_idx = clamp_inf(high, 0, border);
         double norm = 0.0;
         for (int j = low; j <= high; j++) {
-            double temp_val = kernel.f((j - center) * scale, kernel.ctx);
+            double temp_val = kernel.kernel((j - center) * scale, kernel.ctx);
             norm += temp_val;
             if (j < 0 || j > border) temp_val = 0.0;
             int temp_idx = clamp_inf(j, 0, border);
@@ -1726,7 +1728,7 @@ static csr_t csr_get_weights_zero(kernel_t kernel, int src_n, int dst_n, double 
     return (csr_t){src_n, dst_n, weights, col_idx, row_ptr};
 }
 
-static csr_t csr_get_weights_inf(kernel_t kernel, int src_n, int dst_n, double start_n, double real_n) {
+static csr_t csr_weights_inf(kernel_t kernel, int src_n, int dst_n, double start_n, double real_n) {
     double factor = dst_n / real_n;
     double scale = fmin(factor, 1.0);
     int min_n = (int)floor(start_n);
@@ -1748,7 +1750,7 @@ static csr_t csr_get_weights_inf(kernel_t kernel, int src_n, int dst_n, double s
         int max_idx = clamp_inf(high, 0, border);
         double norm = 0.0;
         for (int j = low; j <= high; j++) {
-            double temp_val = kernel.f((j - center) * scale, kernel.ctx);
+            double temp_val = kernel.kernel((j - center) * scale, kernel.ctx);
             norm += temp_val;
             int temp_idx = clamp_inf(j, 0, border);
             int idx = nnz + (temp_idx - min_idx);
@@ -1765,7 +1767,7 @@ static csr_t csr_get_weights_inf(kernel_t kernel, int src_n, int dst_n, double s
     return (csr_t){src_n, dst_n, weights, col_idx, row_ptr};
 }
 
-static csr_t csr_get_weights_mirror(kernel_t kernel, int src_n, int dst_n, double start_n, double real_n) {
+static csr_t csr_weights_mirror(kernel_t kernel, int src_n, int dst_n, double start_n, double real_n) {
     double factor = dst_n / real_n;
     double scale = fmin(factor, 1.0);
     int min_n = (int)floor(start_n);
@@ -1792,7 +1794,7 @@ static csr_t csr_get_weights_mirror(kernel_t kernel, int src_n, int dst_n, doubl
         }
         double norm = 0.0;
         for (int j = low; j <= high; j++) {
-            double temp_val = kernel.f((j - center) * scale, kernel.ctx);
+            double temp_val = kernel.kernel((j - center) * scale, kernel.ctx);
             norm += temp_val;
             int temp_idx = clamp_mirror(j, border);
             int idx = nnz + (temp_idx - min_idx);
@@ -2010,8 +2012,8 @@ static const VSFrame *VS_CC ResizeGetFrame(
     if (activationReason == arInitial) {
         vsapi->requestFrameFilter(n, d->node, frameCtx);
     } else if (activationReason == arAllFramesReady) {
-        transfer_func f0 = d->f0;
-        transfer_func f1 = d->f1;
+        transfer_func transfer_lo = d->transfer_lo;
+        transfer_func transfer_hi = d->transfer_hi;
         const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
         const VSVideoFormat *fi = vsapi->getVideoFrameFormat(src);
         const VSMap *props = vsapi->getFramePropertiesRO(src);
@@ -2019,45 +2021,56 @@ static const VSFrame *VS_CC ResizeGetFrame(
         
         int err;
         int chromaloc = vsapi->mapGetIntSaturated(props, "_ChromaLocation", 0, &err);
-        if (err || chromaloc < 0 || chromaloc > 5) {
-            chromaloc = 0;
+        if (err && (fi->subSamplingW || fi->subSamplingH)) {
+            vsapi->setFilterError("Resize: the \"_ChromaLocation\" frame property is missing", frameCtx);
+            vsapi->freeFrame(src);
+            return NULL;
+        }
+        if (chromaloc < 0 || chromaloc > 5) {
+            vsapi->setFilterError("Resize: the \"_ChromaLocation\" frame property has an unsupported value", frameCtx);
+            vsapi->freeFrame(src);
+            return NULL;
         }
         
         bool range = !vsapi->mapGetIntSaturated(props, "_Range", 0, &err);
+        if (err && bit_convert && d->linear) {
+            vsapi->setFilterError("Resize: the \"_Range\" frame property is missing", frameCtx);
+            vsapi->freeFrame(src);
+            return NULL;
+        }
         if (bit_convert && !d->linear) {
             range = false;
-        } else if (err) {
-            range = !!vsapi->mapGetIntSaturated(props, "_ColorRange", 0, &err);
-            if (err) range = (fi->colorFamily != cfRGB);
         }
         
-        if (d->linear && (!f0 || !f1)) {
-            int transfer = vsapi->mapGetIntSaturated(props, "_Transfer", 0, &err);
+        if (d->linear && (!transfer_lo || !transfer_hi)) {
+            int trn = vsapi->mapGetIntSaturated(props, "_Transfer", 0, &err);
             if (err) {
-                vsapi->setFilterError("Resize: frame property \"_Transfer\" missing, set \"gamma\" explicitly", frameCtx);
+                vsapi->setFilterError("Resize: the \"_Transfer\" frame property is missing, set \"gamma\" explicitly", frameCtx);
                 vsapi->freeFrame(src);
                 return NULL;
             }
-            if (transfer == 1 || transfer == 6 || transfer == 14 || transfer == 15) {
-                f0 = transfer_rec709_to_linear;
-                f1 = transfer_linear_to_rec709;
-            } else if (transfer == 7) {
-                f0 = transfer_smpte240_to_linear;
-                f1 = transfer_linear_to_smpte240;
-            } else if (transfer == 13) {
-                f0 = transfer_srgb_to_linear;
-                f1 = transfer_linear_to_srgb;
-            } else if (transfer == 16) {
-                f0 = transfer_smpte2084_to_linear;
-                f1 = transfer_linear_to_smpte2084;
+            if (trn == 1 || trn == 6 || trn == 14 || trn == 15) {
+                transfer_lo = transfer_rec709_to_linear;
+                transfer_hi = transfer_linear_to_rec709;
+            } else if (trn == 7) {
+                transfer_lo = transfer_smpte240_to_linear;
+                transfer_hi = transfer_linear_to_smpte240;
+            } else if (trn == 13) {
+                transfer_lo = transfer_srgb_to_linear;
+                transfer_hi = transfer_linear_to_srgb;
+            } else if (trn == 16) {
+                transfer_lo = transfer_smpte2084_to_linear;
+                transfer_hi = transfer_linear_to_smpte2084;
             } else {
-                vsapi->setFilterError("Resize: frame property \"_Transfer\" has an unsupported value, set \"gamma\" explicitly", frameCtx);
+                vsapi->setFilterError("Resize: the \"_Transfer\" frame property has an unsupported value, set \"gamma\" explicitly", frameCtx);
                 vsapi->freeFrame(src);
                 return NULL;
             }
         }
         
-        csr_t chroma_w, chroma_h;
+        csr_t chroma_w = (csr_t){0, 0, NULL, NULL, NULL};
+        csr_t chroma_h = (csr_t){0, 0, NULL, NULL, NULL};
+        
         if (d->process_w && fi->subSamplingW) {
             int chroma_src_w = d->vi.width >> fi->subSamplingW;
             int chroma_dst_w = d->dst_width >> fi->subSamplingW;
@@ -2067,9 +2080,7 @@ static const VSFrame *VS_CC ResizeGetFrame(
                 double offset = ((1 << fi->subSamplingW) - 1) / 2.0;
                 start_w += offset / (1 << fi->subSamplingW) - offset * real_w / d->dst_width;
             }
-            chroma_w = d->csr_get_weights(d->kernel_w, chroma_src_w, chroma_dst_w, start_w, real_w);
-        } else {
-            chroma_w = (csr_t){0, 0, NULL, NULL, NULL};
+            chroma_w = d->csr_weights(d->kernel_w, chroma_src_w, chroma_dst_w, start_w, real_w);
         }
         
         if (d->process_h && fi->subSamplingH) {
@@ -2084,9 +2095,7 @@ static const VSFrame *VS_CC ResizeGetFrame(
                 double offset = ((1 << fi->subSamplingH) - 1) / 2.0;
                 start_h -= offset / (1 << fi->subSamplingH) - offset * real_h / d->dst_height;
             }
-            chroma_h = d->csr_get_weights(d->kernel_h, chroma_src_h, chroma_dst_h, start_h, real_h);
-        } else {
-            chroma_h = (csr_t){0, 0, NULL, NULL, NULL};
+            chroma_h = d->csr_weights(d->kernel_h, chroma_src_h, chroma_dst_h, start_h, real_h);
         }
         
         VSFrame *bcu = NULL;
@@ -2133,7 +2142,7 @@ static const VSFrame *VS_CC ResizeGetFrame(
             if (bit_convert) {
                 void *restrict bcup = (void *)vsapi->getWritePtr(bcu, plane);
                 ptrdiff_t bcu_stride = vsapi->getStride(bcu, plane) / sizeof(float);
-                d->conv_up(srcp, bcup, src_stride, bcu_stride, src_w, src_h, fi->bitsPerSample, 32, range, chroma);
+                d->bitdepth_up(srcp, bcup, src_stride, bcu_stride, src_w, src_h, fi->bitsPerSample, 32, range, chroma);
                 srcp = bcup;
                 src_stride = bcu_stride;
                 dstp = (void *)vsapi->getWritePtr(bcd, plane);
@@ -2142,7 +2151,7 @@ static const VSFrame *VS_CC ResizeGetFrame(
             
             if (d->linear && !chroma) {
                 void *restrict linp = (void *)vsapi->getWritePtr(lin, plane);
-                f0(srcp, linp, src_stride, src_w, src_h);
+                transfer_lo(srcp, linp, src_stride, src_w, src_h);
                 srcp = linp;
                 dstp = (void *)vsapi->getWritePtr(trf, plane);
             }
@@ -2168,7 +2177,7 @@ static const VSFrame *VS_CC ResizeGetFrame(
             if (d->linear && !chroma) {
                 void *restrict trfp = dstp;
                 dstp = bit_convert ? (void *)vsapi->getWritePtr(bcd, plane) : (void *)vsapi->getWritePtr(dst, plane);
-                f1(trfp, dstp, dst_stride, dst_w, dst_h);
+                transfer_hi(trfp, dstp, dst_stride, dst_w, dst_h);
             }
             
             if (bit_convert) {
@@ -2176,7 +2185,7 @@ static const VSFrame *VS_CC ResizeGetFrame(
                 dstp = (void *)vsapi->getWritePtr(dst, plane);
                 ptrdiff_t bcd_stride = dst_stride;
                 dst_stride = vsapi->getStride(dst, plane) / fi->bytesPerSample;
-                d->conv_down(bcdp, dstp, bcd_stride, dst_stride, dst_w, dst_h, 32, fi->bitsPerSample, range, chroma);
+                d->bitdepth_down(bcdp, dstp, bcd_stride, dst_stride, dst_w, dst_h, 32, fi->bitsPerSample, range, chroma);
             }
         }
         vsapi->freeFrame(shr);
@@ -2312,29 +2321,29 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData UNUSE
     
     const char *gamma = vsapi->mapGetData(in, "gamma", 0, &err);
     if (err) {
-        d.f0 = NULL;
-        d.f1 = NULL;
+        d.transfer_lo = NULL;
+        d.transfer_hi = NULL;
     } else if (!strcmp(gamma, "srgb")) {
-        d.f0 = transfer_srgb_to_linear;
-        d.f1 = transfer_linear_to_srgb;
+        d.transfer_lo = transfer_srgb_to_linear;
+        d.transfer_hi = transfer_linear_to_srgb;
     } else if (!strcmp(gamma, "smpte170m")) {
-        d.f0 = transfer_rec709_to_linear;
-        d.f1 = transfer_linear_to_rec709;
+        d.transfer_lo = transfer_rec709_to_linear;
+        d.transfer_hi = transfer_linear_to_rec709;
     } else if (!strcmp(gamma, "adobe")) {
-        d.f0 = transfer_oprgb_to_linear;
-        d.f1 = transfer_linear_to_oprgb;
+        d.transfer_lo = transfer_oprgb_to_linear;
+        d.transfer_hi = transfer_linear_to_oprgb;
     } else if (!strcmp(gamma, "dcip3")) {
-        d.f0 = transfer_dcip3_to_linear;
-        d.f1 = transfer_linear_to_dcip3;
+        d.transfer_lo = transfer_dcip3_to_linear;
+        d.transfer_hi = transfer_linear_to_dcip3;
     } else if (!strcmp(gamma, "smpte240m")) {
-        d.f0 = transfer_smpte240_to_linear;
-        d.f1 = transfer_linear_to_smpte240;
+        d.transfer_lo = transfer_smpte240_to_linear;
+        d.transfer_hi = transfer_linear_to_smpte240;
     } else if (!strcmp(gamma, "smpte2084")) {
-        d.f0 = transfer_smpte2084_to_linear;
-        d.f1 = transfer_linear_to_smpte2084;
+        d.transfer_lo = transfer_smpte2084_to_linear;
+        d.transfer_hi = transfer_linear_to_smpte2084;
     } else if (!strcmp(gamma, "none")) {
-        d.f0 = NULL;
-        d.f1 = NULL;
+        d.transfer_lo = NULL;
+        d.transfer_hi = NULL;
         d.linear = false;
     } else {
         vsapi->mapSetError(out, "Resize: invalid gamma specified");
@@ -2361,11 +2370,11 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData UNUSE
     
     const char *confine = vsapi->mapGetData(in, "confine", 0, &err);
     if (err || !strcmp(confine, "inf")) {
-        d.csr_get_weights = csr_get_weights_inf;
+        d.csr_weights = csr_weights_inf;
     } else if (!strcmp(confine, "zero")) {
-        d.csr_get_weights = csr_get_weights_zero;
+        d.csr_weights = csr_weights_zero;
     } else if (!strcmp(confine, "mirror")) {
-        d.csr_get_weights = csr_get_weights_mirror;
+        d.csr_weights = csr_weights_mirror;
     } else {
         vsapi->mapSetError(out, "Resize: invalid confine specified");
         vsapi->freeNode(d.node);
@@ -2526,26 +2535,26 @@ static void VS_CC ResizeCreate(const VSMap *in, VSMap *out, void *userData UNUSE
     d.process_h = (d.dst_height != d.vi.height || d.real_h != d.vi.height || d.start_h != 0.0);
     
     if (d.process_w) {
-        d.luma_w = d.csr_get_weights(d.kernel_w, d.vi.width, d.dst_width, d.start_w, d.real_w);
+        d.luma_w = d.csr_weights(d.kernel_w, d.vi.width, d.dst_width, d.start_w, d.real_w);
     } else {
         d.luma_w = (csr_t){0, 0, NULL, NULL, NULL};
     }
     
     if (d.process_h) {
-        d.luma_h = d.csr_get_weights(d.kernel_h, d.vi.height, d.dst_height, d.start_h, d.real_h);
+        d.luma_h = d.csr_weights(d.kernel_h, d.vi.height, d.dst_height, d.start_h, d.real_h);
     } else {
         d.luma_h = (csr_t){0, 0, NULL, NULL, NULL};
     }
     
     if (d.vi.format.bytesPerSample == 1) {
-        d.conv_up = uint8_to_float;
-        d.conv_down = float_to_uint8;
+        d.bitdepth_up = bitdepth_uint8_to_float;
+        d.bitdepth_down = bitdepth_float_to_uint8;
     } else if (d.vi.format.bytesPerSample == 2) {
-        d.conv_up = uint16_to_float;
-        d.conv_down = float_to_uint16;
+        d.bitdepth_up = bitdepth_uint16_to_float;
+        d.bitdepth_down = bitdepth_float_to_uint16;
     } else {
-        d.conv_up = NULL;
-        d.conv_down = NULL;
+        d.bitdepth_up = NULL;
+        d.bitdepth_down = NULL;
     }
     
     ResizeData *data = (ResizeData *)malloc(sizeof d);
@@ -2568,7 +2577,7 @@ typedef struct {
     int dst_width, dst_height;
     double start_w, start_h, real_w, real_h, reg;
     kernel_t kernel_w, kernel_h;
-    csr_get_weights_func csr_get_weights;
+    csr_weights_func csr_weights;
     bool process_w, process_h;
     csr_t luma_w, luma_h;
     banded_t luma_b_w, luma_b_h;
@@ -2930,8 +2939,11 @@ static const VSFrame *VS_CC DescaleGetFrame(
             chromaloc = 0;
         }
         
-        csr_t chroma_w, chroma_h;
-        banded_t chroma_b_w, chroma_b_h;
+        csr_t chroma_w = (csr_t){0, 0, NULL, NULL, NULL};
+        csr_t chroma_h = (csr_t){0, 0, NULL, NULL, NULL};
+        banded_t chroma_b_w = (banded_t){0, 0, 0, NULL};
+        banded_t chroma_b_h = (banded_t){0, 0, 0, NULL};
+        
         if (d->process_w && fi->subSamplingW) {
             int chroma_src_w = d->vi.width >> fi->subSamplingW;
             int chroma_dst_w = d->dst_width >> fi->subSamplingW;
@@ -2941,14 +2953,11 @@ static const VSFrame *VS_CC DescaleGetFrame(
                 double offset = ((1 << fi->subSamplingW) - 1) / 2.0;
                 start_w += offset / (1 << fi->subSamplingW) - offset * real_w / d->vi.width;
             }
-            csr_t temp = d->csr_get_weights(d->kernel_w, chroma_dst_w, chroma_src_w, start_w, real_w);
+            csr_t temp = d->csr_weights(d->kernel_w, chroma_dst_w, chroma_src_w, start_w, real_w);
             chroma_w = csr_transpose(temp);
             chroma_b_w = banded_gramian_from_csr(temp, d->reg);
             banded_cholesky_from_gramian(chroma_b_w);
             csr_free(temp);
-        } else {
-            chroma_w = (csr_t){0, 0, NULL, NULL, NULL};
-            chroma_b_w = (banded_t){0, 0, 0, NULL};
         }
         
         if (d->process_h && fi->subSamplingH) {
@@ -2963,14 +2972,11 @@ static const VSFrame *VS_CC DescaleGetFrame(
                 double offset = ((1 << fi->subSamplingH) - 1) / 2.0;
                 start_h -= offset / (1 << fi->subSamplingH) - offset * real_h / d->vi.height;
             }
-            csr_t temp = d->csr_get_weights(d->kernel_h, chroma_dst_h, chroma_src_h, start_h, real_h);
+            csr_t temp = d->csr_weights(d->kernel_h, chroma_dst_h, chroma_src_h, start_h, real_h);
             chroma_h = csr_transpose(temp);
             chroma_b_h = banded_gramian_from_csr(temp, d->reg);
             banded_cholesky_from_gramian(chroma_b_h);
             csr_free(temp);
-        } else {
-            chroma_h = (csr_t){0, 0, NULL, NULL, NULL};
-            chroma_b_h = (banded_t){0, 0, 0, NULL};
         }
         
         VSFrame *tmp = NULL;
@@ -3144,11 +3150,11 @@ static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData UNUS
     
     const char *confine = vsapi->mapGetData(in, "confine", 0, &err);
     if (err || !strcmp(confine, "inf")) {
-        d.csr_get_weights = csr_get_weights_inf;
+        d.csr_weights = csr_weights_inf;
     } else if (!strcmp(confine, "zero")) {
-        d.csr_get_weights = csr_get_weights_zero;
+        d.csr_weights = csr_weights_zero;
     } else if (!strcmp(confine, "mirror")) {
-        d.csr_get_weights = csr_get_weights_mirror;
+        d.csr_weights = csr_weights_mirror;
     } else {
         vsapi->mapSetError(out, "Descale: invalid confine specified");
         vsapi->freeNode(d.node);
@@ -3306,7 +3312,7 @@ static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData UNUS
     d.process_h = (d.dst_height != d.vi.height || d.real_h != d.dst_height || d.start_h != 0.0);
     
     if (d.process_w) {
-        csr_t temp = d.csr_get_weights(d.kernel_w, d.dst_width, d.vi.width, d.start_w, d.real_w);
+        csr_t temp = d.csr_weights(d.kernel_w, d.dst_width, d.vi.width, d.start_w, d.real_w);
         d.luma_w = csr_transpose(temp);
         d.luma_b_w = banded_gramian_from_csr(temp, d.reg);
         banded_cholesky_from_gramian(d.luma_b_w);
@@ -3317,7 +3323,7 @@ static void VS_CC DescaleCreate(const VSMap *in, VSMap *out, void *userData UNUS
     }
     
     if (d.process_h) {
-        csr_t temp = d.csr_get_weights(d.kernel_h, d.dst_height, d.vi.height, d.start_h, d.real_h);
+        csr_t temp = d.csr_weights(d.kernel_h, d.dst_height, d.vi.height, d.start_h, d.real_h);
         d.luma_h = csr_transpose(temp);
         d.luma_b_h = banded_gramian_from_csr(temp, d.reg);
         banded_cholesky_from_gramian(d.luma_b_h);
@@ -3344,7 +3350,7 @@ typedef struct {
 typedef frame_stats (*mean_func)(const void *restrict srcp, int src_w, int src_h, ptrdiff_t stride);
 
 typedef struct {
-    mean_func f;
+    mean_func mean;
     const char *name;
 } mean_t;
 
@@ -5618,7 +5624,7 @@ static const VSFrame *VS_CC MeanGetFrame(
         int src_w = vsapi->getFrameWidth(src, d->plane);
         int src_h = vsapi->getFrameHeight(src, d->plane);
         
-        frame_stats mean = d->mean.f(srcp, src_w, src_h, src_stride);
+        frame_stats mean = d->mean.mean(srcp, src_w, src_h, src_stride);
         if (d->norm && fi->sampleType == stInteger) {
             mean.frame_mean /= 255 << (fi->bitsPerSample - 8);
         }
@@ -5676,44 +5682,44 @@ static void VS_CC MeanCreate(
     
     const char *mode = vsapi->mapGetData(in, "mode", 0, &err);
     if (err || !strcmp(mode, "am")) {
-        if (vi->format.bytesPerSample == 1) d.mean.f = get_arithmetic_mean_8;
-        else if (vi->format.bytesPerSample == 2) d.mean.f = get_arithmetic_mean_16;
-        else d.mean.f = get_arithmetic_mean_32;
+        if (vi->format.bytesPerSample == 1) d.mean.mean = get_arithmetic_mean_8;
+        else if (vi->format.bytesPerSample == 2) d.mean.mean = get_arithmetic_mean_16;
+        else d.mean.mean = get_arithmetic_mean_32;
         d.mean.name = "arithmetic_mean";
     } else if (!strcmp(mode, "gm")) {
-        if (vi->format.bytesPerSample == 1) d.mean.f = get_geometric_mean_8;
-        else if (vi->format.bytesPerSample == 2) d.mean.f = get_geometric_mean_16;
-        else d.mean.f = get_geometric_mean_32;
+        if (vi->format.bytesPerSample == 1) d.mean.mean = get_geometric_mean_8;
+        else if (vi->format.bytesPerSample == 2) d.mean.mean = get_geometric_mean_16;
+        else d.mean.mean = get_geometric_mean_32;
         d.mean.name = "geometric_mean";
     } else if (!strcmp(mode, "agm")) {
-        if (vi->format.bytesPerSample == 1) d.mean.f = get_arithmetic_geometric_mean_8;
-        else if (vi->format.bytesPerSample == 2) d.mean.f = get_arithmetic_geometric_mean_16;
-        else d.mean.f = get_arithmetic_geometric_mean_32;
+        if (vi->format.bytesPerSample == 1) d.mean.mean = get_arithmetic_geometric_mean_8;
+        else if (vi->format.bytesPerSample == 2) d.mean.mean = get_arithmetic_geometric_mean_16;
+        else d.mean.mean = get_arithmetic_geometric_mean_32;
         d.mean.name = "arithmetic_geometric_mean";
     } else if (!strcmp(mode, "hm")) {
-        if (vi->format.bytesPerSample == 1) d.mean.f = get_harmonic_mean_8;
-        else if (vi->format.bytesPerSample == 2) d.mean.f = get_harmonic_mean_16;
-        else d.mean.f = get_harmonic_mean_32;
+        if (vi->format.bytesPerSample == 1) d.mean.mean = get_harmonic_mean_8;
+        else if (vi->format.bytesPerSample == 2) d.mean.mean = get_harmonic_mean_16;
+        else d.mean.mean = get_harmonic_mean_32;
         d.mean.name = "harmonic_mean";
     } else if (!strcmp(mode, "chm")) {
-        if (vi->format.bytesPerSample == 1) d.mean.f = get_contraharmonic_mean_8;
-        else if (vi->format.bytesPerSample == 2) d.mean.f = get_contraharmonic_mean_16;
-        else d.mean.f = get_contraharmonic_mean_32;
+        if (vi->format.bytesPerSample == 1) d.mean.mean = get_contraharmonic_mean_8;
+        else if (vi->format.bytesPerSample == 2) d.mean.mean = get_contraharmonic_mean_16;
+        else d.mean.mean = get_contraharmonic_mean_32;
         d.mean.name = "contraharmonic_mean";
     } else if (!strcmp(mode, "rms")) {
-        if (vi->format.bytesPerSample == 1) d.mean.f = get_root_mean_square_8;
-        else if (vi->format.bytesPerSample == 2) d.mean.f = get_root_mean_square_16;
-        else d.mean.f = get_root_mean_square_32;
+        if (vi->format.bytesPerSample == 1) d.mean.mean = get_root_mean_square_8;
+        else if (vi->format.bytesPerSample == 2) d.mean.mean = get_root_mean_square_16;
+        else d.mean.mean = get_root_mean_square_32;
         d.mean.name = "root_mean_square";
     } else if (!strcmp(mode, "rmc")) {
-        if (vi->format.bytesPerSample == 1) d.mean.f = get_root_mean_cube_8;
-        else if (vi->format.bytesPerSample == 2) d.mean.f = get_root_mean_cube_16;
-        else d.mean.f = get_root_mean_cube_32;
+        if (vi->format.bytesPerSample == 1) d.mean.mean = get_root_mean_cube_8;
+        else if (vi->format.bytesPerSample == 2) d.mean.mean = get_root_mean_cube_16;
+        else d.mean.mean = get_root_mean_cube_32;
         d.mean.name = "root_mean_cube";
     } else if (!strcmp(mode, "median")) {
-        if (vi->format.bytesPerSample == 1) d.mean.f = get_median_8;
-        else if (vi->format.bytesPerSample == 2) d.mean.f = get_median_16;
-        else d.mean.f = get_median_32;
+        if (vi->format.bytesPerSample == 1) d.mean.mean = get_median_8;
+        else if (vi->format.bytesPerSample == 2) d.mean.mean = get_median_16;
+        else d.mean.mean = get_median_32;
         d.mean.name = "median";
     } else if (!strcmp(mode, "limsad")) {
         if ((d.plane ? (vi->height >> vi->format.subSamplingH) : vi->height) < 3) {
@@ -5721,9 +5727,9 @@ static void VS_CC MeanCreate(
             vsapi->freeNode(d.node);
             return;
         }
-        if (vi->format.bytesPerSample == 1) d.mean.f = get_linear_interp_msad_8;
-        else if (vi->format.bytesPerSample == 2) d.mean.f = get_linear_interp_msad_16;
-        else d.mean.f = get_linear_interp_msad_32;
+        if (vi->format.bytesPerSample == 1) d.mean.mean = get_linear_interp_msad_8;
+        else if (vi->format.bytesPerSample == 2) d.mean.mean = get_linear_interp_msad_16;
+        else d.mean.mean = get_linear_interp_msad_32;
         d.mean.name = "linear_interp_msad";
     } else if (!strcmp(mode, "simsad")) {
         if ((d.plane ? (vi->height >> vi->format.subSamplingH) : vi->height) < 11) {
@@ -5731,9 +5737,9 @@ static void VS_CC MeanCreate(
             vsapi->freeNode(d.node);
             return;
         }
-        if (vi->format.bytesPerSample == 1) d.mean.f = get_stable_interp_msad_8;
-        else if (vi->format.bytesPerSample == 2) d.mean.f = get_stable_interp_msad_16;
-        else d.mean.f = get_stable_interp_msad_32;
+        if (vi->format.bytesPerSample == 1) d.mean.mean = get_stable_interp_msad_8;
+        else if (vi->format.bytesPerSample == 2) d.mean.mean = get_stable_interp_msad_16;
+        else d.mean.mean = get_stable_interp_msad_32;
         d.mean.name = "stable_interp_msad";
     } else if (!strcmp(mode, "tbmsad")) {
         if ((d.plane ? (vi->height >> vi->format.subSamplingH) : vi->height) & 1) {
@@ -5741,9 +5747,9 @@ static void VS_CC MeanCreate(
             vsapi->freeNode(d.node);
             return;
         }
-        if (vi->format.bytesPerSample == 1) d.mean.f = get_top_bottom_msad_8;
-        else if (vi->format.bytesPerSample == 2) d.mean.f = get_top_bottom_msad_16;
-        else d.mean.f = get_top_bottom_msad_32;
+        if (vi->format.bytesPerSample == 1) d.mean.mean = get_top_bottom_msad_8;
+        else if (vi->format.bytesPerSample == 2) d.mean.mean = get_top_bottom_msad_16;
+        else d.mean.mean = get_top_bottom_msad_32;
         d.mean.name = "top_bottom_msad";
     } else if (!strcmp(mode, "adtbm")) {
         if ((d.plane ? (vi->height >> vi->format.subSamplingH) : vi->height) & 1) {
@@ -5751,9 +5757,9 @@ static void VS_CC MeanCreate(
             vsapi->freeNode(d.node);
             return;
         }
-        if (vi->format.bytesPerSample == 1) d.mean.f = get_abs_diff_top_bottom_means_8;
-        else if (vi->format.bytesPerSample == 2) d.mean.f = get_abs_diff_top_bottom_means_16;
-        else d.mean.f = get_abs_diff_top_bottom_means_32;
+        if (vi->format.bytesPerSample == 1) d.mean.mean = get_abs_diff_top_bottom_means_8;
+        else if (vi->format.bytesPerSample == 2) d.mean.mean = get_abs_diff_top_bottom_means_16;
+        else d.mean.mean = get_abs_diff_top_bottom_means_32;
         d.mean.name = "abs_diff_top_bottom_means";
     } else {
         vsapi->mapSetError(out, "Mean: invalid mode specified");
@@ -9965,12 +9971,12 @@ static void VS_CC UnsharpMaskCreate(
 }
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
-    vspapi->configPlugin("com.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(20, 4), VAPOURSYNTH_API_VERSION, 0, plugin);
+    vspapi->configPlugin("com.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(20, 5), VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction(
         "BitDepth",
         "clip:vnode;"
         "bits:int;"
-        "direct:int:opt;",
+        "range:int:opt;",
         "clip:vnode;",
         BitDepthCreate,
         NULL,
