@@ -11,8 +11,9 @@ The library is written using AVX2 and FMA3 intrinsics, so processors older than 
 * [**Mean**](#mean)  
 * [**Metric**](#metric)  
 * [**FixBorder**](#fixborder)  
-* [**AverageFields**](#averagefields)
-* [**UnsharpMask**](#unsharpmask)
+* [**AverageFields**](#averagefields)  
+* [**UnsharpMask**](#unsharpmask)  
+* [**MedianBlur**](#medianblur)  
 
 ## BitDepth
 `artyfox.BitDepth(clip clip, int bits[, bool range="_Range" frame property])`
@@ -207,9 +208,17 @@ A port of `UnsharpMask` from `AviSynth` with a few additions. By default, it com
 * `mode`: Blur mode:
   * `box`: Box blur, used by default.
   * `stack`: Stack blur (triangular core).
-* `passes`: The number of blur passes. This allows to emulate a Gaussian kernel with the desired degree of approximation. `passes=2, mode='box'` corresponds to `passes=1, mode='stack'`, taking into account the difference in rounding. Valid range: 1 to 16. Default is 1.
+* `passes`: The number of blur passes. This allows to emulate a Gaussian kernel with the desired degree of approximation thanks to the central limit theorem. `passes=2, mode='box'` is equivalent to `passes=1, mode='stack'`, taking into account the difference in internal rounding. Valid range: 1 to 16. Default is 1.
 * `rounding`: Rounding mode. `False` - round down (floor), `True` - arithmetic rounding. Default is `False`.
 * `planes`: List of planes for the unsharp mask. Defaults to `all` for RGB and `0` for other color families.
+
+## MedianBlur
+`artyfox.MedianBlur(clip clip[, int radius=2, int[] planes=[0, 1, 2]])`
+
+Median blur with mathematically correct edge processing.
+* `clip`: The clip to which the median blur should be applied.
+* `radius`: Blur radius. Radii 1-3 are implemented as separate vector functions. The rest are done through universal scalar functions using Huang's algorithm (for 8 bits the histogram is built directly, for 16 bits the Fenwick tree is used, for 32 bits the Treap is used). Valid range: 1 to 127. Default is 2.
+* `planes`: List of planes to be median blurred. By default, all planes are processed.
 
 ## License
 This project is licensed under the MIT License - see the LICENSE file for details.

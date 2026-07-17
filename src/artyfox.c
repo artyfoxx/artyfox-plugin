@@ -8908,6 +8908,7 @@ static void get_box_blur_horizontal_32(
     _mm_free(buf0);
 }
 
+// Based on: https://quasimondo.com/2004/02/25/stackblur-2004/
 static void get_stack_blur_vertical_8(
     const void *restrict srcp, void *restrict dstp, int src_w, int src_h, ptrdiff_t stride, int radius, bool rounding
 ) {
@@ -9970,8 +9971,9808 @@ static void VS_CC UnsharpMaskCreate(
     vsapi->createVideoFilter(out, "UnsharpMask", d.vi, UnsharpMaskGetFrame, UnsharpMaskFree, fmParallel, deps, 1, data, core);
 }
 
+typedef void (*get_median_blur_func)(
+    const void *restrict srcp, void *restrict dstp, int src_w, int src_h, ptrdiff_t stride, int radius
+);
+
+typedef struct {
+    VSNode *node;
+    const VSVideoInfo *vi;
+    int radius;
+    bool process[3];
+    get_median_blur_func blur;
+} MedianBlurData;
+
+// Based on: https://bertdobbelaere.github.io/sorting_networks_extended.html
+#define _MM256_SORT6_EPU8(row0, row1, row2, row3, row4, row5) \
+do { \
+    __m256i temp = row0; row0 = _mm256_min_epu8(row0, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row3); row3 = _mm256_max_epu8(temp, row3); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row2); row2 = _mm256_max_epu8(temp, row2); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row3); row3 = _mm256_max_epu8(temp, row3); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row1); row1 = _mm256_max_epu8(temp, row1); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row3); row3 = _mm256_max_epu8(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row2); row2 = _mm256_max_epu8(temp, row2); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row4); row4 = _mm256_max_epu8(temp, row4); \
+} while (0)
+
+#define _MM256_SORT6_EPU16(row0, row1, row2, row3, row4, row5) \
+do { \
+    __m256i temp = row0; row0 = _mm256_min_epu16(row0, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row3); row3 = _mm256_max_epu16(temp, row3); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row2); row2 = _mm256_max_epu16(temp, row2); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row3); row3 = _mm256_max_epu16(temp, row3); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row1); row1 = _mm256_max_epu16(temp, row1); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row3); row3 = _mm256_max_epu16(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row2); row2 = _mm256_max_epu16(temp, row2); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row4); row4 = _mm256_max_epu16(temp, row4); \
+} while (0)
+
+#define _MM256_SORT6_PS(row0, row1, row2, row3, row4, row5) \
+do { \
+    __m256 temp = row0; row0 = _mm256_min_ps(row0, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row1; row1 = _mm256_min_ps(row1, row3); row3 = _mm256_max_ps(temp, row3); \
+    temp = row2; row2 = _mm256_min_ps(row2, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row1; row1 = _mm256_min_ps(row1, row2); row2 = _mm256_max_ps(temp, row2); \
+    temp = row3; row3 = _mm256_min_ps(row3, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row0; row0 = _mm256_min_ps(row0, row3); row3 = _mm256_max_ps(temp, row3); \
+    temp = row2; row2 = _mm256_min_ps(row2, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row0; row0 = _mm256_min_ps(row0, row1); row1 = _mm256_max_ps(temp, row1); \
+    temp = row2; row2 = _mm256_min_ps(row2, row3); row3 = _mm256_max_ps(temp, row3); \
+    temp = row4; row4 = _mm256_min_ps(row4, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row1; row1 = _mm256_min_ps(row1, row2); row2 = _mm256_max_ps(temp, row2); \
+    temp = row3; row3 = _mm256_min_ps(row3, row4); row4 = _mm256_max_ps(temp, row4); \
+} while (0)
+
+#define _MM256_SORT9_EPU8(row0, row1, row2, row3, row4, row5, row6, row7, row8) \
+do { \
+    __m256i temp = row0; row0 = _mm256_min_epu8(row0, row3); row3 = _mm256_max_epu8(temp, row3); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row2); row2 = _mm256_max_epu8(temp, row2); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row3); row3 = _mm256_max_epu8(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row1); row1 = _mm256_max_epu8(temp, row1); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row3); row3 = _mm256_max_epu8(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row2); row2 = _mm256_max_epu8(temp, row2); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row6); row6 = _mm256_max_epu8(temp, row6); \
+} while (0)
+
+#define _MM256_SORT9_EPU16(row0, row1, row2, row3, row4, row5, row6, row7, row8) \
+do { \
+    __m256i temp = row0; row0 = _mm256_min_epu16(row0, row3); row3 = _mm256_max_epu16(temp, row3); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row2); row2 = _mm256_max_epu16(temp, row2); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row3); row3 = _mm256_max_epu16(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row1); row1 = _mm256_max_epu16(temp, row1); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row3); row3 = _mm256_max_epu16(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row2); row2 = _mm256_max_epu16(temp, row2); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row6); row6 = _mm256_max_epu16(temp, row6); \
+} while (0)
+
+#define _MM256_SORT9_PS(row0, row1, row2, row3, row4, row5, row6, row7, row8) \
+do { \
+    __m256 temp = row0; row0 = _mm256_min_ps(row0, row3); row3 = _mm256_max_ps(temp, row3); \
+    temp = row1; row1 = _mm256_min_ps(row1, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row2; row2 = _mm256_min_ps(row2, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row4; row4 = _mm256_min_ps(row4, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row0; row0 = _mm256_min_ps(row0, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row2; row2 = _mm256_min_ps(row2, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row3; row3 = _mm256_min_ps(row3, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row5; row5 = _mm256_min_ps(row5, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row0; row0 = _mm256_min_ps(row0, row2); row2 = _mm256_max_ps(temp, row2); \
+    temp = row1; row1 = _mm256_min_ps(row1, row3); row3 = _mm256_max_ps(temp, row3); \
+    temp = row4; row4 = _mm256_min_ps(row4, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row7; row7 = _mm256_min_ps(row7, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row1; row1 = _mm256_min_ps(row1, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row3; row3 = _mm256_min_ps(row3, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row5; row5 = _mm256_min_ps(row5, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row0; row0 = _mm256_min_ps(row0, row1); row1 = _mm256_max_ps(temp, row1); \
+    temp = row2; row2 = _mm256_min_ps(row2, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row3; row3 = _mm256_min_ps(row3, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row6; row6 = _mm256_min_ps(row6, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row2; row2 = _mm256_min_ps(row2, row3); row3 = _mm256_max_ps(temp, row3); \
+    temp = row4; row4 = _mm256_min_ps(row4, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row6; row6 = _mm256_min_ps(row6, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row1; row1 = _mm256_min_ps(row1, row2); row2 = _mm256_max_ps(temp, row2); \
+    temp = row3; row3 = _mm256_min_ps(row3, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row5; row5 = _mm256_min_ps(row5, row6); row6 = _mm256_max_ps(temp, row6); \
+} while (0)
+
+#define _MM256_SORT15_EPU8( \
+    row0, row1, row2, row3, row4, row5, row6, row7, row8, row9, row10, row11, row12, row13, row14 \
+) do { \
+    __m256i temp = row1; row1 = _mm256_min_epu8(row1, row2); row2 = _mm256_max_epu8(temp, row2); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row3); row3 = _mm256_max_epu8(temp, row3); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row2); row2 = _mm256_max_epu8(temp, row2); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row1); row1 = _mm256_max_epu8(temp, row1); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row3); row3 = _mm256_max_epu8(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row2); row2 = _mm256_max_epu8(temp, row2); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row3); row3 = _mm256_max_epu8(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row8); row8 = _mm256_max_epu8(temp, row8); \
+} while (0)
+
+#define _MM256_SORT15_EPU16( \
+    row0, row1, row2, row3, row4, row5, row6, row7, row8, row9, row10, row11, row12, row13, row14 \
+) do { \
+    __m256i temp = row1; row1 = _mm256_min_epu16(row1, row2); row2 = _mm256_max_epu16(temp, row2); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row3); row3 = _mm256_max_epu16(temp, row3); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row2); row2 = _mm256_max_epu16(temp, row2); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row1); row1 = _mm256_max_epu16(temp, row1); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row3); row3 = _mm256_max_epu16(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row2); row2 = _mm256_max_epu16(temp, row2); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row3); row3 = _mm256_max_epu16(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row8); row8 = _mm256_max_epu16(temp, row8); \
+} while (0)
+
+#define _MM256_SORT15_PS( \
+    row0, row1, row2, row3, row4, row5, row6, row7, row8, row9, row10, row11, row12, row13, row14 \
+) do { \
+    __m256 temp = row1; row1 = _mm256_min_ps(row1, row2); row2 = _mm256_max_ps(temp, row2); \
+    temp = row3; row3 = _mm256_min_ps(row3, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row4; row4 = _mm256_min_ps(row4, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row5; row5 = _mm256_min_ps(row5, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row6; row6 = _mm256_min_ps(row6, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row7; row7 = _mm256_min_ps(row7, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row9; row9 = _mm256_min_ps(row9, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row0; row0 = _mm256_min_ps(row0, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row1; row1 = _mm256_min_ps(row1, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row2; row2 = _mm256_min_ps(row2, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row3; row3 = _mm256_min_ps(row3, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row6; row6 = _mm256_min_ps(row6, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row10; row10 = _mm256_min_ps(row10, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row11; row11 = _mm256_min_ps(row11, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row0; row0 = _mm256_min_ps(row0, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row1; row1 = _mm256_min_ps(row1, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row2; row2 = _mm256_min_ps(row2, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row4; row4 = _mm256_min_ps(row4, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row5; row5 = _mm256_min_ps(row5, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row8; row8 = _mm256_min_ps(row8, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row12; row12 = _mm256_min_ps(row12, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row0; row0 = _mm256_min_ps(row0, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row2; row2 = _mm256_min_ps(row2, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row3; row3 = _mm256_min_ps(row3, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row7; row7 = _mm256_min_ps(row7, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row8; row8 = _mm256_min_ps(row8, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row9; row9 = _mm256_min_ps(row9, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row13; row13 = _mm256_min_ps(row13, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row0; row0 = _mm256_min_ps(row0, row3); row3 = _mm256_max_ps(temp, row3); \
+    temp = row1; row1 = _mm256_min_ps(row1, row2); row2 = _mm256_max_ps(temp, row2); \
+    temp = row4; row4 = _mm256_min_ps(row4, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row5; row5 = _mm256_min_ps(row5, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row6; row6 = _mm256_min_ps(row6, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row10; row10 = _mm256_min_ps(row10, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row12; row12 = _mm256_min_ps(row12, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row0; row0 = _mm256_min_ps(row0, row1); row1 = _mm256_max_ps(temp, row1); \
+    temp = row2; row2 = _mm256_min_ps(row2, row3); row3 = _mm256_max_ps(temp, row3); \
+    temp = row4; row4 = _mm256_min_ps(row4, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row7; row7 = _mm256_min_ps(row7, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row10; row10 = _mm256_min_ps(row10, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row11; row11 = _mm256_min_ps(row11, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row1; row1 = _mm256_min_ps(row1, row2); row2 = _mm256_max_ps(temp, row2); \
+    temp = row3; row3 = _mm256_min_ps(row3, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row8; row8 = _mm256_min_ps(row8, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row11; row11 = _mm256_min_ps(row11, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row3; row3 = _mm256_min_ps(row3, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row5; row5 = _mm256_min_ps(row5, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row7; row7 = _mm256_min_ps(row7, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row9; row9 = _mm256_min_ps(row9, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row2; row2 = _mm256_min_ps(row2, row3); row3 = _mm256_max_ps(temp, row3); \
+    temp = row4; row4 = _mm256_min_ps(row4, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row6; row6 = _mm256_min_ps(row6, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row8; row8 = _mm256_min_ps(row8, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row10; row10 = _mm256_min_ps(row10, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row5; row5 = _mm256_min_ps(row5, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row7; row7 = _mm256_min_ps(row7, row8); row8 = _mm256_max_ps(temp, row8); \
+} while (0)
+
+#define _MM256_SORT20_EPU8( \
+    row0, row1, row2, row3, row4, row5, row6, row7, row8, row9, \
+    row10, row11, row12, row13, row14, row15, row16, row17, row18, row19 \
+) do { \
+    __m256i temp = row0; row0 = _mm256_min_epu8(row0, row3); row3 = _mm256_max_epu8(temp, row3); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row2); row2 = _mm256_max_epu8(temp, row2); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row1); row1 = _mm256_max_epu8(temp, row1); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row3); row3 = _mm256_max_epu8(temp, row3); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row2); row2 = _mm256_max_epu8(temp, row2); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row3); row3 = _mm256_max_epu8(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row16); row16 = _mm256_max_epu8(temp, row16); \
+} while (0)
+
+#define _MM256_SORT20_EPU16( \
+    row0, row1, row2, row3, row4, row5, row6, row7, row8, row9, \
+    row10, row11, row12, row13, row14, row15, row16, row17, row18, row19 \
+) do { \
+    __m256i temp = row0; row0 = _mm256_min_epu16(row0, row3); row3 = _mm256_max_epu16(temp, row3); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row2); row2 = _mm256_max_epu16(temp, row2); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row1); row1 = _mm256_max_epu16(temp, row1); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row3); row3 = _mm256_max_epu16(temp, row3); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row2); row2 = _mm256_max_epu16(temp, row2); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row3); row3 = _mm256_max_epu16(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row16); row16 = _mm256_max_epu16(temp, row16); \
+} while (0)
+
+#define _MM256_SORT20_PS( \
+    row0, row1, row2, row3, row4, row5, row6, row7, row8, row9, \
+    row10, row11, row12, row13, row14, row15, row16, row17, row18, row19 \
+) do { \
+    __m256 temp = row0; row0 = _mm256_min_ps(row0, row3); row3 = _mm256_max_ps(temp, row3); \
+    temp = row1; row1 = _mm256_min_ps(row1, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row2; row2 = _mm256_min_ps(row2, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row4; row4 = _mm256_min_ps(row4, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row6; row6 = _mm256_min_ps(row6, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row10; row10 = _mm256_min_ps(row10, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row11; row11 = _mm256_min_ps(row11, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row12; row12 = _mm256_min_ps(row12, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row14; row14 = _mm256_min_ps(row14, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row16; row16 = _mm256_min_ps(row16, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row0; row0 = _mm256_min_ps(row0, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row1; row1 = _mm256_min_ps(row1, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row2; row2 = _mm256_min_ps(row2, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row3; row3 = _mm256_min_ps(row3, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row4; row4 = _mm256_min_ps(row4, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row5; row5 = _mm256_min_ps(row5, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row6; row6 = _mm256_min_ps(row6, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row7; row7 = _mm256_min_ps(row7, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row8; row8 = _mm256_min_ps(row8, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row9; row9 = _mm256_min_ps(row9, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row0; row0 = _mm256_min_ps(row0, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row1; row1 = _mm256_min_ps(row1, row2); row2 = _mm256_max_ps(temp, row2); \
+    temp = row3; row3 = _mm256_min_ps(row3, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row5; row5 = _mm256_min_ps(row5, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row11; row11 = _mm256_min_ps(row11, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row12; row12 = _mm256_min_ps(row12, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row15; row15 = _mm256_min_ps(row15, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row17; row17 = _mm256_min_ps(row17, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row1; row1 = _mm256_min_ps(row1, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row2; row2 = _mm256_min_ps(row2, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row3; row3 = _mm256_min_ps(row3, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row4; row4 = _mm256_min_ps(row4, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row7; row7 = _mm256_min_ps(row7, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row8; row8 = _mm256_min_ps(row8, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row13; row13 = _mm256_min_ps(row13, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row14; row14 = _mm256_min_ps(row14, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row0; row0 = _mm256_min_ps(row0, row1); row1 = _mm256_max_ps(temp, row1); \
+    temp = row2; row2 = _mm256_min_ps(row2, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row7; row7 = _mm256_min_ps(row7, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row9; row9 = _mm256_min_ps(row9, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row13; row13 = _mm256_min_ps(row13, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row18; row18 = _mm256_min_ps(row18, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row1; row1 = _mm256_min_ps(row1, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row5; row5 = _mm256_min_ps(row5, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row7; row7 = _mm256_min_ps(row7, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row8; row8 = _mm256_min_ps(row8, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row10; row10 = _mm256_min_ps(row10, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row13; row13 = _mm256_min_ps(row13, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row3; row3 = _mm256_min_ps(row3, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row4; row4 = _mm256_min_ps(row4, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row8; row8 = _mm256_min_ps(row8, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row9; row9 = _mm256_min_ps(row9, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row12; row12 = _mm256_min_ps(row12, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row14; row14 = _mm256_min_ps(row14, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row1; row1 = _mm256_min_ps(row1, row3); row3 = _mm256_max_ps(temp, row3); \
+    temp = row2; row2 = _mm256_min_ps(row2, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row5; row5 = _mm256_min_ps(row5, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row6; row6 = _mm256_min_ps(row6, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row9; row9 = _mm256_min_ps(row9, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row12; row12 = _mm256_min_ps(row12, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row15; row15 = _mm256_min_ps(row15, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row16; row16 = _mm256_min_ps(row16, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row1; row1 = _mm256_min_ps(row1, row2); row2 = _mm256_max_ps(temp, row2); \
+    temp = row3; row3 = _mm256_min_ps(row3, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row6; row6 = _mm256_min_ps(row6, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row8; row8 = _mm256_min_ps(row8, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row10; row10 = _mm256_min_ps(row10, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row12; row12 = _mm256_min_ps(row12, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row15; row15 = _mm256_min_ps(row15, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row17; row17 = _mm256_min_ps(row17, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row2; row2 = _mm256_min_ps(row2, row3); row3 = _mm256_max_ps(temp, row3); \
+    temp = row4; row4 = _mm256_min_ps(row4, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row5; row5 = _mm256_min_ps(row5, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row7; row7 = _mm256_min_ps(row7, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row10; row10 = _mm256_min_ps(row10, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row11; row11 = _mm256_min_ps(row11, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row13; row13 = _mm256_min_ps(row13, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row16; row16 = _mm256_min_ps(row16, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row4; row4 = _mm256_min_ps(row4, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row6; row6 = _mm256_min_ps(row6, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row7; row7 = _mm256_min_ps(row7, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row9; row9 = _mm256_min_ps(row9, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row11; row11 = _mm256_min_ps(row11, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row14; row14 = _mm256_min_ps(row14, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row3; row3 = _mm256_min_ps(row3, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row5; row5 = _mm256_min_ps(row5, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row7; row7 = _mm256_min_ps(row7, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row9; row9 = _mm256_min_ps(row9, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row11; row11 = _mm256_min_ps(row11, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row13; row13 = _mm256_min_ps(row13, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row15; row15 = _mm256_min_ps(row15, row16); row16 = _mm256_max_ps(temp, row16); \
+} while (0)
+
+#define _MM256_SORT25_EPU8( \
+    row0, row1, row2, row3, row4, row5, row6, row7, row8, row9, \
+    row10, row11, row12, row13, row14, row15, row16, row17, row18, row19, \
+    row20, row21, row22, row23, row24 \
+) do { \
+    __m256i temp = row0; row0 = _mm256_min_epu8(row0, row1); row1 = _mm256_max_epu8(temp, row1); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row3); row3 = _mm256_max_epu8(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row22; row22 = _mm256_min_epu8(row22, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row2); row2 = _mm256_max_epu8(temp, row2); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row3); row3 = _mm256_max_epu8(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row23; row23 = _mm256_min_epu8(row23, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row22; row22 = _mm256_min_epu8(row22, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row1); row1 = _mm256_max_epu8(temp, row1); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row2); row2 = _mm256_max_epu8(temp, row2); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row22; row22 = _mm256_min_epu8(row22, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row3); row3 = _mm256_max_epu8(temp, row3); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row3); row3 = _mm256_max_epu8(temp, row3); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row21); row21 = _mm256_max_epu8(temp, row21); \
+} while (0)
+
+#define _MM256_SORT25_EPU16( \
+    row0, row1, row2, row3, row4, row5, row6, row7, row8, row9, \
+    row10, row11, row12, row13, row14, row15, row16, row17, row18, row19, \
+    row20, row21, row22, row23, row24 \
+) do { \
+    __m256i temp = row0; row0 = _mm256_min_epu16(row0, row1); row1 = _mm256_max_epu16(temp, row1); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row3); row3 = _mm256_max_epu16(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row22; row22 = _mm256_min_epu16(row22, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row2); row2 = _mm256_max_epu16(temp, row2); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row3); row3 = _mm256_max_epu16(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row23; row23 = _mm256_min_epu16(row23, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row22; row22 = _mm256_min_epu16(row22, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row1); row1 = _mm256_max_epu16(temp, row1); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row2); row2 = _mm256_max_epu16(temp, row2); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row22; row22 = _mm256_min_epu16(row22, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row3); row3 = _mm256_max_epu16(temp, row3); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row3); row3 = _mm256_max_epu16(temp, row3); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row21); row21 = _mm256_max_epu16(temp, row21); \
+} while (0)
+
+#define _MM256_SORT25_PS( \
+    row0, row1, row2, row3, row4, row5, row6, row7, row8, row9, \
+    row10, row11, row12, row13, row14, row15, row16, row17, row18, row19, \
+    row20, row21, row22, row23, row24 \
+) do { \
+    __m256 temp = row0; row0 = _mm256_min_ps(row0, row1); row1 = _mm256_max_ps(temp, row1); \
+    temp = row2; row2 = _mm256_min_ps(row2, row3); row3 = _mm256_max_ps(temp, row3); \
+    temp = row4; row4 = _mm256_min_ps(row4, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row6; row6 = _mm256_min_ps(row6, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row8; row8 = _mm256_min_ps(row8, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row10; row10 = _mm256_min_ps(row10, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row12; row12 = _mm256_min_ps(row12, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row14; row14 = _mm256_min_ps(row14, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row16; row16 = _mm256_min_ps(row16, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row18; row18 = _mm256_min_ps(row18, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row20; row20 = _mm256_min_ps(row20, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row22; row22 = _mm256_min_ps(row22, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row0; row0 = _mm256_min_ps(row0, row2); row2 = _mm256_max_ps(temp, row2); \
+    temp = row1; row1 = _mm256_min_ps(row1, row3); row3 = _mm256_max_ps(temp, row3); \
+    temp = row4; row4 = _mm256_min_ps(row4, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row5; row5 = _mm256_min_ps(row5, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row8; row8 = _mm256_min_ps(row8, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row9; row9 = _mm256_min_ps(row9, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row12; row12 = _mm256_min_ps(row12, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row13; row13 = _mm256_min_ps(row13, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row16; row16 = _mm256_min_ps(row16, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row17; row17 = _mm256_min_ps(row17, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row21; row21 = _mm256_min_ps(row21, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row23; row23 = _mm256_min_ps(row23, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row0; row0 = _mm256_min_ps(row0, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row1; row1 = _mm256_min_ps(row1, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row2; row2 = _mm256_min_ps(row2, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row3; row3 = _mm256_min_ps(row3, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row8; row8 = _mm256_min_ps(row8, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row9; row9 = _mm256_min_ps(row9, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row10; row10 = _mm256_min_ps(row10, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row11; row11 = _mm256_min_ps(row11, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row18; row18 = _mm256_min_ps(row18, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row20; row20 = _mm256_min_ps(row20, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row22; row22 = _mm256_min_ps(row22, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row0; row0 = _mm256_min_ps(row0, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row1; row1 = _mm256_min_ps(row1, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row2; row2 = _mm256_min_ps(row2, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row3; row3 = _mm256_min_ps(row3, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row4; row4 = _mm256_min_ps(row4, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row5; row5 = _mm256_min_ps(row5, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row6; row6 = _mm256_min_ps(row6, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row7; row7 = _mm256_min_ps(row7, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row16; row16 = _mm256_min_ps(row16, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row17; row17 = _mm256_min_ps(row17, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row19; row19 = _mm256_min_ps(row19, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row21; row21 = _mm256_min_ps(row21, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row1; row1 = _mm256_min_ps(row1, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row3; row3 = _mm256_min_ps(row3, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row5; row5 = _mm256_min_ps(row5, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row6; row6 = _mm256_min_ps(row6, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row11; row11 = _mm256_min_ps(row11, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row15; row15 = _mm256_min_ps(row15, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row1; row1 = _mm256_min_ps(row1, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row3; row3 = _mm256_min_ps(row3, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row6; row6 = _mm256_min_ps(row6, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row7; row7 = _mm256_min_ps(row7, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row13; row13 = _mm256_min_ps(row13, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row14; row14 = _mm256_min_ps(row14, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row0; row0 = _mm256_min_ps(row0, row1); row1 = _mm256_max_ps(temp, row1); \
+    temp = row2; row2 = _mm256_min_ps(row2, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row3; row3 = _mm256_min_ps(row3, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row7; row7 = _mm256_min_ps(row7, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row10; row10 = _mm256_min_ps(row10, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row11; row11 = _mm256_min_ps(row11, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row15; row15 = _mm256_min_ps(row15, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row1; row1 = _mm256_min_ps(row1, row2); row2 = _mm256_max_ps(temp, row2); \
+    temp = row5; row5 = _mm256_min_ps(row5, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row7; row7 = _mm256_min_ps(row7, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row11; row11 = _mm256_min_ps(row11, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row15; row15 = _mm256_min_ps(row15, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row19; row19 = _mm256_min_ps(row19, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row4; row4 = _mm256_min_ps(row4, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row5; row5 = _mm256_min_ps(row5, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row9; row9 = _mm256_min_ps(row9, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row10; row10 = _mm256_min_ps(row10, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row11; row11 = _mm256_min_ps(row11, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row13; row13 = _mm256_min_ps(row13, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row14; row14 = _mm256_min_ps(row14, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row19; row19 = _mm256_min_ps(row19, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row22; row22 = _mm256_min_ps(row22, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row3; row3 = _mm256_min_ps(row3, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row7; row7 = _mm256_min_ps(row7, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row9; row9 = _mm256_min_ps(row9, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row11; row11 = _mm256_min_ps(row11, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row12; row12 = _mm256_min_ps(row12, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row13; row13 = _mm256_min_ps(row13, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row19; row19 = _mm256_min_ps(row19, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row20; row20 = _mm256_min_ps(row20, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row1; row1 = _mm256_min_ps(row1, row3); row3 = _mm256_max_ps(temp, row3); \
+    temp = row2; row2 = _mm256_min_ps(row2, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row5; row5 = _mm256_min_ps(row5, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row6; row6 = _mm256_min_ps(row6, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row7; row7 = _mm256_min_ps(row7, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row8; row8 = _mm256_min_ps(row8, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row12; row12 = _mm256_min_ps(row12, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row14; row14 = _mm256_min_ps(row14, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row15; row15 = _mm256_min_ps(row15, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row2; row2 = _mm256_min_ps(row2, row3); row3 = _mm256_max_ps(temp, row3); \
+    temp = row5; row5 = _mm256_min_ps(row5, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row6; row6 = _mm256_min_ps(row6, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row8; row8 = _mm256_min_ps(row8, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row10; row10 = _mm256_min_ps(row10, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row12; row12 = _mm256_min_ps(row12, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row15; row15 = _mm256_min_ps(row15, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row3; row3 = _mm256_min_ps(row3, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row4; row4 = _mm256_min_ps(row4, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row7; row7 = _mm256_min_ps(row7, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row9; row9 = _mm256_min_ps(row9, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row10; row10 = _mm256_min_ps(row10, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row13; row13 = _mm256_min_ps(row13, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row15; row15 = _mm256_min_ps(row15, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row17; row17 = _mm256_min_ps(row17, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row4; row4 = _mm256_min_ps(row4, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row6; row6 = _mm256_min_ps(row6, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row9; row9 = _mm256_min_ps(row9, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row11; row11 = _mm256_min_ps(row11, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row13; row13 = _mm256_min_ps(row13, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row14; row14 = _mm256_min_ps(row14, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row17; row17 = _mm256_min_ps(row17, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row18; row18 = _mm256_min_ps(row18, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row4; row4 = _mm256_min_ps(row4, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row6; row6 = _mm256_min_ps(row6, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row8; row8 = _mm256_min_ps(row8, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row10; row10 = _mm256_min_ps(row10, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row12; row12 = _mm256_min_ps(row12, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row14; row14 = _mm256_min_ps(row14, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row16; row16 = _mm256_min_ps(row16, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row18; row18 = _mm256_min_ps(row18, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row20; row20 = _mm256_min_ps(row20, row21); row21 = _mm256_max_ps(temp, row21); \
+} while (0)
+
+#define _MM256_SORT28_EPU8( \
+    row0, row1, row2, row3, row4, row5, row6, row7, row8, row9, \
+    row10, row11, row12, row13, row14, row15, row16, row17, row18, row19, \
+    row20, row21, row22, row23, row24, row25, row26, row27 \
+) do { \
+    __m256i temp = row0; row0 = _mm256_min_epu8(row0, row1); row1 = _mm256_max_epu8(temp, row1); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row3); row3 = _mm256_max_epu8(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row22; row22 = _mm256_min_epu8(row22, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row24; row24 = _mm256_min_epu8(row24, row25); row25 = _mm256_max_epu8(temp, row25); \
+    temp = row26; row26 = _mm256_min_epu8(row26, row27); row27 = _mm256_max_epu8(temp, row27); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row2); row2 = _mm256_max_epu8(temp, row2); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row3); row3 = _mm256_max_epu8(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row24; row24 = _mm256_min_epu8(row24, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row25; row25 = _mm256_min_epu8(row25, row27); row27 = _mm256_max_epu8(temp, row27); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row25); row25 = _mm256_max_epu8(temp, row25); \
+    temp = row22; row22 = _mm256_min_epu8(row22, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row23; row23 = _mm256_min_epu8(row23, row27); row27 = _mm256_max_epu8(temp, row27); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row25); row25 = _mm256_max_epu8(temp, row25); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row27); row27 = _mm256_max_epu8(temp, row27); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row2); row2 = _mm256_max_epu8(temp, row2); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row25; row25 = _mm256_min_epu8(row25, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row25); row25 = _mm256_max_epu8(temp, row25); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row27); row27 = _mm256_max_epu8(temp, row27); \
+    temp = row22; row22 = _mm256_min_epu8(row22, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row23; row23 = _mm256_min_epu8(row23, row25); row25 = _mm256_max_epu8(temp, row25); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row2); row2 = _mm256_max_epu8(temp, row2); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row25; row25 = _mm256_min_epu8(row25, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row23; row23 = _mm256_min_epu8(row23, row25); row25 = _mm256_max_epu8(temp, row25); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row23; row23 = _mm256_min_epu8(row23, row24); row24 = _mm256_max_epu8(temp, row24); \
+} while (0)
+
+#define _MM256_SORT28_EPU16( \
+    row0, row1, row2, row3, row4, row5, row6, row7, row8, row9, \
+    row10, row11, row12, row13, row14, row15, row16, row17, row18, row19, \
+    row20, row21, row22, row23, row24, row25, row26, row27 \
+) do { \
+    __m256i temp = row0; row0 = _mm256_min_epu16(row0, row1); row1 = _mm256_max_epu16(temp, row1); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row3); row3 = _mm256_max_epu16(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row22; row22 = _mm256_min_epu16(row22, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row24; row24 = _mm256_min_epu16(row24, row25); row25 = _mm256_max_epu16(temp, row25); \
+    temp = row26; row26 = _mm256_min_epu16(row26, row27); row27 = _mm256_max_epu16(temp, row27); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row2); row2 = _mm256_max_epu16(temp, row2); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row3); row3 = _mm256_max_epu16(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row24; row24 = _mm256_min_epu16(row24, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row25; row25 = _mm256_min_epu16(row25, row27); row27 = _mm256_max_epu16(temp, row27); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row25); row25 = _mm256_max_epu16(temp, row25); \
+    temp = row22; row22 = _mm256_min_epu16(row22, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row23; row23 = _mm256_min_epu16(row23, row27); row27 = _mm256_max_epu16(temp, row27); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row25); row25 = _mm256_max_epu16(temp, row25); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row27); row27 = _mm256_max_epu16(temp, row27); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row2); row2 = _mm256_max_epu16(temp, row2); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row25; row25 = _mm256_min_epu16(row25, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row25); row25 = _mm256_max_epu16(temp, row25); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row27); row27 = _mm256_max_epu16(temp, row27); \
+    temp = row22; row22 = _mm256_min_epu16(row22, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row23; row23 = _mm256_min_epu16(row23, row25); row25 = _mm256_max_epu16(temp, row25); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row2); row2 = _mm256_max_epu16(temp, row2); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row25; row25 = _mm256_min_epu16(row25, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row23; row23 = _mm256_min_epu16(row23, row25); row25 = _mm256_max_epu16(temp, row25); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row23; row23 = _mm256_min_epu16(row23, row24); row24 = _mm256_max_epu16(temp, row24); \
+} while (0)
+
+#define _MM256_SORT28_PS( \
+    row0, row1, row2, row3, row4, row5, row6, row7, row8, row9, \
+    row10, row11, row12, row13, row14, row15, row16, row17, row18, row19, \
+    row20, row21, row22, row23, row24, row25, row26, row27 \
+) do { \
+    __m256 temp = row0; row0 = _mm256_min_ps(row0, row1); row1 = _mm256_max_ps(temp, row1); \
+    temp = row2; row2 = _mm256_min_ps(row2, row3); row3 = _mm256_max_ps(temp, row3); \
+    temp = row4; row4 = _mm256_min_ps(row4, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row6; row6 = _mm256_min_ps(row6, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row8; row8 = _mm256_min_ps(row8, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row10; row10 = _mm256_min_ps(row10, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row12; row12 = _mm256_min_ps(row12, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row14; row14 = _mm256_min_ps(row14, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row16; row16 = _mm256_min_ps(row16, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row18; row18 = _mm256_min_ps(row18, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row20; row20 = _mm256_min_ps(row20, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row22; row22 = _mm256_min_ps(row22, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row24; row24 = _mm256_min_ps(row24, row25); row25 = _mm256_max_ps(temp, row25); \
+    temp = row26; row26 = _mm256_min_ps(row26, row27); row27 = _mm256_max_ps(temp, row27); \
+    temp = row0; row0 = _mm256_min_ps(row0, row2); row2 = _mm256_max_ps(temp, row2); \
+    temp = row1; row1 = _mm256_min_ps(row1, row3); row3 = _mm256_max_ps(temp, row3); \
+    temp = row4; row4 = _mm256_min_ps(row4, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row5; row5 = _mm256_min_ps(row5, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row8; row8 = _mm256_min_ps(row8, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row9; row9 = _mm256_min_ps(row9, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row12; row12 = _mm256_min_ps(row12, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row13; row13 = _mm256_min_ps(row13, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row16; row16 = _mm256_min_ps(row16, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row17; row17 = _mm256_min_ps(row17, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row20; row20 = _mm256_min_ps(row20, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row21; row21 = _mm256_min_ps(row21, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row24; row24 = _mm256_min_ps(row24, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row25; row25 = _mm256_min_ps(row25, row27); row27 = _mm256_max_ps(temp, row27); \
+    temp = row0; row0 = _mm256_min_ps(row0, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row1; row1 = _mm256_min_ps(row1, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row2; row2 = _mm256_min_ps(row2, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row3; row3 = _mm256_min_ps(row3, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row8; row8 = _mm256_min_ps(row8, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row9; row9 = _mm256_min_ps(row9, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row14; row14 = _mm256_min_ps(row14, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row15; row15 = _mm256_min_ps(row15, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row20; row20 = _mm256_min_ps(row20, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row21; row21 = _mm256_min_ps(row21, row25); row25 = _mm256_max_ps(temp, row25); \
+    temp = row22; row22 = _mm256_min_ps(row22, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row23; row23 = _mm256_min_ps(row23, row27); row27 = _mm256_max_ps(temp, row27); \
+    temp = row0; row0 = _mm256_min_ps(row0, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row1; row1 = _mm256_min_ps(row1, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row2; row2 = _mm256_min_ps(row2, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row3; row3 = _mm256_min_ps(row3, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row4; row4 = _mm256_min_ps(row4, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row5; row5 = _mm256_min_ps(row5, row25); row25 = _mm256_max_ps(temp, row25); \
+    temp = row6; row6 = _mm256_min_ps(row6, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row7; row7 = _mm256_min_ps(row7, row27); row27 = _mm256_max_ps(temp, row27); \
+    temp = row9; row9 = _mm256_min_ps(row9, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row10; row10 = _mm256_min_ps(row10, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row11; row11 = _mm256_min_ps(row11, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row12; row12 = _mm256_min_ps(row12, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row1; row1 = _mm256_min_ps(row1, row2); row2 = _mm256_max_ps(temp, row2); \
+    temp = row4; row4 = _mm256_min_ps(row4, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row5; row5 = _mm256_min_ps(row5, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row7; row7 = _mm256_min_ps(row7, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row8; row8 = _mm256_min_ps(row8, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row9; row9 = _mm256_min_ps(row9, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row10; row10 = _mm256_min_ps(row10, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row11; row11 = _mm256_min_ps(row11, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row13; row13 = _mm256_min_ps(row13, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row15; row15 = _mm256_min_ps(row15, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row21; row21 = _mm256_min_ps(row21, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row25; row25 = _mm256_min_ps(row25, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row0; row0 = _mm256_min_ps(row0, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row1; row1 = _mm256_min_ps(row1, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row2; row2 = _mm256_min_ps(row2, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row3; row3 = _mm256_min_ps(row3, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row4; row4 = _mm256_min_ps(row4, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row6; row6 = _mm256_min_ps(row6, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row7; row7 = _mm256_min_ps(row7, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row11; row11 = _mm256_min_ps(row11, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row14; row14 = _mm256_min_ps(row14, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row15; row15 = _mm256_min_ps(row15, row25); row25 = _mm256_max_ps(temp, row25); \
+    temp = row17; row17 = _mm256_min_ps(row17, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row18; row18 = _mm256_min_ps(row18, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row19; row19 = _mm256_min_ps(row19, row27); row27 = _mm256_max_ps(temp, row27); \
+    temp = row22; row22 = _mm256_min_ps(row22, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row2; row2 = _mm256_min_ps(row2, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row3; row3 = _mm256_min_ps(row3, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row5; row5 = _mm256_min_ps(row5, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row8; row8 = _mm256_min_ps(row8, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row9; row9 = _mm256_min_ps(row9, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row10; row10 = _mm256_min_ps(row10, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row13; row13 = _mm256_min_ps(row13, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row16; row16 = _mm256_min_ps(row16, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row20; row20 = _mm256_min_ps(row20, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row23; row23 = _mm256_min_ps(row23, row25); row25 = _mm256_max_ps(temp, row25); \
+    temp = row1; row1 = _mm256_min_ps(row1, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row3; row3 = _mm256_min_ps(row3, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row5; row5 = _mm256_min_ps(row5, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row6; row6 = _mm256_min_ps(row6, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row7; row7 = _mm256_min_ps(row7, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row12; row12 = _mm256_min_ps(row12, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row16; row16 = _mm256_min_ps(row16, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row17; row17 = _mm256_min_ps(row17, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row18; row18 = _mm256_min_ps(row18, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row19; row19 = _mm256_min_ps(row19, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row1; row1 = _mm256_min_ps(row1, row2); row2 = _mm256_max_ps(temp, row2); \
+    temp = row4; row4 = _mm256_min_ps(row4, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row5; row5 = _mm256_min_ps(row5, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row10; row10 = _mm256_min_ps(row10, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row11; row11 = _mm256_min_ps(row11, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row12; row12 = _mm256_min_ps(row12, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row13; row13 = _mm256_min_ps(row13, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row18; row18 = _mm256_min_ps(row18, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row21; row21 = _mm256_min_ps(row21, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row25; row25 = _mm256_min_ps(row25, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row4; row4 = _mm256_min_ps(row4, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row6; row6 = _mm256_min_ps(row6, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row7; row7 = _mm256_min_ps(row7, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row10; row10 = _mm256_min_ps(row10, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row13; row13 = _mm256_min_ps(row13, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row15; row15 = _mm256_min_ps(row15, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row16; row16 = _mm256_min_ps(row16, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row19; row19 = _mm256_min_ps(row19, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row2; row2 = _mm256_min_ps(row2, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row6; row6 = _mm256_min_ps(row6, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row7; row7 = _mm256_min_ps(row7, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row9; row9 = _mm256_min_ps(row9, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row10; row10 = _mm256_min_ps(row10, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row11; row11 = _mm256_min_ps(row11, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row13; row13 = _mm256_min_ps(row13, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row15; row15 = _mm256_min_ps(row15, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row19; row19 = _mm256_min_ps(row19, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row23; row23 = _mm256_min_ps(row23, row25); row25 = _mm256_max_ps(temp, row25); \
+    temp = row3; row3 = _mm256_min_ps(row3, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row5; row5 = _mm256_min_ps(row5, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row7; row7 = _mm256_min_ps(row7, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row11; row11 = _mm256_min_ps(row11, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row14; row14 = _mm256_min_ps(row14, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row15; row15 = _mm256_min_ps(row15, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row17; row17 = _mm256_min_ps(row17, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row18; row18 = _mm256_min_ps(row18, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row3; row3 = _mm256_min_ps(row3, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row5; row5 = _mm256_min_ps(row5, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row7; row7 = _mm256_min_ps(row7, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row9; row9 = _mm256_min_ps(row9, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row11; row11 = _mm256_min_ps(row11, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row13; row13 = _mm256_min_ps(row13, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row15; row15 = _mm256_min_ps(row15, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row17; row17 = _mm256_min_ps(row17, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row19; row19 = _mm256_min_ps(row19, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row21; row21 = _mm256_min_ps(row21, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row3; row3 = _mm256_min_ps(row3, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row5; row5 = _mm256_min_ps(row5, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row7; row7 = _mm256_min_ps(row7, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row9; row9 = _mm256_min_ps(row9, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row11; row11 = _mm256_min_ps(row11, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row13; row13 = _mm256_min_ps(row13, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row15; row15 = _mm256_min_ps(row15, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row17; row17 = _mm256_min_ps(row17, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row19; row19 = _mm256_min_ps(row19, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row21; row21 = _mm256_min_ps(row21, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row23; row23 = _mm256_min_ps(row23, row24); row24 = _mm256_max_ps(temp, row24); \
+} while (0)
+
+#define _MM256_SORT35_EPU8( \
+    row0, row1, row2, row3, row4, row5, row6, row7, row8, row9, \
+    row10, row11, row12, row13, row14, row15, row16, row17, row18, row19, \
+    row20, row21, row22, row23, row24, row25, row26, row27, row28, row29, \
+    row30, row31, row32, row33, row34 \
+) do { \
+    __m256i temp = row0; row0 = _mm256_min_epu8(row0, row1); row1 = _mm256_max_epu8(temp, row1); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row3); row3 = _mm256_max_epu8(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row22; row22 = _mm256_min_epu8(row22, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row24; row24 = _mm256_min_epu8(row24, row25); row25 = _mm256_max_epu8(temp, row25); \
+    temp = row26; row26 = _mm256_min_epu8(row26, row27); row27 = _mm256_max_epu8(temp, row27); \
+    temp = row28; row28 = _mm256_min_epu8(row28, row29); row29 = _mm256_max_epu8(temp, row29); \
+    temp = row30; row30 = _mm256_min_epu8(row30, row31); row31 = _mm256_max_epu8(temp, row31); \
+    temp = row32; row32 = _mm256_min_epu8(row32, row33); row33 = _mm256_max_epu8(temp, row33); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row2); row2 = _mm256_max_epu8(temp, row2); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row3); row3 = _mm256_max_epu8(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row24; row24 = _mm256_min_epu8(row24, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row25; row25 = _mm256_min_epu8(row25, row27); row27 = _mm256_max_epu8(temp, row27); \
+    temp = row28; row28 = _mm256_min_epu8(row28, row30); row30 = _mm256_max_epu8(temp, row30); \
+    temp = row29; row29 = _mm256_min_epu8(row29, row31); row31 = _mm256_max_epu8(temp, row31); \
+    temp = row33; row33 = _mm256_min_epu8(row33, row34); row34 = _mm256_max_epu8(temp, row34); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row24; row24 = _mm256_min_epu8(row24, row28); row28 = _mm256_max_epu8(temp, row28); \
+    temp = row25; row25 = _mm256_min_epu8(row25, row29); row29 = _mm256_max_epu8(temp, row29); \
+    temp = row26; row26 = _mm256_min_epu8(row26, row30); row30 = _mm256_max_epu8(temp, row30); \
+    temp = row27; row27 = _mm256_min_epu8(row27, row31); row31 = _mm256_max_epu8(temp, row31); \
+    temp = row32; row32 = _mm256_min_epu8(row32, row33); row33 = _mm256_max_epu8(temp, row33); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row25); row25 = _mm256_max_epu8(temp, row25); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row27); row27 = _mm256_max_epu8(temp, row27); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row28); row28 = _mm256_max_epu8(temp, row28); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row29); row29 = _mm256_max_epu8(temp, row29); \
+    temp = row22; row22 = _mm256_min_epu8(row22, row30); row30 = _mm256_max_epu8(temp, row30); \
+    temp = row23; row23 = _mm256_min_epu8(row23, row31); row31 = _mm256_max_epu8(temp, row31); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row25); row25 = _mm256_max_epu8(temp, row25); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row27); row27 = _mm256_max_epu8(temp, row27); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row28); row28 = _mm256_max_epu8(temp, row28); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row29); row29 = _mm256_max_epu8(temp, row29); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row30); row30 = _mm256_max_epu8(temp, row30); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row31); row31 = _mm256_max_epu8(temp, row31); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row32); row32 = _mm256_max_epu8(temp, row32); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row2); row2 = _mm256_max_epu8(temp, row2); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row28); row28 = _mm256_max_epu8(temp, row28); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row22; row22 = _mm256_min_epu8(row22, row25); row25 = _mm256_max_epu8(temp, row25); \
+    temp = row23; row23 = _mm256_min_epu8(row23, row27); row27 = _mm256_max_epu8(temp, row27); \
+    temp = row29; row29 = _mm256_min_epu8(row29, row30); row30 = _mm256_max_epu8(temp, row30); \
+    temp = row31; row31 = _mm256_min_epu8(row31, row34); row34 = _mm256_max_epu8(temp, row34); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row28); row28 = _mm256_max_epu8(temp, row28); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row31); row31 = _mm256_max_epu8(temp, row31); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row32); row32 = _mm256_max_epu8(temp, row32); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row33); row33 = _mm256_max_epu8(temp, row33); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row32); row32 = _mm256_max_epu8(temp, row32); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row33); row33 = _mm256_max_epu8(temp, row33); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row30; row30 = _mm256_min_epu8(row30, row31); row31 = _mm256_max_epu8(temp, row31); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row3); row3 = _mm256_max_epu8(temp, row3); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row33); row33 = _mm256_max_epu8(temp, row33); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row32); row32 = _mm256_max_epu8(temp, row32); \
+    temp = row23; row23 = _mm256_min_epu8(row23, row30); row30 = _mm256_max_epu8(temp, row30); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row23; row23 = _mm256_min_epu8(row23, row29); row29 = _mm256_max_epu8(temp, row29); \
+    temp = row25; row25 = _mm256_min_epu8(row25, row32); row32 = _mm256_max_epu8(temp, row32); \
+    temp = row26; row26 = _mm256_min_epu8(row26, row33); row33 = _mm256_max_epu8(temp, row33); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row3); row3 = _mm256_max_epu8(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row25); row25 = _mm256_max_epu8(temp, row25); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row28; row28 = _mm256_min_epu8(row28, row32); row32 = _mm256_max_epu8(temp, row32); \
+    temp = row29; row29 = _mm256_min_epu8(row29, row33); row33 = _mm256_max_epu8(temp, row33); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row22; row22 = _mm256_min_epu8(row22, row25); row25 = _mm256_max_epu8(temp, row25); \
+    temp = row26; row26 = _mm256_min_epu8(row26, row28); row28 = _mm256_max_epu8(temp, row28); \
+    temp = row27; row27 = _mm256_min_epu8(row27, row33); row33 = _mm256_max_epu8(temp, row33); \
+    temp = row30; row30 = _mm256_min_epu8(row30, row32); row32 = _mm256_max_epu8(temp, row32); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row23; row23 = _mm256_min_epu8(row23, row25); row25 = _mm256_max_epu8(temp, row25); \
+    temp = row24; row24 = _mm256_min_epu8(row24, row28); row28 = _mm256_max_epu8(temp, row28); \
+    temp = row27; row27 = _mm256_min_epu8(row27, row30); row30 = _mm256_max_epu8(temp, row30); \
+    temp = row31; row31 = _mm256_min_epu8(row31, row33); row33 = _mm256_max_epu8(temp, row33); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row3); row3 = _mm256_max_epu8(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row22; row22 = _mm256_min_epu8(row22, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row23; row23 = _mm256_min_epu8(row23, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row25; row25 = _mm256_min_epu8(row25, row28); row28 = _mm256_max_epu8(temp, row28); \
+    temp = row27; row27 = _mm256_min_epu8(row27, row29); row29 = _mm256_max_epu8(temp, row29); \
+    temp = row31; row31 = _mm256_min_epu8(row31, row32); row32 = _mm256_max_epu8(temp, row32); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row22; row22 = _mm256_min_epu8(row22, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row24; row24 = _mm256_min_epu8(row24, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row25; row25 = _mm256_min_epu8(row25, row27); row27 = _mm256_max_epu8(temp, row27); \
+    temp = row28; row28 = _mm256_min_epu8(row28, row29); row29 = _mm256_max_epu8(temp, row29); \
+    temp = row30; row30 = _mm256_min_epu8(row30, row31); row31 = _mm256_max_epu8(temp, row31); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row24; row24 = _mm256_min_epu8(row24, row25); row25 = _mm256_max_epu8(temp, row25); \
+    temp = row26; row26 = _mm256_min_epu8(row26, row27); row27 = _mm256_max_epu8(temp, row27); \
+    temp = row29; row29 = _mm256_min_epu8(row29, row30); row30 = _mm256_max_epu8(temp, row30); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row23; row23 = _mm256_min_epu8(row23, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row25; row25 = _mm256_min_epu8(row25, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row27; row27 = _mm256_min_epu8(row27, row28); row28 = _mm256_max_epu8(temp, row28); \
+} while (0)
+
+#define _MM256_SORT35_EPU16( \
+    row0, row1, row2, row3, row4, row5, row6, row7, row8, row9, \
+    row10, row11, row12, row13, row14, row15, row16, row17, row18, row19, \
+    row20, row21, row22, row23, row24, row25, row26, row27, row28, row29, \
+    row30, row31, row32, row33, row34 \
+) do { \
+    __m256i temp = row0; row0 = _mm256_min_epu16(row0, row1); row1 = _mm256_max_epu16(temp, row1); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row3); row3 = _mm256_max_epu16(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row22; row22 = _mm256_min_epu16(row22, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row24; row24 = _mm256_min_epu16(row24, row25); row25 = _mm256_max_epu16(temp, row25); \
+    temp = row26; row26 = _mm256_min_epu16(row26, row27); row27 = _mm256_max_epu16(temp, row27); \
+    temp = row28; row28 = _mm256_min_epu16(row28, row29); row29 = _mm256_max_epu16(temp, row29); \
+    temp = row30; row30 = _mm256_min_epu16(row30, row31); row31 = _mm256_max_epu16(temp, row31); \
+    temp = row32; row32 = _mm256_min_epu16(row32, row33); row33 = _mm256_max_epu16(temp, row33); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row2); row2 = _mm256_max_epu16(temp, row2); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row3); row3 = _mm256_max_epu16(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row24; row24 = _mm256_min_epu16(row24, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row25; row25 = _mm256_min_epu16(row25, row27); row27 = _mm256_max_epu16(temp, row27); \
+    temp = row28; row28 = _mm256_min_epu16(row28, row30); row30 = _mm256_max_epu16(temp, row30); \
+    temp = row29; row29 = _mm256_min_epu16(row29, row31); row31 = _mm256_max_epu16(temp, row31); \
+    temp = row33; row33 = _mm256_min_epu16(row33, row34); row34 = _mm256_max_epu16(temp, row34); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row24; row24 = _mm256_min_epu16(row24, row28); row28 = _mm256_max_epu16(temp, row28); \
+    temp = row25; row25 = _mm256_min_epu16(row25, row29); row29 = _mm256_max_epu16(temp, row29); \
+    temp = row26; row26 = _mm256_min_epu16(row26, row30); row30 = _mm256_max_epu16(temp, row30); \
+    temp = row27; row27 = _mm256_min_epu16(row27, row31); row31 = _mm256_max_epu16(temp, row31); \
+    temp = row32; row32 = _mm256_min_epu16(row32, row33); row33 = _mm256_max_epu16(temp, row33); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row25); row25 = _mm256_max_epu16(temp, row25); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row27); row27 = _mm256_max_epu16(temp, row27); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row28); row28 = _mm256_max_epu16(temp, row28); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row29); row29 = _mm256_max_epu16(temp, row29); \
+    temp = row22; row22 = _mm256_min_epu16(row22, row30); row30 = _mm256_max_epu16(temp, row30); \
+    temp = row23; row23 = _mm256_min_epu16(row23, row31); row31 = _mm256_max_epu16(temp, row31); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row25); row25 = _mm256_max_epu16(temp, row25); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row27); row27 = _mm256_max_epu16(temp, row27); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row28); row28 = _mm256_max_epu16(temp, row28); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row29); row29 = _mm256_max_epu16(temp, row29); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row30); row30 = _mm256_max_epu16(temp, row30); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row31); row31 = _mm256_max_epu16(temp, row31); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row32); row32 = _mm256_max_epu16(temp, row32); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row2); row2 = _mm256_max_epu16(temp, row2); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row28); row28 = _mm256_max_epu16(temp, row28); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row22; row22 = _mm256_min_epu16(row22, row25); row25 = _mm256_max_epu16(temp, row25); \
+    temp = row23; row23 = _mm256_min_epu16(row23, row27); row27 = _mm256_max_epu16(temp, row27); \
+    temp = row29; row29 = _mm256_min_epu16(row29, row30); row30 = _mm256_max_epu16(temp, row30); \
+    temp = row31; row31 = _mm256_min_epu16(row31, row34); row34 = _mm256_max_epu16(temp, row34); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row28); row28 = _mm256_max_epu16(temp, row28); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row31); row31 = _mm256_max_epu16(temp, row31); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row32); row32 = _mm256_max_epu16(temp, row32); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row33); row33 = _mm256_max_epu16(temp, row33); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row32); row32 = _mm256_max_epu16(temp, row32); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row33); row33 = _mm256_max_epu16(temp, row33); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row30; row30 = _mm256_min_epu16(row30, row31); row31 = _mm256_max_epu16(temp, row31); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row3); row3 = _mm256_max_epu16(temp, row3); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row33); row33 = _mm256_max_epu16(temp, row33); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row32); row32 = _mm256_max_epu16(temp, row32); \
+    temp = row23; row23 = _mm256_min_epu16(row23, row30); row30 = _mm256_max_epu16(temp, row30); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row23; row23 = _mm256_min_epu16(row23, row29); row29 = _mm256_max_epu16(temp, row29); \
+    temp = row25; row25 = _mm256_min_epu16(row25, row32); row32 = _mm256_max_epu16(temp, row32); \
+    temp = row26; row26 = _mm256_min_epu16(row26, row33); row33 = _mm256_max_epu16(temp, row33); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row3); row3 = _mm256_max_epu16(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row25); row25 = _mm256_max_epu16(temp, row25); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row28; row28 = _mm256_min_epu16(row28, row32); row32 = _mm256_max_epu16(temp, row32); \
+    temp = row29; row29 = _mm256_min_epu16(row29, row33); row33 = _mm256_max_epu16(temp, row33); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row22; row22 = _mm256_min_epu16(row22, row25); row25 = _mm256_max_epu16(temp, row25); \
+    temp = row26; row26 = _mm256_min_epu16(row26, row28); row28 = _mm256_max_epu16(temp, row28); \
+    temp = row27; row27 = _mm256_min_epu16(row27, row33); row33 = _mm256_max_epu16(temp, row33); \
+    temp = row30; row30 = _mm256_min_epu16(row30, row32); row32 = _mm256_max_epu16(temp, row32); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row23; row23 = _mm256_min_epu16(row23, row25); row25 = _mm256_max_epu16(temp, row25); \
+    temp = row24; row24 = _mm256_min_epu16(row24, row28); row28 = _mm256_max_epu16(temp, row28); \
+    temp = row27; row27 = _mm256_min_epu16(row27, row30); row30 = _mm256_max_epu16(temp, row30); \
+    temp = row31; row31 = _mm256_min_epu16(row31, row33); row33 = _mm256_max_epu16(temp, row33); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row3); row3 = _mm256_max_epu16(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row22; row22 = _mm256_min_epu16(row22, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row23; row23 = _mm256_min_epu16(row23, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row25; row25 = _mm256_min_epu16(row25, row28); row28 = _mm256_max_epu16(temp, row28); \
+    temp = row27; row27 = _mm256_min_epu16(row27, row29); row29 = _mm256_max_epu16(temp, row29); \
+    temp = row31; row31 = _mm256_min_epu16(row31, row32); row32 = _mm256_max_epu16(temp, row32); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row22; row22 = _mm256_min_epu16(row22, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row24; row24 = _mm256_min_epu16(row24, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row25; row25 = _mm256_min_epu16(row25, row27); row27 = _mm256_max_epu16(temp, row27); \
+    temp = row28; row28 = _mm256_min_epu16(row28, row29); row29 = _mm256_max_epu16(temp, row29); \
+    temp = row30; row30 = _mm256_min_epu16(row30, row31); row31 = _mm256_max_epu16(temp, row31); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row24; row24 = _mm256_min_epu16(row24, row25); row25 = _mm256_max_epu16(temp, row25); \
+    temp = row26; row26 = _mm256_min_epu16(row26, row27); row27 = _mm256_max_epu16(temp, row27); \
+    temp = row29; row29 = _mm256_min_epu16(row29, row30); row30 = _mm256_max_epu16(temp, row30); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row23; row23 = _mm256_min_epu16(row23, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row25; row25 = _mm256_min_epu16(row25, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row27; row27 = _mm256_min_epu16(row27, row28); row28 = _mm256_max_epu16(temp, row28); \
+} while (0)
+
+#define _MM256_SORT35_PS( \
+    row0, row1, row2, row3, row4, row5, row6, row7, row8, row9, \
+    row10, row11, row12, row13, row14, row15, row16, row17, row18, row19, \
+    row20, row21, row22, row23, row24, row25, row26, row27, row28, row29, \
+    row30, row31, row32, row33, row34 \
+) do { \
+    __m256 temp = row0; row0 = _mm256_min_ps(row0, row1); row1 = _mm256_max_ps(temp, row1); \
+    temp = row2; row2 = _mm256_min_ps(row2, row3); row3 = _mm256_max_ps(temp, row3); \
+    temp = row4; row4 = _mm256_min_ps(row4, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row6; row6 = _mm256_min_ps(row6, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row8; row8 = _mm256_min_ps(row8, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row10; row10 = _mm256_min_ps(row10, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row12; row12 = _mm256_min_ps(row12, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row14; row14 = _mm256_min_ps(row14, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row16; row16 = _mm256_min_ps(row16, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row18; row18 = _mm256_min_ps(row18, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row20; row20 = _mm256_min_ps(row20, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row22; row22 = _mm256_min_ps(row22, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row24; row24 = _mm256_min_ps(row24, row25); row25 = _mm256_max_ps(temp, row25); \
+    temp = row26; row26 = _mm256_min_ps(row26, row27); row27 = _mm256_max_ps(temp, row27); \
+    temp = row28; row28 = _mm256_min_ps(row28, row29); row29 = _mm256_max_ps(temp, row29); \
+    temp = row30; row30 = _mm256_min_ps(row30, row31); row31 = _mm256_max_ps(temp, row31); \
+    temp = row32; row32 = _mm256_min_ps(row32, row33); row33 = _mm256_max_ps(temp, row33); \
+    temp = row0; row0 = _mm256_min_ps(row0, row2); row2 = _mm256_max_ps(temp, row2); \
+    temp = row1; row1 = _mm256_min_ps(row1, row3); row3 = _mm256_max_ps(temp, row3); \
+    temp = row4; row4 = _mm256_min_ps(row4, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row5; row5 = _mm256_min_ps(row5, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row8; row8 = _mm256_min_ps(row8, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row9; row9 = _mm256_min_ps(row9, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row12; row12 = _mm256_min_ps(row12, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row13; row13 = _mm256_min_ps(row13, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row16; row16 = _mm256_min_ps(row16, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row17; row17 = _mm256_min_ps(row17, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row20; row20 = _mm256_min_ps(row20, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row21; row21 = _mm256_min_ps(row21, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row24; row24 = _mm256_min_ps(row24, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row25; row25 = _mm256_min_ps(row25, row27); row27 = _mm256_max_ps(temp, row27); \
+    temp = row28; row28 = _mm256_min_ps(row28, row30); row30 = _mm256_max_ps(temp, row30); \
+    temp = row29; row29 = _mm256_min_ps(row29, row31); row31 = _mm256_max_ps(temp, row31); \
+    temp = row33; row33 = _mm256_min_ps(row33, row34); row34 = _mm256_max_ps(temp, row34); \
+    temp = row0; row0 = _mm256_min_ps(row0, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row1; row1 = _mm256_min_ps(row1, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row2; row2 = _mm256_min_ps(row2, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row3; row3 = _mm256_min_ps(row3, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row8; row8 = _mm256_min_ps(row8, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row9; row9 = _mm256_min_ps(row9, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row10; row10 = _mm256_min_ps(row10, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row11; row11 = _mm256_min_ps(row11, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row16; row16 = _mm256_min_ps(row16, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row17; row17 = _mm256_min_ps(row17, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row18; row18 = _mm256_min_ps(row18, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row19; row19 = _mm256_min_ps(row19, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row24; row24 = _mm256_min_ps(row24, row28); row28 = _mm256_max_ps(temp, row28); \
+    temp = row25; row25 = _mm256_min_ps(row25, row29); row29 = _mm256_max_ps(temp, row29); \
+    temp = row26; row26 = _mm256_min_ps(row26, row30); row30 = _mm256_max_ps(temp, row30); \
+    temp = row27; row27 = _mm256_min_ps(row27, row31); row31 = _mm256_max_ps(temp, row31); \
+    temp = row32; row32 = _mm256_min_ps(row32, row33); row33 = _mm256_max_ps(temp, row33); \
+    temp = row0; row0 = _mm256_min_ps(row0, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row1; row1 = _mm256_min_ps(row1, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row2; row2 = _mm256_min_ps(row2, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row3; row3 = _mm256_min_ps(row3, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row4; row4 = _mm256_min_ps(row4, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row5; row5 = _mm256_min_ps(row5, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row6; row6 = _mm256_min_ps(row6, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row7; row7 = _mm256_min_ps(row7, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row16; row16 = _mm256_min_ps(row16, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row17; row17 = _mm256_min_ps(row17, row25); row25 = _mm256_max_ps(temp, row25); \
+    temp = row18; row18 = _mm256_min_ps(row18, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row19; row19 = _mm256_min_ps(row19, row27); row27 = _mm256_max_ps(temp, row27); \
+    temp = row20; row20 = _mm256_min_ps(row20, row28); row28 = _mm256_max_ps(temp, row28); \
+    temp = row21; row21 = _mm256_min_ps(row21, row29); row29 = _mm256_max_ps(temp, row29); \
+    temp = row22; row22 = _mm256_min_ps(row22, row30); row30 = _mm256_max_ps(temp, row30); \
+    temp = row23; row23 = _mm256_min_ps(row23, row31); row31 = _mm256_max_ps(temp, row31); \
+    temp = row0; row0 = _mm256_min_ps(row0, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row1; row1 = _mm256_min_ps(row1, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row2; row2 = _mm256_min_ps(row2, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row3; row3 = _mm256_min_ps(row3, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row4; row4 = _mm256_min_ps(row4, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row5; row5 = _mm256_min_ps(row5, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row6; row6 = _mm256_min_ps(row6, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row7; row7 = _mm256_min_ps(row7, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row8; row8 = _mm256_min_ps(row8, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row9; row9 = _mm256_min_ps(row9, row25); row25 = _mm256_max_ps(temp, row25); \
+    temp = row10; row10 = _mm256_min_ps(row10, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row11; row11 = _mm256_min_ps(row11, row27); row27 = _mm256_max_ps(temp, row27); \
+    temp = row12; row12 = _mm256_min_ps(row12, row28); row28 = _mm256_max_ps(temp, row28); \
+    temp = row13; row13 = _mm256_min_ps(row13, row29); row29 = _mm256_max_ps(temp, row29); \
+    temp = row14; row14 = _mm256_min_ps(row14, row30); row30 = _mm256_max_ps(temp, row30); \
+    temp = row15; row15 = _mm256_min_ps(row15, row31); row31 = _mm256_max_ps(temp, row31); \
+    temp = row0; row0 = _mm256_min_ps(row0, row32); row32 = _mm256_max_ps(temp, row32); \
+    temp = row1; row1 = _mm256_min_ps(row1, row2); row2 = _mm256_max_ps(temp, row2); \
+    temp = row3; row3 = _mm256_min_ps(row3, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row4; row4 = _mm256_min_ps(row4, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row5; row5 = _mm256_min_ps(row5, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row6; row6 = _mm256_min_ps(row6, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row7; row7 = _mm256_min_ps(row7, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row13; row13 = _mm256_min_ps(row13, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row17; row17 = _mm256_min_ps(row17, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row19; row19 = _mm256_min_ps(row19, row28); row28 = _mm256_max_ps(temp, row28); \
+    temp = row20; row20 = _mm256_min_ps(row20, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row21; row21 = _mm256_min_ps(row21, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row22; row22 = _mm256_min_ps(row22, row25); row25 = _mm256_max_ps(temp, row25); \
+    temp = row23; row23 = _mm256_min_ps(row23, row27); row27 = _mm256_max_ps(temp, row27); \
+    temp = row29; row29 = _mm256_min_ps(row29, row30); row30 = _mm256_max_ps(temp, row30); \
+    temp = row31; row31 = _mm256_min_ps(row31, row34); row34 = _mm256_max_ps(temp, row34); \
+    temp = row5; row5 = _mm256_min_ps(row5, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row9; row9 = _mm256_min_ps(row9, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row14; row14 = _mm256_min_ps(row14, row28); row28 = _mm256_max_ps(temp, row28); \
+    temp = row15; row15 = _mm256_min_ps(row15, row31); row31 = _mm256_max_ps(temp, row31); \
+    temp = row16; row16 = _mm256_min_ps(row16, row32); row32 = _mm256_max_ps(temp, row32); \
+    temp = row17; row17 = _mm256_min_ps(row17, row33); row33 = _mm256_max_ps(temp, row33); \
+    temp = row18; row18 = _mm256_min_ps(row18, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row21; row21 = _mm256_min_ps(row21, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row1; row1 = _mm256_min_ps(row1, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row3; row3 = _mm256_min_ps(row3, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row9; row9 = _mm256_min_ps(row9, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row10; row10 = _mm256_min_ps(row10, row32); row32 = _mm256_max_ps(temp, row32); \
+    temp = row13; row13 = _mm256_min_ps(row13, row33); row33 = _mm256_max_ps(temp, row33); \
+    temp = row14; row14 = _mm256_min_ps(row14, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row15; row15 = _mm256_min_ps(row15, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row19; row19 = _mm256_min_ps(row19, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row30; row30 = _mm256_min_ps(row30, row31); row31 = _mm256_max_ps(temp, row31); \
+    temp = row1; row1 = _mm256_min_ps(row1, row3); row3 = _mm256_max_ps(temp, row3); \
+    temp = row2; row2 = _mm256_min_ps(row2, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row7; row7 = _mm256_min_ps(row7, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row8; row8 = _mm256_min_ps(row8, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row10; row10 = _mm256_min_ps(row10, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row11; row11 = _mm256_min_ps(row11, row33); row33 = _mm256_max_ps(temp, row33); \
+    temp = row20; row20 = _mm256_min_ps(row20, row32); row32 = _mm256_max_ps(temp, row32); \
+    temp = row23; row23 = _mm256_min_ps(row23, row30); row30 = _mm256_max_ps(temp, row30); \
+    temp = row3; row3 = _mm256_min_ps(row3, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row5; row5 = _mm256_min_ps(row5, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row6; row6 = _mm256_min_ps(row6, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row7; row7 = _mm256_min_ps(row7, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row11; row11 = _mm256_min_ps(row11, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row12; row12 = _mm256_min_ps(row12, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row13; row13 = _mm256_min_ps(row13, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row23; row23 = _mm256_min_ps(row23, row29); row29 = _mm256_max_ps(temp, row29); \
+    temp = row25; row25 = _mm256_min_ps(row25, row32); row32 = _mm256_max_ps(temp, row32); \
+    temp = row26; row26 = _mm256_min_ps(row26, row33); row33 = _mm256_max_ps(temp, row33); \
+    temp = row1; row1 = _mm256_min_ps(row1, row3); row3 = _mm256_max_ps(temp, row3); \
+    temp = row4; row4 = _mm256_min_ps(row4, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row5; row5 = _mm256_min_ps(row5, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row6; row6 = _mm256_min_ps(row6, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row9; row9 = _mm256_min_ps(row9, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row13; row13 = _mm256_min_ps(row13, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row14; row14 = _mm256_min_ps(row14, row25); row25 = _mm256_max_ps(temp, row25); \
+    temp = row16; row16 = _mm256_min_ps(row16, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row19; row19 = _mm256_min_ps(row19, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row20; row20 = _mm256_min_ps(row20, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row28; row28 = _mm256_min_ps(row28, row32); row32 = _mm256_max_ps(temp, row32); \
+    temp = row29; row29 = _mm256_min_ps(row29, row33); row33 = _mm256_max_ps(temp, row33); \
+    temp = row2; row2 = _mm256_min_ps(row2, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row10; row10 = _mm256_min_ps(row10, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row11; row11 = _mm256_min_ps(row11, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row12; row12 = _mm256_min_ps(row12, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row17; row17 = _mm256_min_ps(row17, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row21; row21 = _mm256_min_ps(row21, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row22; row22 = _mm256_min_ps(row22, row25); row25 = _mm256_max_ps(temp, row25); \
+    temp = row26; row26 = _mm256_min_ps(row26, row28); row28 = _mm256_max_ps(temp, row28); \
+    temp = row27; row27 = _mm256_min_ps(row27, row33); row33 = _mm256_max_ps(temp, row33); \
+    temp = row30; row30 = _mm256_min_ps(row30, row32); row32 = _mm256_max_ps(temp, row32); \
+    temp = row2; row2 = _mm256_min_ps(row2, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row5; row5 = _mm256_min_ps(row5, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row9; row9 = _mm256_min_ps(row9, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row11; row11 = _mm256_min_ps(row11, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row12; row12 = _mm256_min_ps(row12, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row14; row14 = _mm256_min_ps(row14, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row18; row18 = _mm256_min_ps(row18, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row19; row19 = _mm256_min_ps(row19, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row21; row21 = _mm256_min_ps(row21, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row23; row23 = _mm256_min_ps(row23, row25); row25 = _mm256_max_ps(temp, row25); \
+    temp = row24; row24 = _mm256_min_ps(row24, row28); row28 = _mm256_max_ps(temp, row28); \
+    temp = row27; row27 = _mm256_min_ps(row27, row30); row30 = _mm256_max_ps(temp, row30); \
+    temp = row31; row31 = _mm256_min_ps(row31, row33); row33 = _mm256_max_ps(temp, row33); \
+    temp = row2; row2 = _mm256_min_ps(row2, row3); row3 = _mm256_max_ps(temp, row3); \
+    temp = row4; row4 = _mm256_min_ps(row4, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row6; row6 = _mm256_min_ps(row6, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row7; row7 = _mm256_min_ps(row7, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row8; row8 = _mm256_min_ps(row8, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row11; row11 = _mm256_min_ps(row11, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row13; row13 = _mm256_min_ps(row13, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row14; row14 = _mm256_min_ps(row14, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row15; row15 = _mm256_min_ps(row15, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row19; row19 = _mm256_min_ps(row19, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row22; row22 = _mm256_min_ps(row22, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row23; row23 = _mm256_min_ps(row23, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row25; row25 = _mm256_min_ps(row25, row28); row28 = _mm256_max_ps(temp, row28); \
+    temp = row27; row27 = _mm256_min_ps(row27, row29); row29 = _mm256_max_ps(temp, row29); \
+    temp = row31; row31 = _mm256_min_ps(row31, row32); row32 = _mm256_max_ps(temp, row32); \
+    temp = row6; row6 = _mm256_min_ps(row6, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row7; row7 = _mm256_min_ps(row7, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row10; row10 = _mm256_min_ps(row10, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row12; row12 = _mm256_min_ps(row12, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row13; row13 = _mm256_min_ps(row13, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row15; row15 = _mm256_min_ps(row15, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row17; row17 = _mm256_min_ps(row17, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row20; row20 = _mm256_min_ps(row20, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row22; row22 = _mm256_min_ps(row22, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row24; row24 = _mm256_min_ps(row24, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row25; row25 = _mm256_min_ps(row25, row27); row27 = _mm256_max_ps(temp, row27); \
+    temp = row28; row28 = _mm256_min_ps(row28, row29); row29 = _mm256_max_ps(temp, row29); \
+    temp = row30; row30 = _mm256_min_ps(row30, row31); row31 = _mm256_max_ps(temp, row31); \
+    temp = row5; row5 = _mm256_min_ps(row5, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row7; row7 = _mm256_min_ps(row7, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row9; row9 = _mm256_min_ps(row9, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row12; row12 = _mm256_min_ps(row12, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row14; row14 = _mm256_min_ps(row14, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row15; row15 = _mm256_min_ps(row15, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row18; row18 = _mm256_min_ps(row18, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row20; row20 = _mm256_min_ps(row20, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row21; row21 = _mm256_min_ps(row21, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row24; row24 = _mm256_min_ps(row24, row25); row25 = _mm256_max_ps(temp, row25); \
+    temp = row26; row26 = _mm256_min_ps(row26, row27); row27 = _mm256_max_ps(temp, row27); \
+    temp = row29; row29 = _mm256_min_ps(row29, row30); row30 = _mm256_max_ps(temp, row30); \
+    temp = row7; row7 = _mm256_min_ps(row7, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row9; row9 = _mm256_min_ps(row9, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row11; row11 = _mm256_min_ps(row11, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row13; row13 = _mm256_min_ps(row13, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row15; row15 = _mm256_min_ps(row15, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row17; row17 = _mm256_min_ps(row17, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row19; row19 = _mm256_min_ps(row19, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row21; row21 = _mm256_min_ps(row21, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row23; row23 = _mm256_min_ps(row23, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row25; row25 = _mm256_min_ps(row25, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row27; row27 = _mm256_min_ps(row27, row28); row28 = _mm256_max_ps(temp, row28); \
+} while (0)
+
+#define _MM256_SORT42_EPU8( \
+    row0, row1, row2, row3, row4, row5, row6, row7, row8, row9, \
+    row10, row11, row12, row13, row14, row15, row16, row17, row18, row19, \
+    row20, row21, row22, row23, row24, row25, row26, row27, row28, row29, \
+    row30, row31, row32, row33, row34, row35, row36, row37, row38, row39, \
+    row40, row41 \
+) do { \
+    __m256i temp = row0; row0 = _mm256_min_epu8(row0, row1); row1 = _mm256_max_epu8(temp, row1); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row3); row3 = _mm256_max_epu8(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row22; row22 = _mm256_min_epu8(row22, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row24; row24 = _mm256_min_epu8(row24, row25); row25 = _mm256_max_epu8(temp, row25); \
+    temp = row26; row26 = _mm256_min_epu8(row26, row27); row27 = _mm256_max_epu8(temp, row27); \
+    temp = row28; row28 = _mm256_min_epu8(row28, row29); row29 = _mm256_max_epu8(temp, row29); \
+    temp = row30; row30 = _mm256_min_epu8(row30, row31); row31 = _mm256_max_epu8(temp, row31); \
+    temp = row32; row32 = _mm256_min_epu8(row32, row33); row33 = _mm256_max_epu8(temp, row33); \
+    temp = row34; row34 = _mm256_min_epu8(row34, row35); row35 = _mm256_max_epu8(temp, row35); \
+    temp = row36; row36 = _mm256_min_epu8(row36, row37); row37 = _mm256_max_epu8(temp, row37); \
+    temp = row38; row38 = _mm256_min_epu8(row38, row39); row39 = _mm256_max_epu8(temp, row39); \
+    temp = row40; row40 = _mm256_min_epu8(row40, row41); row41 = _mm256_max_epu8(temp, row41); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row2); row2 = _mm256_max_epu8(temp, row2); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row3); row3 = _mm256_max_epu8(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row25); row25 = _mm256_max_epu8(temp, row25); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row26; row26 = _mm256_min_epu8(row26, row28); row28 = _mm256_max_epu8(temp, row28); \
+    temp = row27; row27 = _mm256_min_epu8(row27, row29); row29 = _mm256_max_epu8(temp, row29); \
+    temp = row30; row30 = _mm256_min_epu8(row30, row32); row32 = _mm256_max_epu8(temp, row32); \
+    temp = row31; row31 = _mm256_min_epu8(row31, row33); row33 = _mm256_max_epu8(temp, row33); \
+    temp = row34; row34 = _mm256_min_epu8(row34, row36); row36 = _mm256_max_epu8(temp, row36); \
+    temp = row35; row35 = _mm256_min_epu8(row35, row37); row37 = _mm256_max_epu8(temp, row37); \
+    temp = row38; row38 = _mm256_min_epu8(row38, row40); row40 = _mm256_max_epu8(temp, row40); \
+    temp = row39; row39 = _mm256_min_epu8(row39, row41); row41 = _mm256_max_epu8(temp, row41); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row23; row23 = _mm256_min_epu8(row23, row25); row25 = _mm256_max_epu8(temp, row25); \
+    temp = row26; row26 = _mm256_min_epu8(row26, row30); row30 = _mm256_max_epu8(temp, row30); \
+    temp = row27; row27 = _mm256_min_epu8(row27, row31); row31 = _mm256_max_epu8(temp, row31); \
+    temp = row28; row28 = _mm256_min_epu8(row28, row32); row32 = _mm256_max_epu8(temp, row32); \
+    temp = row29; row29 = _mm256_min_epu8(row29, row33); row33 = _mm256_max_epu8(temp, row33); \
+    temp = row34; row34 = _mm256_min_epu8(row34, row38); row38 = _mm256_max_epu8(temp, row38); \
+    temp = row35; row35 = _mm256_min_epu8(row35, row39); row39 = _mm256_max_epu8(temp, row39); \
+    temp = row36; row36 = _mm256_min_epu8(row36, row40); row40 = _mm256_max_epu8(temp, row40); \
+    temp = row37; row37 = _mm256_min_epu8(row37, row41); row41 = _mm256_max_epu8(temp, row41); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row23; row23 = _mm256_min_epu8(row23, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row26; row26 = _mm256_min_epu8(row26, row34); row34 = _mm256_max_epu8(temp, row34); \
+    temp = row27; row27 = _mm256_min_epu8(row27, row35); row35 = _mm256_max_epu8(temp, row35); \
+    temp = row28; row28 = _mm256_min_epu8(row28, row36); row36 = _mm256_max_epu8(temp, row36); \
+    temp = row29; row29 = _mm256_min_epu8(row29, row37); row37 = _mm256_max_epu8(temp, row37); \
+    temp = row30; row30 = _mm256_min_epu8(row30, row38); row38 = _mm256_max_epu8(temp, row38); \
+    temp = row31; row31 = _mm256_min_epu8(row31, row39); row39 = _mm256_max_epu8(temp, row39); \
+    temp = row32; row32 = _mm256_min_epu8(row32, row40); row40 = _mm256_max_epu8(temp, row40); \
+    temp = row33; row33 = _mm256_min_epu8(row33, row41); row41 = _mm256_max_epu8(temp, row41); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row27); row27 = _mm256_max_epu8(temp, row27); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row28); row28 = _mm256_max_epu8(temp, row28); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row29); row29 = _mm256_max_epu8(temp, row29); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row30); row30 = _mm256_max_epu8(temp, row30); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row31); row31 = _mm256_max_epu8(temp, row31); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row32); row32 = _mm256_max_epu8(temp, row32); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row33); row33 = _mm256_max_epu8(temp, row33); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row34); row34 = _mm256_max_epu8(temp, row34); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row35); row35 = _mm256_max_epu8(temp, row35); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row36); row36 = _mm256_max_epu8(temp, row36); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row37); row37 = _mm256_max_epu8(temp, row37); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row38); row38 = _mm256_max_epu8(temp, row38); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row39); row39 = _mm256_max_epu8(temp, row39); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row40); row40 = _mm256_max_epu8(temp, row40); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row41); row41 = _mm256_max_epu8(temp, row41); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row24; row24 = _mm256_min_epu8(row24, row25); row25 = _mm256_max_epu8(temp, row25); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row2); row2 = _mm256_max_epu8(temp, row2); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row22; row22 = _mm256_min_epu8(row22, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row25; row25 = _mm256_min_epu8(row25, row41); row41 = _mm256_max_epu8(temp, row41); \
+    temp = row27; row27 = _mm256_min_epu8(row27, row28); row28 = _mm256_max_epu8(temp, row28); \
+    temp = row29; row29 = _mm256_min_epu8(row29, row38); row38 = _mm256_max_epu8(temp, row38); \
+    temp = row30; row30 = _mm256_min_epu8(row30, row34); row34 = _mm256_max_epu8(temp, row34); \
+    temp = row31; row31 = _mm256_min_epu8(row31, row36); row36 = _mm256_max_epu8(temp, row36); \
+    temp = row32; row32 = _mm256_min_epu8(row32, row35); row35 = _mm256_max_epu8(temp, row35); \
+    temp = row33; row33 = _mm256_min_epu8(row33, row37); row37 = _mm256_max_epu8(temp, row37); \
+    temp = row39; row39 = _mm256_min_epu8(row39, row40); row40 = _mm256_max_epu8(temp, row40); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row27); row27 = _mm256_max_epu8(temp, row27); \
+    temp = row22; row22 = _mm256_min_epu8(row22, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row25; row25 = _mm256_min_epu8(row25, row37); row37 = _mm256_max_epu8(temp, row37); \
+    temp = row28; row28 = _mm256_min_epu8(row28, row34); row34 = _mm256_max_epu8(temp, row34); \
+    temp = row31; row31 = _mm256_min_epu8(row31, row32); row32 = _mm256_max_epu8(temp, row32); \
+    temp = row35; row35 = _mm256_min_epu8(row35, row36); row36 = _mm256_max_epu8(temp, row36); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row27); row27 = _mm256_max_epu8(temp, row27); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row29); row29 = _mm256_max_epu8(temp, row29); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row36); row36 = _mm256_max_epu8(temp, row36); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row30); row30 = _mm256_max_epu8(temp, row30); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row38); row38 = _mm256_max_epu8(temp, row38); \
+    temp = row22; row22 = _mm256_min_epu8(row22, row33); row33 = _mm256_max_epu8(temp, row33); \
+    temp = row24; row24 = _mm256_min_epu8(row24, row40); row40 = _mm256_max_epu8(temp, row40); \
+    temp = row25; row25 = _mm256_min_epu8(row25, row39); row39 = _mm256_max_epu8(temp, row39); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row30); row30 = _mm256_max_epu8(temp, row30); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row32); row32 = _mm256_max_epu8(temp, row32); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row34); row34 = _mm256_max_epu8(temp, row34); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row25); row25 = _mm256_max_epu8(temp, row25); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row27); row27 = _mm256_max_epu8(temp, row27); \
+    temp = row22; row22 = _mm256_min_epu8(row22, row31); row31 = _mm256_max_epu8(temp, row31); \
+    temp = row23; row23 = _mm256_min_epu8(row23, row35); row35 = _mm256_max_epu8(temp, row35); \
+    temp = row24; row24 = _mm256_min_epu8(row24, row33); row33 = _mm256_max_epu8(temp, row33); \
+    temp = row36; row36 = _mm256_min_epu8(row36, row38); row38 = _mm256_max_epu8(temp, row38); \
+    temp = row37; row37 = _mm256_min_epu8(row37, row40); row40 = _mm256_max_epu8(temp, row40); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row28); row28 = _mm256_max_epu8(temp, row28); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row30); row30 = _mm256_max_epu8(temp, row30); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row23; row23 = _mm256_min_epu8(row23, row29); row29 = _mm256_max_epu8(temp, row29); \
+    temp = row24; row24 = _mm256_min_epu8(row24, row25); row25 = _mm256_max_epu8(temp, row25); \
+    temp = row27; row27 = _mm256_min_epu8(row27, row32); row32 = _mm256_max_epu8(temp, row32); \
+    temp = row35; row35 = _mm256_min_epu8(row35, row39); row39 = _mm256_max_epu8(temp, row39); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row28); row28 = _mm256_max_epu8(temp, row28); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row34); row34 = _mm256_max_epu8(temp, row34); \
+    temp = row23; row23 = _mm256_min_epu8(row23, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row24; row24 = _mm256_min_epu8(row24, row31); row31 = _mm256_max_epu8(temp, row31); \
+    temp = row25; row25 = _mm256_min_epu8(row25, row35); row35 = _mm256_max_epu8(temp, row35); \
+    temp = row29; row29 = _mm256_min_epu8(row29, row30); row30 = _mm256_max_epu8(temp, row30); \
+    temp = row32; row32 = _mm256_min_epu8(row32, row36); row36 = _mm256_max_epu8(temp, row36); \
+    temp = row33; row33 = _mm256_min_epu8(row33, row39); row39 = _mm256_max_epu8(temp, row39); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row23; row23 = _mm256_min_epu8(row23, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row27; row27 = _mm256_min_epu8(row27, row28); row28 = _mm256_max_epu8(temp, row28); \
+    temp = row29; row29 = _mm256_min_epu8(row29, row31); row31 = _mm256_max_epu8(temp, row31); \
+    temp = row30; row30 = _mm256_min_epu8(row30, row34); row34 = _mm256_max_epu8(temp, row34); \
+    temp = row33; row33 = _mm256_min_epu8(row33, row37); row37 = _mm256_max_epu8(temp, row37); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row29); row29 = _mm256_max_epu8(temp, row29); \
+    temp = row24; row24 = _mm256_min_epu8(row24, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row25; row25 = _mm256_min_epu8(row25, row30); row30 = _mm256_max_epu8(temp, row30); \
+    temp = row31; row31 = _mm256_min_epu8(row31, row32); row32 = _mm256_max_epu8(temp, row32); \
+    temp = row33; row33 = _mm256_min_epu8(row33, row35); row35 = _mm256_max_epu8(temp, row35); \
+    temp = row37; row37 = _mm256_min_epu8(row37, row39); row39 = _mm256_max_epu8(temp, row39); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row22; row22 = _mm256_min_epu8(row22, row29); row29 = _mm256_max_epu8(temp, row29); \
+    temp = row24; row24 = _mm256_min_epu8(row24, row27); row27 = _mm256_max_epu8(temp, row27); \
+    temp = row25; row25 = _mm256_min_epu8(row25, row31); row31 = _mm256_max_epu8(temp, row31); \
+    temp = row26; row26 = _mm256_min_epu8(row26, row28); row28 = _mm256_max_epu8(temp, row28); \
+    temp = row32; row32 = _mm256_min_epu8(row32, row34); row34 = _mm256_max_epu8(temp, row34); \
+    temp = row33; row33 = _mm256_min_epu8(row33, row36); row36 = _mm256_max_epu8(temp, row36); \
+    temp = row35; row35 = _mm256_min_epu8(row35, row38); row38 = _mm256_max_epu8(temp, row38); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row22; row22 = _mm256_min_epu8(row22, row27); row27 = _mm256_max_epu8(temp, row27); \
+    temp = row28; row28 = _mm256_min_epu8(row28, row29); row29 = _mm256_max_epu8(temp, row29); \
+    temp = row30; row30 = _mm256_min_epu8(row30, row33); row33 = _mm256_max_epu8(temp, row33); \
+    temp = row34; row34 = _mm256_min_epu8(row34, row35); row35 = _mm256_max_epu8(temp, row35); \
+    temp = row37; row37 = _mm256_min_epu8(row37, row38); row38 = _mm256_max_epu8(temp, row38); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row23; row23 = _mm256_min_epu8(row23, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row25; row25 = _mm256_min_epu8(row25, row27); row27 = _mm256_max_epu8(temp, row27); \
+    temp = row26; row26 = _mm256_min_epu8(row26, row28); row28 = _mm256_max_epu8(temp, row28); \
+    temp = row29; row29 = _mm256_min_epu8(row29, row31); row31 = _mm256_max_epu8(temp, row31); \
+    temp = row30; row30 = _mm256_min_epu8(row30, row32); row32 = _mm256_max_epu8(temp, row32); \
+    temp = row33; row33 = _mm256_min_epu8(row33, row34); row34 = _mm256_max_epu8(temp, row34); \
+    temp = row35; row35 = _mm256_min_epu8(row35, row36); row36 = _mm256_max_epu8(temp, row36); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row22; row22 = _mm256_min_epu8(row22, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row25; row25 = _mm256_min_epu8(row25, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row27; row27 = _mm256_min_epu8(row27, row28); row28 = _mm256_max_epu8(temp, row28); \
+    temp = row29; row29 = _mm256_min_epu8(row29, row30); row30 = _mm256_max_epu8(temp, row30); \
+    temp = row31; row31 = _mm256_min_epu8(row31, row32); row32 = _mm256_max_epu8(temp, row32); \
+    temp = row34; row34 = _mm256_min_epu8(row34, row35); row35 = _mm256_max_epu8(temp, row35); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row22; row22 = _mm256_min_epu8(row22, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row24; row24 = _mm256_min_epu8(row24, row25); row25 = _mm256_max_epu8(temp, row25); \
+    temp = row26; row26 = _mm256_min_epu8(row26, row27); row27 = _mm256_max_epu8(temp, row27); \
+    temp = row28; row28 = _mm256_min_epu8(row28, row29); row29 = _mm256_max_epu8(temp, row29); \
+    temp = row30; row30 = _mm256_min_epu8(row30, row31); row31 = _mm256_max_epu8(temp, row31); \
+    temp = row32; row32 = _mm256_min_epu8(row32, row33); row33 = _mm256_max_epu8(temp, row33); \
+} while (0)
+
+#define _MM256_SORT42_EPU16( \
+    row0, row1, row2, row3, row4, row5, row6, row7, row8, row9, \
+    row10, row11, row12, row13, row14, row15, row16, row17, row18, row19, \
+    row20, row21, row22, row23, row24, row25, row26, row27, row28, row29, \
+    row30, row31, row32, row33, row34, row35, row36, row37, row38, row39, \
+    row40, row41 \
+) do { \
+    __m256i temp = row0; row0 = _mm256_min_epu16(row0, row1); row1 = _mm256_max_epu16(temp, row1); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row3); row3 = _mm256_max_epu16(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row22; row22 = _mm256_min_epu16(row22, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row24; row24 = _mm256_min_epu16(row24, row25); row25 = _mm256_max_epu16(temp, row25); \
+    temp = row26; row26 = _mm256_min_epu16(row26, row27); row27 = _mm256_max_epu16(temp, row27); \
+    temp = row28; row28 = _mm256_min_epu16(row28, row29); row29 = _mm256_max_epu16(temp, row29); \
+    temp = row30; row30 = _mm256_min_epu16(row30, row31); row31 = _mm256_max_epu16(temp, row31); \
+    temp = row32; row32 = _mm256_min_epu16(row32, row33); row33 = _mm256_max_epu16(temp, row33); \
+    temp = row34; row34 = _mm256_min_epu16(row34, row35); row35 = _mm256_max_epu16(temp, row35); \
+    temp = row36; row36 = _mm256_min_epu16(row36, row37); row37 = _mm256_max_epu16(temp, row37); \
+    temp = row38; row38 = _mm256_min_epu16(row38, row39); row39 = _mm256_max_epu16(temp, row39); \
+    temp = row40; row40 = _mm256_min_epu16(row40, row41); row41 = _mm256_max_epu16(temp, row41); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row2); row2 = _mm256_max_epu16(temp, row2); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row3); row3 = _mm256_max_epu16(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row25); row25 = _mm256_max_epu16(temp, row25); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row26; row26 = _mm256_min_epu16(row26, row28); row28 = _mm256_max_epu16(temp, row28); \
+    temp = row27; row27 = _mm256_min_epu16(row27, row29); row29 = _mm256_max_epu16(temp, row29); \
+    temp = row30; row30 = _mm256_min_epu16(row30, row32); row32 = _mm256_max_epu16(temp, row32); \
+    temp = row31; row31 = _mm256_min_epu16(row31, row33); row33 = _mm256_max_epu16(temp, row33); \
+    temp = row34; row34 = _mm256_min_epu16(row34, row36); row36 = _mm256_max_epu16(temp, row36); \
+    temp = row35; row35 = _mm256_min_epu16(row35, row37); row37 = _mm256_max_epu16(temp, row37); \
+    temp = row38; row38 = _mm256_min_epu16(row38, row40); row40 = _mm256_max_epu16(temp, row40); \
+    temp = row39; row39 = _mm256_min_epu16(row39, row41); row41 = _mm256_max_epu16(temp, row41); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row23; row23 = _mm256_min_epu16(row23, row25); row25 = _mm256_max_epu16(temp, row25); \
+    temp = row26; row26 = _mm256_min_epu16(row26, row30); row30 = _mm256_max_epu16(temp, row30); \
+    temp = row27; row27 = _mm256_min_epu16(row27, row31); row31 = _mm256_max_epu16(temp, row31); \
+    temp = row28; row28 = _mm256_min_epu16(row28, row32); row32 = _mm256_max_epu16(temp, row32); \
+    temp = row29; row29 = _mm256_min_epu16(row29, row33); row33 = _mm256_max_epu16(temp, row33); \
+    temp = row34; row34 = _mm256_min_epu16(row34, row38); row38 = _mm256_max_epu16(temp, row38); \
+    temp = row35; row35 = _mm256_min_epu16(row35, row39); row39 = _mm256_max_epu16(temp, row39); \
+    temp = row36; row36 = _mm256_min_epu16(row36, row40); row40 = _mm256_max_epu16(temp, row40); \
+    temp = row37; row37 = _mm256_min_epu16(row37, row41); row41 = _mm256_max_epu16(temp, row41); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row23; row23 = _mm256_min_epu16(row23, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row26; row26 = _mm256_min_epu16(row26, row34); row34 = _mm256_max_epu16(temp, row34); \
+    temp = row27; row27 = _mm256_min_epu16(row27, row35); row35 = _mm256_max_epu16(temp, row35); \
+    temp = row28; row28 = _mm256_min_epu16(row28, row36); row36 = _mm256_max_epu16(temp, row36); \
+    temp = row29; row29 = _mm256_min_epu16(row29, row37); row37 = _mm256_max_epu16(temp, row37); \
+    temp = row30; row30 = _mm256_min_epu16(row30, row38); row38 = _mm256_max_epu16(temp, row38); \
+    temp = row31; row31 = _mm256_min_epu16(row31, row39); row39 = _mm256_max_epu16(temp, row39); \
+    temp = row32; row32 = _mm256_min_epu16(row32, row40); row40 = _mm256_max_epu16(temp, row40); \
+    temp = row33; row33 = _mm256_min_epu16(row33, row41); row41 = _mm256_max_epu16(temp, row41); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row27); row27 = _mm256_max_epu16(temp, row27); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row28); row28 = _mm256_max_epu16(temp, row28); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row29); row29 = _mm256_max_epu16(temp, row29); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row30); row30 = _mm256_max_epu16(temp, row30); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row31); row31 = _mm256_max_epu16(temp, row31); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row32); row32 = _mm256_max_epu16(temp, row32); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row33); row33 = _mm256_max_epu16(temp, row33); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row34); row34 = _mm256_max_epu16(temp, row34); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row35); row35 = _mm256_max_epu16(temp, row35); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row36); row36 = _mm256_max_epu16(temp, row36); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row37); row37 = _mm256_max_epu16(temp, row37); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row38); row38 = _mm256_max_epu16(temp, row38); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row39); row39 = _mm256_max_epu16(temp, row39); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row40); row40 = _mm256_max_epu16(temp, row40); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row41); row41 = _mm256_max_epu16(temp, row41); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row24; row24 = _mm256_min_epu16(row24, row25); row25 = _mm256_max_epu16(temp, row25); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row2); row2 = _mm256_max_epu16(temp, row2); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row22; row22 = _mm256_min_epu16(row22, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row25; row25 = _mm256_min_epu16(row25, row41); row41 = _mm256_max_epu16(temp, row41); \
+    temp = row27; row27 = _mm256_min_epu16(row27, row28); row28 = _mm256_max_epu16(temp, row28); \
+    temp = row29; row29 = _mm256_min_epu16(row29, row38); row38 = _mm256_max_epu16(temp, row38); \
+    temp = row30; row30 = _mm256_min_epu16(row30, row34); row34 = _mm256_max_epu16(temp, row34); \
+    temp = row31; row31 = _mm256_min_epu16(row31, row36); row36 = _mm256_max_epu16(temp, row36); \
+    temp = row32; row32 = _mm256_min_epu16(row32, row35); row35 = _mm256_max_epu16(temp, row35); \
+    temp = row33; row33 = _mm256_min_epu16(row33, row37); row37 = _mm256_max_epu16(temp, row37); \
+    temp = row39; row39 = _mm256_min_epu16(row39, row40); row40 = _mm256_max_epu16(temp, row40); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row27); row27 = _mm256_max_epu16(temp, row27); \
+    temp = row22; row22 = _mm256_min_epu16(row22, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row25; row25 = _mm256_min_epu16(row25, row37); row37 = _mm256_max_epu16(temp, row37); \
+    temp = row28; row28 = _mm256_min_epu16(row28, row34); row34 = _mm256_max_epu16(temp, row34); \
+    temp = row31; row31 = _mm256_min_epu16(row31, row32); row32 = _mm256_max_epu16(temp, row32); \
+    temp = row35; row35 = _mm256_min_epu16(row35, row36); row36 = _mm256_max_epu16(temp, row36); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row27); row27 = _mm256_max_epu16(temp, row27); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row29); row29 = _mm256_max_epu16(temp, row29); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row36); row36 = _mm256_max_epu16(temp, row36); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row30); row30 = _mm256_max_epu16(temp, row30); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row38); row38 = _mm256_max_epu16(temp, row38); \
+    temp = row22; row22 = _mm256_min_epu16(row22, row33); row33 = _mm256_max_epu16(temp, row33); \
+    temp = row24; row24 = _mm256_min_epu16(row24, row40); row40 = _mm256_max_epu16(temp, row40); \
+    temp = row25; row25 = _mm256_min_epu16(row25, row39); row39 = _mm256_max_epu16(temp, row39); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row30); row30 = _mm256_max_epu16(temp, row30); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row32); row32 = _mm256_max_epu16(temp, row32); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row34); row34 = _mm256_max_epu16(temp, row34); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row25); row25 = _mm256_max_epu16(temp, row25); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row27); row27 = _mm256_max_epu16(temp, row27); \
+    temp = row22; row22 = _mm256_min_epu16(row22, row31); row31 = _mm256_max_epu16(temp, row31); \
+    temp = row23; row23 = _mm256_min_epu16(row23, row35); row35 = _mm256_max_epu16(temp, row35); \
+    temp = row24; row24 = _mm256_min_epu16(row24, row33); row33 = _mm256_max_epu16(temp, row33); \
+    temp = row36; row36 = _mm256_min_epu16(row36, row38); row38 = _mm256_max_epu16(temp, row38); \
+    temp = row37; row37 = _mm256_min_epu16(row37, row40); row40 = _mm256_max_epu16(temp, row40); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row28); row28 = _mm256_max_epu16(temp, row28); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row30); row30 = _mm256_max_epu16(temp, row30); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row23; row23 = _mm256_min_epu16(row23, row29); row29 = _mm256_max_epu16(temp, row29); \
+    temp = row24; row24 = _mm256_min_epu16(row24, row25); row25 = _mm256_max_epu16(temp, row25); \
+    temp = row27; row27 = _mm256_min_epu16(row27, row32); row32 = _mm256_max_epu16(temp, row32); \
+    temp = row35; row35 = _mm256_min_epu16(row35, row39); row39 = _mm256_max_epu16(temp, row39); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row28); row28 = _mm256_max_epu16(temp, row28); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row34); row34 = _mm256_max_epu16(temp, row34); \
+    temp = row23; row23 = _mm256_min_epu16(row23, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row24; row24 = _mm256_min_epu16(row24, row31); row31 = _mm256_max_epu16(temp, row31); \
+    temp = row25; row25 = _mm256_min_epu16(row25, row35); row35 = _mm256_max_epu16(temp, row35); \
+    temp = row29; row29 = _mm256_min_epu16(row29, row30); row30 = _mm256_max_epu16(temp, row30); \
+    temp = row32; row32 = _mm256_min_epu16(row32, row36); row36 = _mm256_max_epu16(temp, row36); \
+    temp = row33; row33 = _mm256_min_epu16(row33, row39); row39 = _mm256_max_epu16(temp, row39); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row23; row23 = _mm256_min_epu16(row23, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row27; row27 = _mm256_min_epu16(row27, row28); row28 = _mm256_max_epu16(temp, row28); \
+    temp = row29; row29 = _mm256_min_epu16(row29, row31); row31 = _mm256_max_epu16(temp, row31); \
+    temp = row30; row30 = _mm256_min_epu16(row30, row34); row34 = _mm256_max_epu16(temp, row34); \
+    temp = row33; row33 = _mm256_min_epu16(row33, row37); row37 = _mm256_max_epu16(temp, row37); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row29); row29 = _mm256_max_epu16(temp, row29); \
+    temp = row24; row24 = _mm256_min_epu16(row24, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row25; row25 = _mm256_min_epu16(row25, row30); row30 = _mm256_max_epu16(temp, row30); \
+    temp = row31; row31 = _mm256_min_epu16(row31, row32); row32 = _mm256_max_epu16(temp, row32); \
+    temp = row33; row33 = _mm256_min_epu16(row33, row35); row35 = _mm256_max_epu16(temp, row35); \
+    temp = row37; row37 = _mm256_min_epu16(row37, row39); row39 = _mm256_max_epu16(temp, row39); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row22; row22 = _mm256_min_epu16(row22, row29); row29 = _mm256_max_epu16(temp, row29); \
+    temp = row24; row24 = _mm256_min_epu16(row24, row27); row27 = _mm256_max_epu16(temp, row27); \
+    temp = row25; row25 = _mm256_min_epu16(row25, row31); row31 = _mm256_max_epu16(temp, row31); \
+    temp = row26; row26 = _mm256_min_epu16(row26, row28); row28 = _mm256_max_epu16(temp, row28); \
+    temp = row32; row32 = _mm256_min_epu16(row32, row34); row34 = _mm256_max_epu16(temp, row34); \
+    temp = row33; row33 = _mm256_min_epu16(row33, row36); row36 = _mm256_max_epu16(temp, row36); \
+    temp = row35; row35 = _mm256_min_epu16(row35, row38); row38 = _mm256_max_epu16(temp, row38); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row22; row22 = _mm256_min_epu16(row22, row27); row27 = _mm256_max_epu16(temp, row27); \
+    temp = row28; row28 = _mm256_min_epu16(row28, row29); row29 = _mm256_max_epu16(temp, row29); \
+    temp = row30; row30 = _mm256_min_epu16(row30, row33); row33 = _mm256_max_epu16(temp, row33); \
+    temp = row34; row34 = _mm256_min_epu16(row34, row35); row35 = _mm256_max_epu16(temp, row35); \
+    temp = row37; row37 = _mm256_min_epu16(row37, row38); row38 = _mm256_max_epu16(temp, row38); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row23; row23 = _mm256_min_epu16(row23, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row25; row25 = _mm256_min_epu16(row25, row27); row27 = _mm256_max_epu16(temp, row27); \
+    temp = row26; row26 = _mm256_min_epu16(row26, row28); row28 = _mm256_max_epu16(temp, row28); \
+    temp = row29; row29 = _mm256_min_epu16(row29, row31); row31 = _mm256_max_epu16(temp, row31); \
+    temp = row30; row30 = _mm256_min_epu16(row30, row32); row32 = _mm256_max_epu16(temp, row32); \
+    temp = row33; row33 = _mm256_min_epu16(row33, row34); row34 = _mm256_max_epu16(temp, row34); \
+    temp = row35; row35 = _mm256_min_epu16(row35, row36); row36 = _mm256_max_epu16(temp, row36); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row22; row22 = _mm256_min_epu16(row22, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row25; row25 = _mm256_min_epu16(row25, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row27; row27 = _mm256_min_epu16(row27, row28); row28 = _mm256_max_epu16(temp, row28); \
+    temp = row29; row29 = _mm256_min_epu16(row29, row30); row30 = _mm256_max_epu16(temp, row30); \
+    temp = row31; row31 = _mm256_min_epu16(row31, row32); row32 = _mm256_max_epu16(temp, row32); \
+    temp = row34; row34 = _mm256_min_epu16(row34, row35); row35 = _mm256_max_epu16(temp, row35); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row22; row22 = _mm256_min_epu16(row22, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row24; row24 = _mm256_min_epu16(row24, row25); row25 = _mm256_max_epu16(temp, row25); \
+    temp = row26; row26 = _mm256_min_epu16(row26, row27); row27 = _mm256_max_epu16(temp, row27); \
+    temp = row28; row28 = _mm256_min_epu16(row28, row29); row29 = _mm256_max_epu16(temp, row29); \
+    temp = row30; row30 = _mm256_min_epu16(row30, row31); row31 = _mm256_max_epu16(temp, row31); \
+    temp = row32; row32 = _mm256_min_epu16(row32, row33); row33 = _mm256_max_epu16(temp, row33); \
+} while (0)
+
+#define _MM256_SORT42_PS( \
+    row0, row1, row2, row3, row4, row5, row6, row7, row8, row9, \
+    row10, row11, row12, row13, row14, row15, row16, row17, row18, row19, \
+    row20, row21, row22, row23, row24, row25, row26, row27, row28, row29, \
+    row30, row31, row32, row33, row34, row35, row36, row37, row38, row39, \
+    row40, row41 \
+) do { \
+    __m256 temp = row0; row0 = _mm256_min_ps(row0, row1); row1 = _mm256_max_ps(temp, row1); \
+    temp = row2; row2 = _mm256_min_ps(row2, row3); row3 = _mm256_max_ps(temp, row3); \
+    temp = row4; row4 = _mm256_min_ps(row4, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row6; row6 = _mm256_min_ps(row6, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row8; row8 = _mm256_min_ps(row8, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row10; row10 = _mm256_min_ps(row10, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row12; row12 = _mm256_min_ps(row12, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row14; row14 = _mm256_min_ps(row14, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row16; row16 = _mm256_min_ps(row16, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row18; row18 = _mm256_min_ps(row18, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row20; row20 = _mm256_min_ps(row20, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row22; row22 = _mm256_min_ps(row22, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row24; row24 = _mm256_min_ps(row24, row25); row25 = _mm256_max_ps(temp, row25); \
+    temp = row26; row26 = _mm256_min_ps(row26, row27); row27 = _mm256_max_ps(temp, row27); \
+    temp = row28; row28 = _mm256_min_ps(row28, row29); row29 = _mm256_max_ps(temp, row29); \
+    temp = row30; row30 = _mm256_min_ps(row30, row31); row31 = _mm256_max_ps(temp, row31); \
+    temp = row32; row32 = _mm256_min_ps(row32, row33); row33 = _mm256_max_ps(temp, row33); \
+    temp = row34; row34 = _mm256_min_ps(row34, row35); row35 = _mm256_max_ps(temp, row35); \
+    temp = row36; row36 = _mm256_min_ps(row36, row37); row37 = _mm256_max_ps(temp, row37); \
+    temp = row38; row38 = _mm256_min_ps(row38, row39); row39 = _mm256_max_ps(temp, row39); \
+    temp = row40; row40 = _mm256_min_ps(row40, row41); row41 = _mm256_max_ps(temp, row41); \
+    temp = row0; row0 = _mm256_min_ps(row0, row2); row2 = _mm256_max_ps(temp, row2); \
+    temp = row1; row1 = _mm256_min_ps(row1, row3); row3 = _mm256_max_ps(temp, row3); \
+    temp = row4; row4 = _mm256_min_ps(row4, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row5; row5 = _mm256_min_ps(row5, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row8; row8 = _mm256_min_ps(row8, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row9; row9 = _mm256_min_ps(row9, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row12; row12 = _mm256_min_ps(row12, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row13; row13 = _mm256_min_ps(row13, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row16; row16 = _mm256_min_ps(row16, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row17; row17 = _mm256_min_ps(row17, row25); row25 = _mm256_max_ps(temp, row25); \
+    temp = row18; row18 = _mm256_min_ps(row18, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row19; row19 = _mm256_min_ps(row19, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row26; row26 = _mm256_min_ps(row26, row28); row28 = _mm256_max_ps(temp, row28); \
+    temp = row27; row27 = _mm256_min_ps(row27, row29); row29 = _mm256_max_ps(temp, row29); \
+    temp = row30; row30 = _mm256_min_ps(row30, row32); row32 = _mm256_max_ps(temp, row32); \
+    temp = row31; row31 = _mm256_min_ps(row31, row33); row33 = _mm256_max_ps(temp, row33); \
+    temp = row34; row34 = _mm256_min_ps(row34, row36); row36 = _mm256_max_ps(temp, row36); \
+    temp = row35; row35 = _mm256_min_ps(row35, row37); row37 = _mm256_max_ps(temp, row37); \
+    temp = row38; row38 = _mm256_min_ps(row38, row40); row40 = _mm256_max_ps(temp, row40); \
+    temp = row39; row39 = _mm256_min_ps(row39, row41); row41 = _mm256_max_ps(temp, row41); \
+    temp = row0; row0 = _mm256_min_ps(row0, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row1; row1 = _mm256_min_ps(row1, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row2; row2 = _mm256_min_ps(row2, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row3; row3 = _mm256_min_ps(row3, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row8; row8 = _mm256_min_ps(row8, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row9; row9 = _mm256_min_ps(row9, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row10; row10 = _mm256_min_ps(row10, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row11; row11 = _mm256_min_ps(row11, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row16; row16 = _mm256_min_ps(row16, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row17; row17 = _mm256_min_ps(row17, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row19; row19 = _mm256_min_ps(row19, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row21; row21 = _mm256_min_ps(row21, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row23; row23 = _mm256_min_ps(row23, row25); row25 = _mm256_max_ps(temp, row25); \
+    temp = row26; row26 = _mm256_min_ps(row26, row30); row30 = _mm256_max_ps(temp, row30); \
+    temp = row27; row27 = _mm256_min_ps(row27, row31); row31 = _mm256_max_ps(temp, row31); \
+    temp = row28; row28 = _mm256_min_ps(row28, row32); row32 = _mm256_max_ps(temp, row32); \
+    temp = row29; row29 = _mm256_min_ps(row29, row33); row33 = _mm256_max_ps(temp, row33); \
+    temp = row34; row34 = _mm256_min_ps(row34, row38); row38 = _mm256_max_ps(temp, row38); \
+    temp = row35; row35 = _mm256_min_ps(row35, row39); row39 = _mm256_max_ps(temp, row39); \
+    temp = row36; row36 = _mm256_min_ps(row36, row40); row40 = _mm256_max_ps(temp, row40); \
+    temp = row37; row37 = _mm256_min_ps(row37, row41); row41 = _mm256_max_ps(temp, row41); \
+    temp = row0; row0 = _mm256_min_ps(row0, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row1; row1 = _mm256_min_ps(row1, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row2; row2 = _mm256_min_ps(row2, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row3; row3 = _mm256_min_ps(row3, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row4; row4 = _mm256_min_ps(row4, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row5; row5 = _mm256_min_ps(row5, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row6; row6 = _mm256_min_ps(row6, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row7; row7 = _mm256_min_ps(row7, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row17; row17 = _mm256_min_ps(row17, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row19; row19 = _mm256_min_ps(row19, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row20; row20 = _mm256_min_ps(row20, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row23; row23 = _mm256_min_ps(row23, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row26; row26 = _mm256_min_ps(row26, row34); row34 = _mm256_max_ps(temp, row34); \
+    temp = row27; row27 = _mm256_min_ps(row27, row35); row35 = _mm256_max_ps(temp, row35); \
+    temp = row28; row28 = _mm256_min_ps(row28, row36); row36 = _mm256_max_ps(temp, row36); \
+    temp = row29; row29 = _mm256_min_ps(row29, row37); row37 = _mm256_max_ps(temp, row37); \
+    temp = row30; row30 = _mm256_min_ps(row30, row38); row38 = _mm256_max_ps(temp, row38); \
+    temp = row31; row31 = _mm256_min_ps(row31, row39); row39 = _mm256_max_ps(temp, row39); \
+    temp = row32; row32 = _mm256_min_ps(row32, row40); row40 = _mm256_max_ps(temp, row40); \
+    temp = row33; row33 = _mm256_min_ps(row33, row41); row41 = _mm256_max_ps(temp, row41); \
+    temp = row0; row0 = _mm256_min_ps(row0, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row1; row1 = _mm256_min_ps(row1, row27); row27 = _mm256_max_ps(temp, row27); \
+    temp = row2; row2 = _mm256_min_ps(row2, row28); row28 = _mm256_max_ps(temp, row28); \
+    temp = row3; row3 = _mm256_min_ps(row3, row29); row29 = _mm256_max_ps(temp, row29); \
+    temp = row4; row4 = _mm256_min_ps(row4, row30); row30 = _mm256_max_ps(temp, row30); \
+    temp = row5; row5 = _mm256_min_ps(row5, row31); row31 = _mm256_max_ps(temp, row31); \
+    temp = row6; row6 = _mm256_min_ps(row6, row32); row32 = _mm256_max_ps(temp, row32); \
+    temp = row7; row7 = _mm256_min_ps(row7, row33); row33 = _mm256_max_ps(temp, row33); \
+    temp = row8; row8 = _mm256_min_ps(row8, row34); row34 = _mm256_max_ps(temp, row34); \
+    temp = row9; row9 = _mm256_min_ps(row9, row35); row35 = _mm256_max_ps(temp, row35); \
+    temp = row10; row10 = _mm256_min_ps(row10, row36); row36 = _mm256_max_ps(temp, row36); \
+    temp = row11; row11 = _mm256_min_ps(row11, row37); row37 = _mm256_max_ps(temp, row37); \
+    temp = row12; row12 = _mm256_min_ps(row12, row38); row38 = _mm256_max_ps(temp, row38); \
+    temp = row13; row13 = _mm256_min_ps(row13, row39); row39 = _mm256_max_ps(temp, row39); \
+    temp = row14; row14 = _mm256_min_ps(row14, row40); row40 = _mm256_max_ps(temp, row40); \
+    temp = row15; row15 = _mm256_min_ps(row15, row41); row41 = _mm256_max_ps(temp, row41); \
+    temp = row16; row16 = _mm256_min_ps(row16, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row18; row18 = _mm256_min_ps(row18, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row21; row21 = _mm256_min_ps(row21, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row24; row24 = _mm256_min_ps(row24, row25); row25 = _mm256_max_ps(temp, row25); \
+    temp = row0; row0 = _mm256_min_ps(row0, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row1; row1 = _mm256_min_ps(row1, row2); row2 = _mm256_max_ps(temp, row2); \
+    temp = row3; row3 = _mm256_min_ps(row3, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row4; row4 = _mm256_min_ps(row4, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row5; row5 = _mm256_min_ps(row5, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row6; row6 = _mm256_min_ps(row6, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row7; row7 = _mm256_min_ps(row7, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row13; row13 = _mm256_min_ps(row13, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row17; row17 = _mm256_min_ps(row17, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row20; row20 = _mm256_min_ps(row20, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row22; row22 = _mm256_min_ps(row22, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row25; row25 = _mm256_min_ps(row25, row41); row41 = _mm256_max_ps(temp, row41); \
+    temp = row27; row27 = _mm256_min_ps(row27, row28); row28 = _mm256_max_ps(temp, row28); \
+    temp = row29; row29 = _mm256_min_ps(row29, row38); row38 = _mm256_max_ps(temp, row38); \
+    temp = row30; row30 = _mm256_min_ps(row30, row34); row34 = _mm256_max_ps(temp, row34); \
+    temp = row31; row31 = _mm256_min_ps(row31, row36); row36 = _mm256_max_ps(temp, row36); \
+    temp = row32; row32 = _mm256_min_ps(row32, row35); row35 = _mm256_max_ps(temp, row35); \
+    temp = row33; row33 = _mm256_min_ps(row33, row37); row37 = _mm256_max_ps(temp, row37); \
+    temp = row39; row39 = _mm256_min_ps(row39, row40); row40 = _mm256_max_ps(temp, row40); \
+    temp = row4; row4 = _mm256_min_ps(row4, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row5; row5 = _mm256_min_ps(row5, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row7; row7 = _mm256_min_ps(row7, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row9; row9 = _mm256_min_ps(row9, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row14; row14 = _mm256_min_ps(row14, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row15; row15 = _mm256_min_ps(row15, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row17; row17 = _mm256_min_ps(row17, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row18; row18 = _mm256_min_ps(row18, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row20; row20 = _mm256_min_ps(row20, row27); row27 = _mm256_max_ps(temp, row27); \
+    temp = row22; row22 = _mm256_min_ps(row22, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row25; row25 = _mm256_min_ps(row25, row37); row37 = _mm256_max_ps(temp, row37); \
+    temp = row28; row28 = _mm256_min_ps(row28, row34); row34 = _mm256_max_ps(temp, row34); \
+    temp = row31; row31 = _mm256_min_ps(row31, row32); row32 = _mm256_max_ps(temp, row32); \
+    temp = row35; row35 = _mm256_min_ps(row35, row36); row36 = _mm256_max_ps(temp, row36); \
+    temp = row1; row1 = _mm256_min_ps(row1, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row2; row2 = _mm256_min_ps(row2, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row3; row3 = _mm256_min_ps(row3, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row5; row5 = _mm256_min_ps(row5, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row8; row8 = _mm256_min_ps(row8, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row11; row11 = _mm256_min_ps(row11, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row12; row12 = _mm256_min_ps(row12, row27); row27 = _mm256_max_ps(temp, row27); \
+    temp = row14; row14 = _mm256_min_ps(row14, row29); row29 = _mm256_max_ps(temp, row29); \
+    temp = row15; row15 = _mm256_min_ps(row15, row36); row36 = _mm256_max_ps(temp, row36); \
+    temp = row18; row18 = _mm256_min_ps(row18, row30); row30 = _mm256_max_ps(temp, row30); \
+    temp = row21; row21 = _mm256_min_ps(row21, row38); row38 = _mm256_max_ps(temp, row38); \
+    temp = row22; row22 = _mm256_min_ps(row22, row33); row33 = _mm256_max_ps(temp, row33); \
+    temp = row24; row24 = _mm256_min_ps(row24, row40); row40 = _mm256_max_ps(temp, row40); \
+    temp = row25; row25 = _mm256_min_ps(row25, row39); row39 = _mm256_max_ps(temp, row39); \
+    temp = row1; row1 = _mm256_min_ps(row1, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row3; row3 = _mm256_min_ps(row3, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row6; row6 = _mm256_min_ps(row6, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row7; row7 = _mm256_min_ps(row7, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row8; row8 = _mm256_min_ps(row8, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row9; row9 = _mm256_min_ps(row9, row30); row30 = _mm256_max_ps(temp, row30); \
+    temp = row10; row10 = _mm256_min_ps(row10, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row11; row11 = _mm256_min_ps(row11, row32); row32 = _mm256_max_ps(temp, row32); \
+    temp = row14; row14 = _mm256_min_ps(row14, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row15; row15 = _mm256_min_ps(row15, row34); row34 = _mm256_max_ps(temp, row34); \
+    temp = row16; row16 = _mm256_min_ps(row16, row25); row25 = _mm256_max_ps(temp, row25); \
+    temp = row21; row21 = _mm256_min_ps(row21, row27); row27 = _mm256_max_ps(temp, row27); \
+    temp = row22; row22 = _mm256_min_ps(row22, row31); row31 = _mm256_max_ps(temp, row31); \
+    temp = row23; row23 = _mm256_min_ps(row23, row35); row35 = _mm256_max_ps(temp, row35); \
+    temp = row24; row24 = _mm256_min_ps(row24, row33); row33 = _mm256_max_ps(temp, row33); \
+    temp = row36; row36 = _mm256_min_ps(row36, row38); row38 = _mm256_max_ps(temp, row38); \
+    temp = row37; row37 = _mm256_min_ps(row37, row40); row40 = _mm256_max_ps(temp, row40); \
+    temp = row2; row2 = _mm256_min_ps(row2, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row9; row9 = _mm256_min_ps(row9, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row11; row11 = _mm256_min_ps(row11, row28); row28 = _mm256_max_ps(temp, row28); \
+    temp = row12; row12 = _mm256_min_ps(row12, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row13; row13 = _mm256_min_ps(row13, row30); row30 = _mm256_max_ps(temp, row30); \
+    temp = row16; row16 = _mm256_min_ps(row16, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row19; row19 = _mm256_min_ps(row19, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row20; row20 = _mm256_min_ps(row20, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row23; row23 = _mm256_min_ps(row23, row29); row29 = _mm256_max_ps(temp, row29); \
+    temp = row24; row24 = _mm256_min_ps(row24, row25); row25 = _mm256_max_ps(temp, row25); \
+    temp = row27; row27 = _mm256_min_ps(row27, row32); row32 = _mm256_max_ps(temp, row32); \
+    temp = row35; row35 = _mm256_min_ps(row35, row39); row39 = _mm256_max_ps(temp, row39); \
+    temp = row2; row2 = _mm256_min_ps(row2, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row5; row5 = _mm256_min_ps(row5, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row6; row6 = _mm256_min_ps(row6, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row7; row7 = _mm256_min_ps(row7, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row10; row10 = _mm256_min_ps(row10, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row11; row11 = _mm256_min_ps(row11, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row13; row13 = _mm256_min_ps(row13, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row15; row15 = _mm256_min_ps(row15, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row19; row19 = _mm256_min_ps(row19, row28); row28 = _mm256_max_ps(temp, row28); \
+    temp = row21; row21 = _mm256_min_ps(row21, row34); row34 = _mm256_max_ps(temp, row34); \
+    temp = row23; row23 = _mm256_min_ps(row23, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row24; row24 = _mm256_min_ps(row24, row31); row31 = _mm256_max_ps(temp, row31); \
+    temp = row25; row25 = _mm256_min_ps(row25, row35); row35 = _mm256_max_ps(temp, row35); \
+    temp = row29; row29 = _mm256_min_ps(row29, row30); row30 = _mm256_max_ps(temp, row30); \
+    temp = row32; row32 = _mm256_min_ps(row32, row36); row36 = _mm256_max_ps(temp, row36); \
+    temp = row33; row33 = _mm256_min_ps(row33, row39); row39 = _mm256_max_ps(temp, row39); \
+    temp = row4; row4 = _mm256_min_ps(row4, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row7; row7 = _mm256_min_ps(row7, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row10; row10 = _mm256_min_ps(row10, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row13; row13 = _mm256_min_ps(row13, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row17; row17 = _mm256_min_ps(row17, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row23; row23 = _mm256_min_ps(row23, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row27; row27 = _mm256_min_ps(row27, row28); row28 = _mm256_max_ps(temp, row28); \
+    temp = row29; row29 = _mm256_min_ps(row29, row31); row31 = _mm256_max_ps(temp, row31); \
+    temp = row30; row30 = _mm256_min_ps(row30, row34); row34 = _mm256_max_ps(temp, row34); \
+    temp = row33; row33 = _mm256_min_ps(row33, row37); row37 = _mm256_max_ps(temp, row37); \
+    temp = row2; row2 = _mm256_min_ps(row2, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row6; row6 = _mm256_min_ps(row6, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row9; row9 = _mm256_min_ps(row9, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row11; row11 = _mm256_min_ps(row11, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row12; row12 = _mm256_min_ps(row12, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row15; row15 = _mm256_min_ps(row15, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row18; row18 = _mm256_min_ps(row18, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row19; row19 = _mm256_min_ps(row19, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row21; row21 = _mm256_min_ps(row21, row29); row29 = _mm256_max_ps(temp, row29); \
+    temp = row24; row24 = _mm256_min_ps(row24, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row25; row25 = _mm256_min_ps(row25, row30); row30 = _mm256_max_ps(temp, row30); \
+    temp = row31; row31 = _mm256_min_ps(row31, row32); row32 = _mm256_max_ps(temp, row32); \
+    temp = row33; row33 = _mm256_min_ps(row33, row35); row35 = _mm256_max_ps(temp, row35); \
+    temp = row37; row37 = _mm256_min_ps(row37, row39); row39 = _mm256_max_ps(temp, row39); \
+    temp = row3; row3 = _mm256_min_ps(row3, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row5; row5 = _mm256_min_ps(row5, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row7; row7 = _mm256_min_ps(row7, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row10; row10 = _mm256_min_ps(row10, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row12; row12 = _mm256_min_ps(row12, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row13; row13 = _mm256_min_ps(row13, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row14; row14 = _mm256_min_ps(row14, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row18; row18 = _mm256_min_ps(row18, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row20; row20 = _mm256_min_ps(row20, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row22; row22 = _mm256_min_ps(row22, row29); row29 = _mm256_max_ps(temp, row29); \
+    temp = row24; row24 = _mm256_min_ps(row24, row27); row27 = _mm256_max_ps(temp, row27); \
+    temp = row25; row25 = _mm256_min_ps(row25, row31); row31 = _mm256_max_ps(temp, row31); \
+    temp = row26; row26 = _mm256_min_ps(row26, row28); row28 = _mm256_max_ps(temp, row28); \
+    temp = row32; row32 = _mm256_min_ps(row32, row34); row34 = _mm256_max_ps(temp, row34); \
+    temp = row33; row33 = _mm256_min_ps(row33, row36); row36 = _mm256_max_ps(temp, row36); \
+    temp = row35; row35 = _mm256_min_ps(row35, row38); row38 = _mm256_max_ps(temp, row38); \
+    temp = row3; row3 = _mm256_min_ps(row3, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row6; row6 = _mm256_min_ps(row6, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row8; row8 = _mm256_min_ps(row8, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row12; row12 = _mm256_min_ps(row12, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row14; row14 = _mm256_min_ps(row14, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row15; row15 = _mm256_min_ps(row15, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row17; row17 = _mm256_min_ps(row17, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row18; row18 = _mm256_min_ps(row18, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row21; row21 = _mm256_min_ps(row21, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row22; row22 = _mm256_min_ps(row22, row27); row27 = _mm256_max_ps(temp, row27); \
+    temp = row28; row28 = _mm256_min_ps(row28, row29); row29 = _mm256_max_ps(temp, row29); \
+    temp = row30; row30 = _mm256_min_ps(row30, row33); row33 = _mm256_max_ps(temp, row33); \
+    temp = row34; row34 = _mm256_min_ps(row34, row35); row35 = _mm256_max_ps(temp, row35); \
+    temp = row37; row37 = _mm256_min_ps(row37, row38); row38 = _mm256_max_ps(temp, row38); \
+    temp = row5; row5 = _mm256_min_ps(row5, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row7; row7 = _mm256_min_ps(row7, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row9; row9 = _mm256_min_ps(row9, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row10; row10 = _mm256_min_ps(row10, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row13; row13 = _mm256_min_ps(row13, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row14; row14 = _mm256_min_ps(row14, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row17; row17 = _mm256_min_ps(row17, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row19; row19 = _mm256_min_ps(row19, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row21; row21 = _mm256_min_ps(row21, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row23; row23 = _mm256_min_ps(row23, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row25; row25 = _mm256_min_ps(row25, row27); row27 = _mm256_max_ps(temp, row27); \
+    temp = row26; row26 = _mm256_min_ps(row26, row28); row28 = _mm256_max_ps(temp, row28); \
+    temp = row29; row29 = _mm256_min_ps(row29, row31); row31 = _mm256_max_ps(temp, row31); \
+    temp = row30; row30 = _mm256_min_ps(row30, row32); row32 = _mm256_max_ps(temp, row32); \
+    temp = row33; row33 = _mm256_min_ps(row33, row34); row34 = _mm256_max_ps(temp, row34); \
+    temp = row35; row35 = _mm256_min_ps(row35, row36); row36 = _mm256_max_ps(temp, row36); \
+    temp = row6; row6 = _mm256_min_ps(row6, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row9; row9 = _mm256_min_ps(row9, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row11; row11 = _mm256_min_ps(row11, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row13; row13 = _mm256_min_ps(row13, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row15; row15 = _mm256_min_ps(row15, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row17; row17 = _mm256_min_ps(row17, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row18; row18 = _mm256_min_ps(row18, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row21; row21 = _mm256_min_ps(row21, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row22; row22 = _mm256_min_ps(row22, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row25; row25 = _mm256_min_ps(row25, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row27; row27 = _mm256_min_ps(row27, row28); row28 = _mm256_max_ps(temp, row28); \
+    temp = row29; row29 = _mm256_min_ps(row29, row30); row30 = _mm256_max_ps(temp, row30); \
+    temp = row31; row31 = _mm256_min_ps(row31, row32); row32 = _mm256_max_ps(temp, row32); \
+    temp = row34; row34 = _mm256_min_ps(row34, row35); row35 = _mm256_max_ps(temp, row35); \
+    temp = row8; row8 = _mm256_min_ps(row8, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row10; row10 = _mm256_min_ps(row10, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row12; row12 = _mm256_min_ps(row12, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row14; row14 = _mm256_min_ps(row14, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row16; row16 = _mm256_min_ps(row16, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row18; row18 = _mm256_min_ps(row18, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row20; row20 = _mm256_min_ps(row20, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row22; row22 = _mm256_min_ps(row22, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row24; row24 = _mm256_min_ps(row24, row25); row25 = _mm256_max_ps(temp, row25); \
+    temp = row26; row26 = _mm256_min_ps(row26, row27); row27 = _mm256_max_ps(temp, row27); \
+    temp = row28; row28 = _mm256_min_ps(row28, row29); row29 = _mm256_max_ps(temp, row29); \
+    temp = row30; row30 = _mm256_min_ps(row30, row31); row31 = _mm256_max_ps(temp, row31); \
+    temp = row32; row32 = _mm256_min_ps(row32, row33); row33 = _mm256_max_ps(temp, row33); \
+} while (0)
+
+#define _MM256_SORT49_EPU8( \
+    row0, row1, row2, row3, row4, row5, row6, row7, row8, row9, \
+    row10, row11, row12, row13, row14, row15, row16, row17, row18, row19, \
+    row20, row21, row22, row23, row24, row25, row26, row27, row28, row29, \
+    row30, row31, row32, row33, row34, row35, row36, row37, row38, row39, \
+    row40, row41, row42, row43, row44, row45, row46, row47, row48 \
+) do { \
+    __m256i temp = row0; row0 = _mm256_min_epu8(row0, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row24; row24 = _mm256_min_epu8(row24, row32); row32 = _mm256_max_epu8(temp, row32); \
+    temp = row25; row25 = _mm256_min_epu8(row25, row31); row31 = _mm256_max_epu8(temp, row31); \
+    temp = row26; row26 = _mm256_min_epu8(row26, row30); row30 = _mm256_max_epu8(temp, row30); \
+    temp = row27; row27 = _mm256_min_epu8(row27, row35); row35 = _mm256_max_epu8(temp, row35); \
+    temp = row28; row28 = _mm256_min_epu8(row28, row34); row34 = _mm256_max_epu8(temp, row34); \
+    temp = row29; row29 = _mm256_min_epu8(row29, row33); row33 = _mm256_max_epu8(temp, row33); \
+    temp = row36; row36 = _mm256_min_epu8(row36, row48); row48 = _mm256_max_epu8(temp, row48); \
+    temp = row37; row37 = _mm256_min_epu8(row37, row46); row46 = _mm256_max_epu8(temp, row46); \
+    temp = row38; row38 = _mm256_min_epu8(row38, row45); row45 = _mm256_max_epu8(temp, row45); \
+    temp = row39; row39 = _mm256_min_epu8(row39, row43); row43 = _mm256_max_epu8(temp, row43); \
+    temp = row41; row41 = _mm256_min_epu8(row41, row47); row47 = _mm256_max_epu8(temp, row47); \
+    temp = row42; row42 = _mm256_min_epu8(row42, row44); row44 = _mm256_max_epu8(temp, row44); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row1); row1 = _mm256_max_epu8(temp, row1); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row22; row22 = _mm256_min_epu8(row22, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row24; row24 = _mm256_min_epu8(row24, row25); row25 = _mm256_max_epu8(temp, row25); \
+    temp = row26; row26 = _mm256_min_epu8(row26, row29); row29 = _mm256_max_epu8(temp, row29); \
+    temp = row27; row27 = _mm256_min_epu8(row27, row28); row28 = _mm256_max_epu8(temp, row28); \
+    temp = row30; row30 = _mm256_min_epu8(row30, row33); row33 = _mm256_max_epu8(temp, row33); \
+    temp = row31; row31 = _mm256_min_epu8(row31, row32); row32 = _mm256_max_epu8(temp, row32); \
+    temp = row34; row34 = _mm256_min_epu8(row34, row35); row35 = _mm256_max_epu8(temp, row35); \
+    temp = row37; row37 = _mm256_min_epu8(row37, row42); row42 = _mm256_max_epu8(temp, row42); \
+    temp = row38; row38 = _mm256_min_epu8(row38, row39); row39 = _mm256_max_epu8(temp, row39); \
+    temp = row40; row40 = _mm256_min_epu8(row40, row47); row47 = _mm256_max_epu8(temp, row47); \
+    temp = row43; row43 = _mm256_min_epu8(row43, row45); row45 = _mm256_max_epu8(temp, row45); \
+    temp = row44; row44 = _mm256_min_epu8(row44, row46); row46 = _mm256_max_epu8(temp, row46); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row2); row2 = _mm256_max_epu8(temp, row2); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row24; row24 = _mm256_min_epu8(row24, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row25; row25 = _mm256_min_epu8(row25, row30); row30 = _mm256_max_epu8(temp, row30); \
+    temp = row29; row29 = _mm256_min_epu8(row29, row34); row34 = _mm256_max_epu8(temp, row34); \
+    temp = row33; row33 = _mm256_min_epu8(row33, row35); row35 = _mm256_max_epu8(temp, row35); \
+    temp = row36; row36 = _mm256_min_epu8(row36, row40); row40 = _mm256_max_epu8(temp, row40); \
+    temp = row37; row37 = _mm256_min_epu8(row37, row38); row38 = _mm256_max_epu8(temp, row38); \
+    temp = row39; row39 = _mm256_min_epu8(row39, row42); row42 = _mm256_max_epu8(temp, row42); \
+    temp = row43; row43 = _mm256_min_epu8(row43, row44); row44 = _mm256_max_epu8(temp, row44); \
+    temp = row45; row45 = _mm256_min_epu8(row45, row46); row46 = _mm256_max_epu8(temp, row46); \
+    temp = row47; row47 = _mm256_min_epu8(row47, row48); row48 = _mm256_max_epu8(temp, row48); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row3); row3 = _mm256_max_epu8(temp, row3); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row2); row2 = _mm256_max_epu8(temp, row2); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row11); row11 = _mm256_max_epu8(temp, row11); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row24; row24 = _mm256_min_epu8(row24, row27); row27 = _mm256_max_epu8(temp, row27); \
+    temp = row25; row25 = _mm256_min_epu8(row25, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row28; row28 = _mm256_min_epu8(row28, row30); row30 = _mm256_max_epu8(temp, row30); \
+    temp = row29; row29 = _mm256_min_epu8(row29, row31); row31 = _mm256_max_epu8(temp, row31); \
+    temp = row32; row32 = _mm256_min_epu8(row32, row35); row35 = _mm256_max_epu8(temp, row35); \
+    temp = row33; row33 = _mm256_min_epu8(row33, row34); row34 = _mm256_max_epu8(temp, row34); \
+    temp = row40; row40 = _mm256_min_epu8(row40, row42); row42 = _mm256_max_epu8(temp, row42); \
+    temp = row41; row41 = _mm256_min_epu8(row41, row45); row45 = _mm256_max_epu8(temp, row45); \
+    temp = row44; row44 = _mm256_min_epu8(row44, row47); row47 = _mm256_max_epu8(temp, row47); \
+    temp = row46; row46 = _mm256_min_epu8(row46, row48); row48 = _mm256_max_epu8(temp, row48); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row23); row23 = _mm256_max_epu8(temp, row23); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row25; row25 = _mm256_min_epu8(row25, row28); row28 = _mm256_max_epu8(temp, row28); \
+    temp = row27; row27 = _mm256_min_epu8(row27, row29); row29 = _mm256_max_epu8(temp, row29); \
+    temp = row30; row30 = _mm256_min_epu8(row30, row32); row32 = _mm256_max_epu8(temp, row32); \
+    temp = row31; row31 = _mm256_min_epu8(row31, row34); row34 = _mm256_max_epu8(temp, row34); \
+    temp = row36; row36 = _mm256_min_epu8(row36, row41); row41 = _mm256_max_epu8(temp, row41); \
+    temp = row39; row39 = _mm256_min_epu8(row39, row44); row44 = _mm256_max_epu8(temp, row44); \
+    temp = row40; row40 = _mm256_min_epu8(row40, row43); row43 = _mm256_max_epu8(temp, row43); \
+    temp = row42; row42 = _mm256_min_epu8(row42, row47); row47 = _mm256_max_epu8(temp, row47); \
+    temp = row45; row45 = _mm256_min_epu8(row45, row46); row46 = _mm256_max_epu8(temp, row46); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row3); row3 = _mm256_max_epu8(temp, row3); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row25; row25 = _mm256_min_epu8(row25, row27); row27 = _mm256_max_epu8(temp, row27); \
+    temp = row26; row26 = _mm256_min_epu8(row26, row29); row29 = _mm256_max_epu8(temp, row29); \
+    temp = row30; row30 = _mm256_min_epu8(row30, row33); row33 = _mm256_max_epu8(temp, row33); \
+    temp = row32; row32 = _mm256_min_epu8(row32, row34); row34 = _mm256_max_epu8(temp, row34); \
+    temp = row36; row36 = _mm256_min_epu8(row36, row37); row37 = _mm256_max_epu8(temp, row37); \
+    temp = row38; row38 = _mm256_min_epu8(row38, row41); row41 = _mm256_max_epu8(temp, row41); \
+    temp = row42; row42 = _mm256_min_epu8(row42, row45); row45 = _mm256_max_epu8(temp, row45); \
+    temp = row43; row43 = _mm256_min_epu8(row43, row44); row44 = _mm256_max_epu8(temp, row44); \
+    temp = row46; row46 = _mm256_min_epu8(row46, row47); row47 = _mm256_max_epu8(temp, row47); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row3); row3 = _mm256_max_epu8(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row36); row36 = _mm256_max_epu8(temp, row36); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row26; row26 = _mm256_min_epu8(row26, row27); row27 = _mm256_max_epu8(temp, row27); \
+    temp = row28; row28 = _mm256_min_epu8(row28, row29); row29 = _mm256_max_epu8(temp, row29); \
+    temp = row30; row30 = _mm256_min_epu8(row30, row31); row31 = _mm256_max_epu8(temp, row31); \
+    temp = row32; row32 = _mm256_min_epu8(row32, row33); row33 = _mm256_max_epu8(temp, row33); \
+    temp = row35; row35 = _mm256_min_epu8(row35, row47); row47 = _mm256_max_epu8(temp, row47); \
+    temp = row37; row37 = _mm256_min_epu8(row37, row39); row39 = _mm256_max_epu8(temp, row39); \
+    temp = row38; row38 = _mm256_min_epu8(row38, row40); row40 = _mm256_max_epu8(temp, row40); \
+    temp = row41; row41 = _mm256_min_epu8(row41, row42); row42 = _mm256_max_epu8(temp, row42); \
+    temp = row45; row45 = _mm256_min_epu8(row45, row46); row46 = _mm256_max_epu8(temp, row46); \
+    temp = row0; row0 = _mm256_min_epu8(row0, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row7); row7 = _mm256_max_epu8(temp, row7); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row35); row35 = _mm256_max_epu8(temp, row35); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row23; row23 = _mm256_min_epu8(row23, row47); row47 = _mm256_max_epu8(temp, row47); \
+    temp = row24; row24 = _mm256_min_epu8(row24, row36); row36 = _mm256_max_epu8(temp, row36); \
+    temp = row28; row28 = _mm256_min_epu8(row28, row30); row30 = _mm256_max_epu8(temp, row30); \
+    temp = row29; row29 = _mm256_min_epu8(row29, row31); row31 = _mm256_max_epu8(temp, row31); \
+    temp = row34; row34 = _mm256_min_epu8(row34, row46); row46 = _mm256_max_epu8(temp, row46); \
+    temp = row37; row37 = _mm256_min_epu8(row37, row38); row38 = _mm256_max_epu8(temp, row38); \
+    temp = row39; row39 = _mm256_min_epu8(row39, row40); row40 = _mm256_max_epu8(temp, row40); \
+    temp = row41; row41 = _mm256_min_epu8(row41, row43); row43 = _mm256_max_epu8(temp, row43); \
+    temp = row42; row42 = _mm256_min_epu8(row42, row44); row44 = _mm256_max_epu8(temp, row44); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row34); row34 = _mm256_max_epu8(temp, row34); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row22; row22 = _mm256_min_epu8(row22, row46); row46 = _mm256_max_epu8(temp, row46); \
+    temp = row23; row23 = _mm256_min_epu8(row23, row35); row35 = _mm256_max_epu8(temp, row35); \
+    temp = row25; row25 = _mm256_min_epu8(row25, row37); row37 = _mm256_max_epu8(temp, row37); \
+    temp = row27; row27 = _mm256_min_epu8(row27, row28); row28 = _mm256_max_epu8(temp, row28); \
+    temp = row29; row29 = _mm256_min_epu8(row29, row30); row30 = _mm256_max_epu8(temp, row30); \
+    temp = row31; row31 = _mm256_min_epu8(row31, row32); row32 = _mm256_max_epu8(temp, row32); \
+    temp = row38; row38 = _mm256_min_epu8(row38, row39); row39 = _mm256_max_epu8(temp, row39); \
+    temp = row40; row40 = _mm256_min_epu8(row40, row41); row41 = _mm256_max_epu8(temp, row41); \
+    temp = row42; row42 = _mm256_min_epu8(row42, row43); row43 = _mm256_max_epu8(temp, row43); \
+    temp = row44; row44 = _mm256_min_epu8(row44, row45); row45 = _mm256_max_epu8(temp, row45); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row25); row25 = _mm256_max_epu8(temp, row25); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row28); row28 = _mm256_max_epu8(temp, row28); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row29); row29 = _mm256_max_epu8(temp, row29); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row30); row30 = _mm256_max_epu8(temp, row30); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row31); row31 = _mm256_max_epu8(temp, row31); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row32); row32 = _mm256_max_epu8(temp, row32); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row37); row37 = _mm256_max_epu8(temp, row37); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row43); row43 = _mm256_max_epu8(temp, row43); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row48); row48 = _mm256_max_epu8(temp, row48); \
+    temp = row22; row22 = _mm256_min_epu8(row22, row34); row34 = _mm256_max_epu8(temp, row34); \
+    temp = row26; row26 = _mm256_min_epu8(row26, row38); row38 = _mm256_max_epu8(temp, row38); \
+    temp = row33; row33 = _mm256_min_epu8(row33, row45); row45 = _mm256_max_epu8(temp, row45); \
+    temp = row39; row39 = _mm256_min_epu8(row39, row40); row40 = _mm256_max_epu8(temp, row40); \
+    temp = row41; row41 = _mm256_min_epu8(row41, row42); row42 = _mm256_max_epu8(temp, row42); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row40); row40 = _mm256_max_epu8(temp, row40); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row33); row33 = _mm256_max_epu8(temp, row33); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row25); row25 = _mm256_max_epu8(temp, row25); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row38); row38 = _mm256_max_epu8(temp, row38); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row28); row28 = _mm256_max_epu8(temp, row28); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row41); row41 = _mm256_max_epu8(temp, row41); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row42); row42 = _mm256_max_epu8(temp, row42); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row45); row45 = _mm256_max_epu8(temp, row45); \
+    temp = row27; row27 = _mm256_min_epu8(row27, row39); row39 = _mm256_max_epu8(temp, row39); \
+    temp = row31; row31 = _mm256_min_epu8(row31, row43); row43 = _mm256_max_epu8(temp, row43); \
+    temp = row32; row32 = _mm256_min_epu8(row32, row48); row48 = _mm256_max_epu8(temp, row48); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row27); row27 = _mm256_max_epu8(temp, row27); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row37); row37 = _mm256_max_epu8(temp, row37); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row38); row38 = _mm256_max_epu8(temp, row38); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row39); row39 = _mm256_max_epu8(temp, row39); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row31); row31 = _mm256_max_epu8(temp, row31); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row32); row32 = _mm256_max_epu8(temp, row32); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row33); row33 = _mm256_max_epu8(temp, row33); \
+    temp = row28; row28 = _mm256_min_epu8(row28, row44); row44 = _mm256_max_epu8(temp, row44); \
+    temp = row29; row29 = _mm256_min_epu8(row29, row41); row41 = _mm256_max_epu8(temp, row41); \
+    temp = row30; row30 = _mm256_min_epu8(row30, row42); row42 = _mm256_max_epu8(temp, row42); \
+    temp = row35; row35 = _mm256_min_epu8(row35, row43); row43 = _mm256_max_epu8(temp, row43); \
+    temp = row36; row36 = _mm256_min_epu8(row36, row40); row40 = _mm256_max_epu8(temp, row40); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row28); row28 = _mm256_max_epu8(temp, row28); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row25); row25 = _mm256_max_epu8(temp, row25); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row39); row39 = _mm256_max_epu8(temp, row39); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row27); row27 = _mm256_max_epu8(temp, row27); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row36); row36 = _mm256_max_epu8(temp, row36); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row29); row29 = _mm256_max_epu8(temp, row29); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row30); row30 = _mm256_max_epu8(temp, row30); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row40); row40 = _mm256_max_epu8(temp, row40); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row37); row37 = _mm256_max_epu8(temp, row37); \
+    temp = row22; row22 = _mm256_min_epu8(row22, row38); row38 = _mm256_max_epu8(temp, row38); \
+    temp = row32; row32 = _mm256_min_epu8(row32, row44); row44 = _mm256_max_epu8(temp, row44); \
+    temp = row33; row33 = _mm256_min_epu8(row33, row41); row41 = _mm256_max_epu8(temp, row41); \
+    temp = row34; row34 = _mm256_min_epu8(row34, row42); row42 = _mm256_max_epu8(temp, row42); \
+    temp = row43; row43 = _mm256_min_epu8(row43, row46); row46 = _mm256_max_epu8(temp, row46); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row27); row27 = _mm256_max_epu8(temp, row27); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row25); row25 = _mm256_max_epu8(temp, row25); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row29); row29 = _mm256_max_epu8(temp, row29); \
+    temp = row22; row22 = _mm256_min_epu8(row22, row30); row30 = _mm256_max_epu8(temp, row30); \
+    temp = row23; row23 = _mm256_min_epu8(row23, row39); row39 = _mm256_max_epu8(temp, row39); \
+    temp = row28; row28 = _mm256_min_epu8(row28, row36); row36 = _mm256_max_epu8(temp, row36); \
+    temp = row32; row32 = _mm256_min_epu8(row32, row40); row40 = _mm256_max_epu8(temp, row40); \
+    temp = row33; row33 = _mm256_min_epu8(row33, row37); row37 = _mm256_max_epu8(temp, row37); \
+    temp = row34; row34 = _mm256_min_epu8(row34, row38); row38 = _mm256_max_epu8(temp, row38); \
+    temp = row42; row42 = _mm256_min_epu8(row42, row48); row48 = _mm256_max_epu8(temp, row48); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row4; row4 = _mm256_min_epu8(row4, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row15); row15 = _mm256_max_epu8(temp, row15); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row27); row27 = _mm256_max_epu8(temp, row27); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row25); row25 = _mm256_max_epu8(temp, row25); \
+    temp = row22; row22 = _mm256_min_epu8(row22, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row23; row23 = _mm256_min_epu8(row23, row31); row31 = _mm256_max_epu8(temp, row31); \
+    temp = row24; row24 = _mm256_min_epu8(row24, row28); row28 = _mm256_max_epu8(temp, row28); \
+    temp = row29; row29 = _mm256_min_epu8(row29, row33); row33 = _mm256_max_epu8(temp, row33); \
+    temp = row30; row30 = _mm256_min_epu8(row30, row34); row34 = _mm256_max_epu8(temp, row34); \
+    temp = row32; row32 = _mm256_min_epu8(row32, row36); row36 = _mm256_max_epu8(temp, row36); \
+    temp = row35; row35 = _mm256_min_epu8(row35, row39); row39 = _mm256_max_epu8(temp, row39); \
+    temp = row38; row38 = _mm256_min_epu8(row38, row44); row44 = _mm256_max_epu8(temp, row44); \
+    temp = row43; row43 = _mm256_min_epu8(row43, row48); row48 = _mm256_max_epu8(temp, row48); \
+    temp = row1; row1 = _mm256_min_epu8(row1, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row5); row5 = _mm256_max_epu8(temp, row5); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row8; row8 = _mm256_min_epu8(row8, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row19); row19 = _mm256_max_epu8(temp, row19); \
+    temp = row16; row16 = _mm256_min_epu8(row16, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row28); row28 = _mm256_max_epu8(temp, row28); \
+    temp = row23; row23 = _mm256_min_epu8(row23, row27); row27 = _mm256_max_epu8(temp, row27); \
+    temp = row30; row30 = _mm256_min_epu8(row30, row36); row36 = _mm256_max_epu8(temp, row36); \
+    temp = row31; row31 = _mm256_min_epu8(row31, row35); row35 = _mm256_max_epu8(temp, row35); \
+    temp = row34; row34 = _mm256_min_epu8(row34, row40); row40 = _mm256_max_epu8(temp, row40); \
+    temp = row39; row39 = _mm256_min_epu8(row39, row45); row45 = _mm256_max_epu8(temp, row45); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row9); row9 = _mm256_max_epu8(temp, row9); \
+    temp = row12; row12 = _mm256_min_epu8(row12, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row25); row25 = _mm256_max_epu8(temp, row25); \
+    temp = row20; row20 = _mm256_min_epu8(row20, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row23; row23 = _mm256_min_epu8(row23, row29); row29 = _mm256_max_epu8(temp, row29); \
+    temp = row27; row27 = _mm256_min_epu8(row27, row33); row33 = _mm256_max_epu8(temp, row33); \
+    temp = row28; row28 = _mm256_min_epu8(row28, row32); row32 = _mm256_max_epu8(temp, row32); \
+    temp = row31; row31 = _mm256_min_epu8(row31, row37); row37 = _mm256_max_epu8(temp, row37); \
+    temp = row34; row34 = _mm256_min_epu8(row34, row36); row36 = _mm256_max_epu8(temp, row36); \
+    temp = row35; row35 = _mm256_min_epu8(row35, row41); row41 = _mm256_max_epu8(temp, row41); \
+    temp = row39; row39 = _mm256_min_epu8(row39, row42); row42 = _mm256_max_epu8(temp, row42); \
+    temp = row45; row45 = _mm256_min_epu8(row45, row48); row48 = _mm256_max_epu8(temp, row48); \
+    temp = row2; row2 = _mm256_min_epu8(row2, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row21); row21 = _mm256_max_epu8(temp, row21); \
+    temp = row22; row22 = _mm256_min_epu8(row22, row28); row28 = _mm256_max_epu8(temp, row28); \
+    temp = row23; row23 = _mm256_min_epu8(row23, row25); row25 = _mm256_max_epu8(temp, row25); \
+    temp = row26; row26 = _mm256_min_epu8(row26, row32); row32 = _mm256_max_epu8(temp, row32); \
+    temp = row29; row29 = _mm256_min_epu8(row29, row30); row30 = _mm256_max_epu8(temp, row30); \
+    temp = row31; row31 = _mm256_min_epu8(row31, row33); row33 = _mm256_max_epu8(temp, row33); \
+    temp = row35; row35 = _mm256_min_epu8(row35, row38); row38 = _mm256_max_epu8(temp, row38); \
+    temp = row37; row37 = _mm256_min_epu8(row37, row40); row40 = _mm256_max_epu8(temp, row40); \
+    temp = row39; row39 = _mm256_min_epu8(row39, row44); row44 = _mm256_max_epu8(temp, row44); \
+    temp = row43; row43 = _mm256_min_epu8(row43, row45); row45 = _mm256_max_epu8(temp, row45); \
+    temp = row46; row46 = _mm256_min_epu8(row46, row48); row48 = _mm256_max_epu8(temp, row48); \
+    temp = row6; row6 = _mm256_min_epu8(row6, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row10; row10 = _mm256_min_epu8(row10, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row22; row22 = _mm256_min_epu8(row22, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row26; row26 = _mm256_min_epu8(row26, row28); row28 = _mm256_max_epu8(temp, row28); \
+    temp = row27; row27 = _mm256_min_epu8(row27, row32); row32 = _mm256_max_epu8(temp, row32); \
+    temp = row31; row31 = _mm256_min_epu8(row31, row34); row34 = _mm256_max_epu8(temp, row34); \
+    temp = row33; row33 = _mm256_min_epu8(row33, row36); row36 = _mm256_max_epu8(temp, row36); \
+    temp = row35; row35 = _mm256_min_epu8(row35, row37); row37 = _mm256_max_epu8(temp, row37); \
+    temp = row38; row38 = _mm256_min_epu8(row38, row40); row40 = _mm256_max_epu8(temp, row40); \
+    temp = row41; row41 = _mm256_min_epu8(row41, row44); row44 = _mm256_max_epu8(temp, row44); \
+    temp = row47; row47 = _mm256_min_epu8(row47, row48); row48 = _mm256_max_epu8(temp, row48); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row13); row13 = _mm256_max_epu8(temp, row13); \
+    temp = row14; row14 = _mm256_min_epu8(row14, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row17); row17 = _mm256_max_epu8(temp, row17); \
+    temp = row18; row18 = _mm256_min_epu8(row18, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row23; row23 = _mm256_min_epu8(row23, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row25; row25 = _mm256_min_epu8(row25, row28); row28 = _mm256_max_epu8(temp, row28); \
+    temp = row27; row27 = _mm256_min_epu8(row27, row29); row29 = _mm256_max_epu8(temp, row29); \
+    temp = row30; row30 = _mm256_min_epu8(row30, row32); row32 = _mm256_max_epu8(temp, row32); \
+    temp = row33; row33 = _mm256_min_epu8(row33, row34); row34 = _mm256_max_epu8(temp, row34); \
+    temp = row35; row35 = _mm256_min_epu8(row35, row36); row36 = _mm256_max_epu8(temp, row36); \
+    temp = row37; row37 = _mm256_min_epu8(row37, row38); row38 = _mm256_max_epu8(temp, row38); \
+    temp = row39; row39 = _mm256_min_epu8(row39, row41); row41 = _mm256_max_epu8(temp, row41); \
+    temp = row42; row42 = _mm256_min_epu8(row42, row44); row44 = _mm256_max_epu8(temp, row44); \
+    temp = row3; row3 = _mm256_min_epu8(row3, row4); row4 = _mm256_max_epu8(temp, row4); \
+    temp = row5; row5 = _mm256_min_epu8(row5, row6); row6 = _mm256_max_epu8(temp, row6); \
+    temp = row7; row7 = _mm256_min_epu8(row7, row8); row8 = _mm256_max_epu8(temp, row8); \
+    temp = row9; row9 = _mm256_min_epu8(row9, row10); row10 = _mm256_max_epu8(temp, row10); \
+    temp = row11; row11 = _mm256_min_epu8(row11, row12); row12 = _mm256_max_epu8(temp, row12); \
+    temp = row13; row13 = _mm256_min_epu8(row13, row14); row14 = _mm256_max_epu8(temp, row14); \
+    temp = row15; row15 = _mm256_min_epu8(row15, row16); row16 = _mm256_max_epu8(temp, row16); \
+    temp = row17; row17 = _mm256_min_epu8(row17, row18); row18 = _mm256_max_epu8(temp, row18); \
+    temp = row19; row19 = _mm256_min_epu8(row19, row20); row20 = _mm256_max_epu8(temp, row20); \
+    temp = row21; row21 = _mm256_min_epu8(row21, row22); row22 = _mm256_max_epu8(temp, row22); \
+    temp = row23; row23 = _mm256_min_epu8(row23, row24); row24 = _mm256_max_epu8(temp, row24); \
+    temp = row25; row25 = _mm256_min_epu8(row25, row26); row26 = _mm256_max_epu8(temp, row26); \
+    temp = row27; row27 = _mm256_min_epu8(row27, row28); row28 = _mm256_max_epu8(temp, row28); \
+    temp = row29; row29 = _mm256_min_epu8(row29, row30); row30 = _mm256_max_epu8(temp, row30); \
+    temp = row31; row31 = _mm256_min_epu8(row31, row32); row32 = _mm256_max_epu8(temp, row32); \
+    temp = row39; row39 = _mm256_min_epu8(row39, row40); row40 = _mm256_max_epu8(temp, row40); \
+    temp = row43; row43 = _mm256_min_epu8(row43, row44); row44 = _mm256_max_epu8(temp, row44); \
+} while (0)
+
+#define _MM256_SORT49_EPU16( \
+    row0, row1, row2, row3, row4, row5, row6, row7, row8, row9, \
+    row10, row11, row12, row13, row14, row15, row16, row17, row18, row19, \
+    row20, row21, row22, row23, row24, row25, row26, row27, row28, row29, \
+    row30, row31, row32, row33, row34, row35, row36, row37, row38, row39, \
+    row40, row41, row42, row43, row44, row45, row46, row47, row48 \
+) do { \
+    __m256i temp = row0; row0 = _mm256_min_epu16(row0, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row24; row24 = _mm256_min_epu16(row24, row32); row32 = _mm256_max_epu16(temp, row32); \
+    temp = row25; row25 = _mm256_min_epu16(row25, row31); row31 = _mm256_max_epu16(temp, row31); \
+    temp = row26; row26 = _mm256_min_epu16(row26, row30); row30 = _mm256_max_epu16(temp, row30); \
+    temp = row27; row27 = _mm256_min_epu16(row27, row35); row35 = _mm256_max_epu16(temp, row35); \
+    temp = row28; row28 = _mm256_min_epu16(row28, row34); row34 = _mm256_max_epu16(temp, row34); \
+    temp = row29; row29 = _mm256_min_epu16(row29, row33); row33 = _mm256_max_epu16(temp, row33); \
+    temp = row36; row36 = _mm256_min_epu16(row36, row48); row48 = _mm256_max_epu16(temp, row48); \
+    temp = row37; row37 = _mm256_min_epu16(row37, row46); row46 = _mm256_max_epu16(temp, row46); \
+    temp = row38; row38 = _mm256_min_epu16(row38, row45); row45 = _mm256_max_epu16(temp, row45); \
+    temp = row39; row39 = _mm256_min_epu16(row39, row43); row43 = _mm256_max_epu16(temp, row43); \
+    temp = row41; row41 = _mm256_min_epu16(row41, row47); row47 = _mm256_max_epu16(temp, row47); \
+    temp = row42; row42 = _mm256_min_epu16(row42, row44); row44 = _mm256_max_epu16(temp, row44); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row1); row1 = _mm256_max_epu16(temp, row1); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row22; row22 = _mm256_min_epu16(row22, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row24; row24 = _mm256_min_epu16(row24, row25); row25 = _mm256_max_epu16(temp, row25); \
+    temp = row26; row26 = _mm256_min_epu16(row26, row29); row29 = _mm256_max_epu16(temp, row29); \
+    temp = row27; row27 = _mm256_min_epu16(row27, row28); row28 = _mm256_max_epu16(temp, row28); \
+    temp = row30; row30 = _mm256_min_epu16(row30, row33); row33 = _mm256_max_epu16(temp, row33); \
+    temp = row31; row31 = _mm256_min_epu16(row31, row32); row32 = _mm256_max_epu16(temp, row32); \
+    temp = row34; row34 = _mm256_min_epu16(row34, row35); row35 = _mm256_max_epu16(temp, row35); \
+    temp = row37; row37 = _mm256_min_epu16(row37, row42); row42 = _mm256_max_epu16(temp, row42); \
+    temp = row38; row38 = _mm256_min_epu16(row38, row39); row39 = _mm256_max_epu16(temp, row39); \
+    temp = row40; row40 = _mm256_min_epu16(row40, row47); row47 = _mm256_max_epu16(temp, row47); \
+    temp = row43; row43 = _mm256_min_epu16(row43, row45); row45 = _mm256_max_epu16(temp, row45); \
+    temp = row44; row44 = _mm256_min_epu16(row44, row46); row46 = _mm256_max_epu16(temp, row46); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row2); row2 = _mm256_max_epu16(temp, row2); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row24; row24 = _mm256_min_epu16(row24, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row25; row25 = _mm256_min_epu16(row25, row30); row30 = _mm256_max_epu16(temp, row30); \
+    temp = row29; row29 = _mm256_min_epu16(row29, row34); row34 = _mm256_max_epu16(temp, row34); \
+    temp = row33; row33 = _mm256_min_epu16(row33, row35); row35 = _mm256_max_epu16(temp, row35); \
+    temp = row36; row36 = _mm256_min_epu16(row36, row40); row40 = _mm256_max_epu16(temp, row40); \
+    temp = row37; row37 = _mm256_min_epu16(row37, row38); row38 = _mm256_max_epu16(temp, row38); \
+    temp = row39; row39 = _mm256_min_epu16(row39, row42); row42 = _mm256_max_epu16(temp, row42); \
+    temp = row43; row43 = _mm256_min_epu16(row43, row44); row44 = _mm256_max_epu16(temp, row44); \
+    temp = row45; row45 = _mm256_min_epu16(row45, row46); row46 = _mm256_max_epu16(temp, row46); \
+    temp = row47; row47 = _mm256_min_epu16(row47, row48); row48 = _mm256_max_epu16(temp, row48); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row3); row3 = _mm256_max_epu16(temp, row3); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row2); row2 = _mm256_max_epu16(temp, row2); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row11); row11 = _mm256_max_epu16(temp, row11); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row24; row24 = _mm256_min_epu16(row24, row27); row27 = _mm256_max_epu16(temp, row27); \
+    temp = row25; row25 = _mm256_min_epu16(row25, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row28; row28 = _mm256_min_epu16(row28, row30); row30 = _mm256_max_epu16(temp, row30); \
+    temp = row29; row29 = _mm256_min_epu16(row29, row31); row31 = _mm256_max_epu16(temp, row31); \
+    temp = row32; row32 = _mm256_min_epu16(row32, row35); row35 = _mm256_max_epu16(temp, row35); \
+    temp = row33; row33 = _mm256_min_epu16(row33, row34); row34 = _mm256_max_epu16(temp, row34); \
+    temp = row40; row40 = _mm256_min_epu16(row40, row42); row42 = _mm256_max_epu16(temp, row42); \
+    temp = row41; row41 = _mm256_min_epu16(row41, row45); row45 = _mm256_max_epu16(temp, row45); \
+    temp = row44; row44 = _mm256_min_epu16(row44, row47); row47 = _mm256_max_epu16(temp, row47); \
+    temp = row46; row46 = _mm256_min_epu16(row46, row48); row48 = _mm256_max_epu16(temp, row48); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row23); row23 = _mm256_max_epu16(temp, row23); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row25; row25 = _mm256_min_epu16(row25, row28); row28 = _mm256_max_epu16(temp, row28); \
+    temp = row27; row27 = _mm256_min_epu16(row27, row29); row29 = _mm256_max_epu16(temp, row29); \
+    temp = row30; row30 = _mm256_min_epu16(row30, row32); row32 = _mm256_max_epu16(temp, row32); \
+    temp = row31; row31 = _mm256_min_epu16(row31, row34); row34 = _mm256_max_epu16(temp, row34); \
+    temp = row36; row36 = _mm256_min_epu16(row36, row41); row41 = _mm256_max_epu16(temp, row41); \
+    temp = row39; row39 = _mm256_min_epu16(row39, row44); row44 = _mm256_max_epu16(temp, row44); \
+    temp = row40; row40 = _mm256_min_epu16(row40, row43); row43 = _mm256_max_epu16(temp, row43); \
+    temp = row42; row42 = _mm256_min_epu16(row42, row47); row47 = _mm256_max_epu16(temp, row47); \
+    temp = row45; row45 = _mm256_min_epu16(row45, row46); row46 = _mm256_max_epu16(temp, row46); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row3); row3 = _mm256_max_epu16(temp, row3); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row25; row25 = _mm256_min_epu16(row25, row27); row27 = _mm256_max_epu16(temp, row27); \
+    temp = row26; row26 = _mm256_min_epu16(row26, row29); row29 = _mm256_max_epu16(temp, row29); \
+    temp = row30; row30 = _mm256_min_epu16(row30, row33); row33 = _mm256_max_epu16(temp, row33); \
+    temp = row32; row32 = _mm256_min_epu16(row32, row34); row34 = _mm256_max_epu16(temp, row34); \
+    temp = row36; row36 = _mm256_min_epu16(row36, row37); row37 = _mm256_max_epu16(temp, row37); \
+    temp = row38; row38 = _mm256_min_epu16(row38, row41); row41 = _mm256_max_epu16(temp, row41); \
+    temp = row42; row42 = _mm256_min_epu16(row42, row45); row45 = _mm256_max_epu16(temp, row45); \
+    temp = row43; row43 = _mm256_min_epu16(row43, row44); row44 = _mm256_max_epu16(temp, row44); \
+    temp = row46; row46 = _mm256_min_epu16(row46, row47); row47 = _mm256_max_epu16(temp, row47); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row3); row3 = _mm256_max_epu16(temp, row3); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row36); row36 = _mm256_max_epu16(temp, row36); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row26; row26 = _mm256_min_epu16(row26, row27); row27 = _mm256_max_epu16(temp, row27); \
+    temp = row28; row28 = _mm256_min_epu16(row28, row29); row29 = _mm256_max_epu16(temp, row29); \
+    temp = row30; row30 = _mm256_min_epu16(row30, row31); row31 = _mm256_max_epu16(temp, row31); \
+    temp = row32; row32 = _mm256_min_epu16(row32, row33); row33 = _mm256_max_epu16(temp, row33); \
+    temp = row35; row35 = _mm256_min_epu16(row35, row47); row47 = _mm256_max_epu16(temp, row47); \
+    temp = row37; row37 = _mm256_min_epu16(row37, row39); row39 = _mm256_max_epu16(temp, row39); \
+    temp = row38; row38 = _mm256_min_epu16(row38, row40); row40 = _mm256_max_epu16(temp, row40); \
+    temp = row41; row41 = _mm256_min_epu16(row41, row42); row42 = _mm256_max_epu16(temp, row42); \
+    temp = row45; row45 = _mm256_min_epu16(row45, row46); row46 = _mm256_max_epu16(temp, row46); \
+    temp = row0; row0 = _mm256_min_epu16(row0, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row7); row7 = _mm256_max_epu16(temp, row7); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row35); row35 = _mm256_max_epu16(temp, row35); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row23; row23 = _mm256_min_epu16(row23, row47); row47 = _mm256_max_epu16(temp, row47); \
+    temp = row24; row24 = _mm256_min_epu16(row24, row36); row36 = _mm256_max_epu16(temp, row36); \
+    temp = row28; row28 = _mm256_min_epu16(row28, row30); row30 = _mm256_max_epu16(temp, row30); \
+    temp = row29; row29 = _mm256_min_epu16(row29, row31); row31 = _mm256_max_epu16(temp, row31); \
+    temp = row34; row34 = _mm256_min_epu16(row34, row46); row46 = _mm256_max_epu16(temp, row46); \
+    temp = row37; row37 = _mm256_min_epu16(row37, row38); row38 = _mm256_max_epu16(temp, row38); \
+    temp = row39; row39 = _mm256_min_epu16(row39, row40); row40 = _mm256_max_epu16(temp, row40); \
+    temp = row41; row41 = _mm256_min_epu16(row41, row43); row43 = _mm256_max_epu16(temp, row43); \
+    temp = row42; row42 = _mm256_min_epu16(row42, row44); row44 = _mm256_max_epu16(temp, row44); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row34); row34 = _mm256_max_epu16(temp, row34); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row22; row22 = _mm256_min_epu16(row22, row46); row46 = _mm256_max_epu16(temp, row46); \
+    temp = row23; row23 = _mm256_min_epu16(row23, row35); row35 = _mm256_max_epu16(temp, row35); \
+    temp = row25; row25 = _mm256_min_epu16(row25, row37); row37 = _mm256_max_epu16(temp, row37); \
+    temp = row27; row27 = _mm256_min_epu16(row27, row28); row28 = _mm256_max_epu16(temp, row28); \
+    temp = row29; row29 = _mm256_min_epu16(row29, row30); row30 = _mm256_max_epu16(temp, row30); \
+    temp = row31; row31 = _mm256_min_epu16(row31, row32); row32 = _mm256_max_epu16(temp, row32); \
+    temp = row38; row38 = _mm256_min_epu16(row38, row39); row39 = _mm256_max_epu16(temp, row39); \
+    temp = row40; row40 = _mm256_min_epu16(row40, row41); row41 = _mm256_max_epu16(temp, row41); \
+    temp = row42; row42 = _mm256_min_epu16(row42, row43); row43 = _mm256_max_epu16(temp, row43); \
+    temp = row44; row44 = _mm256_min_epu16(row44, row45); row45 = _mm256_max_epu16(temp, row45); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row25); row25 = _mm256_max_epu16(temp, row25); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row28); row28 = _mm256_max_epu16(temp, row28); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row29); row29 = _mm256_max_epu16(temp, row29); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row30); row30 = _mm256_max_epu16(temp, row30); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row31); row31 = _mm256_max_epu16(temp, row31); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row32); row32 = _mm256_max_epu16(temp, row32); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row37); row37 = _mm256_max_epu16(temp, row37); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row43); row43 = _mm256_max_epu16(temp, row43); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row48); row48 = _mm256_max_epu16(temp, row48); \
+    temp = row22; row22 = _mm256_min_epu16(row22, row34); row34 = _mm256_max_epu16(temp, row34); \
+    temp = row26; row26 = _mm256_min_epu16(row26, row38); row38 = _mm256_max_epu16(temp, row38); \
+    temp = row33; row33 = _mm256_min_epu16(row33, row45); row45 = _mm256_max_epu16(temp, row45); \
+    temp = row39; row39 = _mm256_min_epu16(row39, row40); row40 = _mm256_max_epu16(temp, row40); \
+    temp = row41; row41 = _mm256_min_epu16(row41, row42); row42 = _mm256_max_epu16(temp, row42); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row40); row40 = _mm256_max_epu16(temp, row40); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row33); row33 = _mm256_max_epu16(temp, row33); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row25); row25 = _mm256_max_epu16(temp, row25); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row38); row38 = _mm256_max_epu16(temp, row38); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row28); row28 = _mm256_max_epu16(temp, row28); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row41); row41 = _mm256_max_epu16(temp, row41); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row42); row42 = _mm256_max_epu16(temp, row42); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row45); row45 = _mm256_max_epu16(temp, row45); \
+    temp = row27; row27 = _mm256_min_epu16(row27, row39); row39 = _mm256_max_epu16(temp, row39); \
+    temp = row31; row31 = _mm256_min_epu16(row31, row43); row43 = _mm256_max_epu16(temp, row43); \
+    temp = row32; row32 = _mm256_min_epu16(row32, row48); row48 = _mm256_max_epu16(temp, row48); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row27); row27 = _mm256_max_epu16(temp, row27); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row37); row37 = _mm256_max_epu16(temp, row37); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row38); row38 = _mm256_max_epu16(temp, row38); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row39); row39 = _mm256_max_epu16(temp, row39); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row31); row31 = _mm256_max_epu16(temp, row31); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row32); row32 = _mm256_max_epu16(temp, row32); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row33); row33 = _mm256_max_epu16(temp, row33); \
+    temp = row28; row28 = _mm256_min_epu16(row28, row44); row44 = _mm256_max_epu16(temp, row44); \
+    temp = row29; row29 = _mm256_min_epu16(row29, row41); row41 = _mm256_max_epu16(temp, row41); \
+    temp = row30; row30 = _mm256_min_epu16(row30, row42); row42 = _mm256_max_epu16(temp, row42); \
+    temp = row35; row35 = _mm256_min_epu16(row35, row43); row43 = _mm256_max_epu16(temp, row43); \
+    temp = row36; row36 = _mm256_min_epu16(row36, row40); row40 = _mm256_max_epu16(temp, row40); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row28); row28 = _mm256_max_epu16(temp, row28); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row25); row25 = _mm256_max_epu16(temp, row25); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row39); row39 = _mm256_max_epu16(temp, row39); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row27); row27 = _mm256_max_epu16(temp, row27); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row36); row36 = _mm256_max_epu16(temp, row36); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row29); row29 = _mm256_max_epu16(temp, row29); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row30); row30 = _mm256_max_epu16(temp, row30); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row40); row40 = _mm256_max_epu16(temp, row40); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row37); row37 = _mm256_max_epu16(temp, row37); \
+    temp = row22; row22 = _mm256_min_epu16(row22, row38); row38 = _mm256_max_epu16(temp, row38); \
+    temp = row32; row32 = _mm256_min_epu16(row32, row44); row44 = _mm256_max_epu16(temp, row44); \
+    temp = row33; row33 = _mm256_min_epu16(row33, row41); row41 = _mm256_max_epu16(temp, row41); \
+    temp = row34; row34 = _mm256_min_epu16(row34, row42); row42 = _mm256_max_epu16(temp, row42); \
+    temp = row43; row43 = _mm256_min_epu16(row43, row46); row46 = _mm256_max_epu16(temp, row46); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row27); row27 = _mm256_max_epu16(temp, row27); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row25); row25 = _mm256_max_epu16(temp, row25); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row29); row29 = _mm256_max_epu16(temp, row29); \
+    temp = row22; row22 = _mm256_min_epu16(row22, row30); row30 = _mm256_max_epu16(temp, row30); \
+    temp = row23; row23 = _mm256_min_epu16(row23, row39); row39 = _mm256_max_epu16(temp, row39); \
+    temp = row28; row28 = _mm256_min_epu16(row28, row36); row36 = _mm256_max_epu16(temp, row36); \
+    temp = row32; row32 = _mm256_min_epu16(row32, row40); row40 = _mm256_max_epu16(temp, row40); \
+    temp = row33; row33 = _mm256_min_epu16(row33, row37); row37 = _mm256_max_epu16(temp, row37); \
+    temp = row34; row34 = _mm256_min_epu16(row34, row38); row38 = _mm256_max_epu16(temp, row38); \
+    temp = row42; row42 = _mm256_min_epu16(row42, row48); row48 = _mm256_max_epu16(temp, row48); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row4; row4 = _mm256_min_epu16(row4, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row15); row15 = _mm256_max_epu16(temp, row15); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row27); row27 = _mm256_max_epu16(temp, row27); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row25); row25 = _mm256_max_epu16(temp, row25); \
+    temp = row22; row22 = _mm256_min_epu16(row22, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row23; row23 = _mm256_min_epu16(row23, row31); row31 = _mm256_max_epu16(temp, row31); \
+    temp = row24; row24 = _mm256_min_epu16(row24, row28); row28 = _mm256_max_epu16(temp, row28); \
+    temp = row29; row29 = _mm256_min_epu16(row29, row33); row33 = _mm256_max_epu16(temp, row33); \
+    temp = row30; row30 = _mm256_min_epu16(row30, row34); row34 = _mm256_max_epu16(temp, row34); \
+    temp = row32; row32 = _mm256_min_epu16(row32, row36); row36 = _mm256_max_epu16(temp, row36); \
+    temp = row35; row35 = _mm256_min_epu16(row35, row39); row39 = _mm256_max_epu16(temp, row39); \
+    temp = row38; row38 = _mm256_min_epu16(row38, row44); row44 = _mm256_max_epu16(temp, row44); \
+    temp = row43; row43 = _mm256_min_epu16(row43, row48); row48 = _mm256_max_epu16(temp, row48); \
+    temp = row1; row1 = _mm256_min_epu16(row1, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row5); row5 = _mm256_max_epu16(temp, row5); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row8; row8 = _mm256_min_epu16(row8, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row19); row19 = _mm256_max_epu16(temp, row19); \
+    temp = row16; row16 = _mm256_min_epu16(row16, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row28); row28 = _mm256_max_epu16(temp, row28); \
+    temp = row23; row23 = _mm256_min_epu16(row23, row27); row27 = _mm256_max_epu16(temp, row27); \
+    temp = row30; row30 = _mm256_min_epu16(row30, row36); row36 = _mm256_max_epu16(temp, row36); \
+    temp = row31; row31 = _mm256_min_epu16(row31, row35); row35 = _mm256_max_epu16(temp, row35); \
+    temp = row34; row34 = _mm256_min_epu16(row34, row40); row40 = _mm256_max_epu16(temp, row40); \
+    temp = row39; row39 = _mm256_min_epu16(row39, row45); row45 = _mm256_max_epu16(temp, row45); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row9); row9 = _mm256_max_epu16(temp, row9); \
+    temp = row12; row12 = _mm256_min_epu16(row12, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row25); row25 = _mm256_max_epu16(temp, row25); \
+    temp = row20; row20 = _mm256_min_epu16(row20, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row23; row23 = _mm256_min_epu16(row23, row29); row29 = _mm256_max_epu16(temp, row29); \
+    temp = row27; row27 = _mm256_min_epu16(row27, row33); row33 = _mm256_max_epu16(temp, row33); \
+    temp = row28; row28 = _mm256_min_epu16(row28, row32); row32 = _mm256_max_epu16(temp, row32); \
+    temp = row31; row31 = _mm256_min_epu16(row31, row37); row37 = _mm256_max_epu16(temp, row37); \
+    temp = row34; row34 = _mm256_min_epu16(row34, row36); row36 = _mm256_max_epu16(temp, row36); \
+    temp = row35; row35 = _mm256_min_epu16(row35, row41); row41 = _mm256_max_epu16(temp, row41); \
+    temp = row39; row39 = _mm256_min_epu16(row39, row42); row42 = _mm256_max_epu16(temp, row42); \
+    temp = row45; row45 = _mm256_min_epu16(row45, row48); row48 = _mm256_max_epu16(temp, row48); \
+    temp = row2; row2 = _mm256_min_epu16(row2, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row21); row21 = _mm256_max_epu16(temp, row21); \
+    temp = row22; row22 = _mm256_min_epu16(row22, row28); row28 = _mm256_max_epu16(temp, row28); \
+    temp = row23; row23 = _mm256_min_epu16(row23, row25); row25 = _mm256_max_epu16(temp, row25); \
+    temp = row26; row26 = _mm256_min_epu16(row26, row32); row32 = _mm256_max_epu16(temp, row32); \
+    temp = row29; row29 = _mm256_min_epu16(row29, row30); row30 = _mm256_max_epu16(temp, row30); \
+    temp = row31; row31 = _mm256_min_epu16(row31, row33); row33 = _mm256_max_epu16(temp, row33); \
+    temp = row35; row35 = _mm256_min_epu16(row35, row38); row38 = _mm256_max_epu16(temp, row38); \
+    temp = row37; row37 = _mm256_min_epu16(row37, row40); row40 = _mm256_max_epu16(temp, row40); \
+    temp = row39; row39 = _mm256_min_epu16(row39, row44); row44 = _mm256_max_epu16(temp, row44); \
+    temp = row43; row43 = _mm256_min_epu16(row43, row45); row45 = _mm256_max_epu16(temp, row45); \
+    temp = row46; row46 = _mm256_min_epu16(row46, row48); row48 = _mm256_max_epu16(temp, row48); \
+    temp = row6; row6 = _mm256_min_epu16(row6, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row10; row10 = _mm256_min_epu16(row10, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row22; row22 = _mm256_min_epu16(row22, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row26; row26 = _mm256_min_epu16(row26, row28); row28 = _mm256_max_epu16(temp, row28); \
+    temp = row27; row27 = _mm256_min_epu16(row27, row32); row32 = _mm256_max_epu16(temp, row32); \
+    temp = row31; row31 = _mm256_min_epu16(row31, row34); row34 = _mm256_max_epu16(temp, row34); \
+    temp = row33; row33 = _mm256_min_epu16(row33, row36); row36 = _mm256_max_epu16(temp, row36); \
+    temp = row35; row35 = _mm256_min_epu16(row35, row37); row37 = _mm256_max_epu16(temp, row37); \
+    temp = row38; row38 = _mm256_min_epu16(row38, row40); row40 = _mm256_max_epu16(temp, row40); \
+    temp = row41; row41 = _mm256_min_epu16(row41, row44); row44 = _mm256_max_epu16(temp, row44); \
+    temp = row47; row47 = _mm256_min_epu16(row47, row48); row48 = _mm256_max_epu16(temp, row48); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row13); row13 = _mm256_max_epu16(temp, row13); \
+    temp = row14; row14 = _mm256_min_epu16(row14, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row17); row17 = _mm256_max_epu16(temp, row17); \
+    temp = row18; row18 = _mm256_min_epu16(row18, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row23; row23 = _mm256_min_epu16(row23, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row25; row25 = _mm256_min_epu16(row25, row28); row28 = _mm256_max_epu16(temp, row28); \
+    temp = row27; row27 = _mm256_min_epu16(row27, row29); row29 = _mm256_max_epu16(temp, row29); \
+    temp = row30; row30 = _mm256_min_epu16(row30, row32); row32 = _mm256_max_epu16(temp, row32); \
+    temp = row33; row33 = _mm256_min_epu16(row33, row34); row34 = _mm256_max_epu16(temp, row34); \
+    temp = row35; row35 = _mm256_min_epu16(row35, row36); row36 = _mm256_max_epu16(temp, row36); \
+    temp = row37; row37 = _mm256_min_epu16(row37, row38); row38 = _mm256_max_epu16(temp, row38); \
+    temp = row39; row39 = _mm256_min_epu16(row39, row41); row41 = _mm256_max_epu16(temp, row41); \
+    temp = row42; row42 = _mm256_min_epu16(row42, row44); row44 = _mm256_max_epu16(temp, row44); \
+    temp = row3; row3 = _mm256_min_epu16(row3, row4); row4 = _mm256_max_epu16(temp, row4); \
+    temp = row5; row5 = _mm256_min_epu16(row5, row6); row6 = _mm256_max_epu16(temp, row6); \
+    temp = row7; row7 = _mm256_min_epu16(row7, row8); row8 = _mm256_max_epu16(temp, row8); \
+    temp = row9; row9 = _mm256_min_epu16(row9, row10); row10 = _mm256_max_epu16(temp, row10); \
+    temp = row11; row11 = _mm256_min_epu16(row11, row12); row12 = _mm256_max_epu16(temp, row12); \
+    temp = row13; row13 = _mm256_min_epu16(row13, row14); row14 = _mm256_max_epu16(temp, row14); \
+    temp = row15; row15 = _mm256_min_epu16(row15, row16); row16 = _mm256_max_epu16(temp, row16); \
+    temp = row17; row17 = _mm256_min_epu16(row17, row18); row18 = _mm256_max_epu16(temp, row18); \
+    temp = row19; row19 = _mm256_min_epu16(row19, row20); row20 = _mm256_max_epu16(temp, row20); \
+    temp = row21; row21 = _mm256_min_epu16(row21, row22); row22 = _mm256_max_epu16(temp, row22); \
+    temp = row23; row23 = _mm256_min_epu16(row23, row24); row24 = _mm256_max_epu16(temp, row24); \
+    temp = row25; row25 = _mm256_min_epu16(row25, row26); row26 = _mm256_max_epu16(temp, row26); \
+    temp = row27; row27 = _mm256_min_epu16(row27, row28); row28 = _mm256_max_epu16(temp, row28); \
+    temp = row29; row29 = _mm256_min_epu16(row29, row30); row30 = _mm256_max_epu16(temp, row30); \
+    temp = row31; row31 = _mm256_min_epu16(row31, row32); row32 = _mm256_max_epu16(temp, row32); \
+    temp = row39; row39 = _mm256_min_epu16(row39, row40); row40 = _mm256_max_epu16(temp, row40); \
+    temp = row43; row43 = _mm256_min_epu16(row43, row44); row44 = _mm256_max_epu16(temp, row44); \
+} while (0)
+
+#define _MM256_SORT49_PS( \
+    row0, row1, row2, row3, row4, row5, row6, row7, row8, row9, \
+    row10, row11, row12, row13, row14, row15, row16, row17, row18, row19, \
+    row20, row21, row22, row23, row24, row25, row26, row27, row28, row29, \
+    row30, row31, row32, row33, row34, row35, row36, row37, row38, row39, \
+    row40, row41, row42, row43, row44, row45, row46, row47, row48 \
+) do { \
+    __m256 temp = row0; row0 = _mm256_min_ps(row0, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row1; row1 = _mm256_min_ps(row1, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row2; row2 = _mm256_min_ps(row2, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row3; row3 = _mm256_min_ps(row3, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row4; row4 = _mm256_min_ps(row4, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row5; row5 = _mm256_min_ps(row5, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row12; row12 = _mm256_min_ps(row12, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row13; row13 = _mm256_min_ps(row13, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row14; row14 = _mm256_min_ps(row14, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row15; row15 = _mm256_min_ps(row15, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row16; row16 = _mm256_min_ps(row16, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row17; row17 = _mm256_min_ps(row17, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row24; row24 = _mm256_min_ps(row24, row32); row32 = _mm256_max_ps(temp, row32); \
+    temp = row25; row25 = _mm256_min_ps(row25, row31); row31 = _mm256_max_ps(temp, row31); \
+    temp = row26; row26 = _mm256_min_ps(row26, row30); row30 = _mm256_max_ps(temp, row30); \
+    temp = row27; row27 = _mm256_min_ps(row27, row35); row35 = _mm256_max_ps(temp, row35); \
+    temp = row28; row28 = _mm256_min_ps(row28, row34); row34 = _mm256_max_ps(temp, row34); \
+    temp = row29; row29 = _mm256_min_ps(row29, row33); row33 = _mm256_max_ps(temp, row33); \
+    temp = row36; row36 = _mm256_min_ps(row36, row48); row48 = _mm256_max_ps(temp, row48); \
+    temp = row37; row37 = _mm256_min_ps(row37, row46); row46 = _mm256_max_ps(temp, row46); \
+    temp = row38; row38 = _mm256_min_ps(row38, row45); row45 = _mm256_max_ps(temp, row45); \
+    temp = row39; row39 = _mm256_min_ps(row39, row43); row43 = _mm256_max_ps(temp, row43); \
+    temp = row41; row41 = _mm256_min_ps(row41, row47); row47 = _mm256_max_ps(temp, row47); \
+    temp = row42; row42 = _mm256_min_ps(row42, row44); row44 = _mm256_max_ps(temp, row44); \
+    temp = row0; row0 = _mm256_min_ps(row0, row1); row1 = _mm256_max_ps(temp, row1); \
+    temp = row2; row2 = _mm256_min_ps(row2, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row3; row3 = _mm256_min_ps(row3, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row6; row6 = _mm256_min_ps(row6, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row7; row7 = _mm256_min_ps(row7, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row10; row10 = _mm256_min_ps(row10, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row12; row12 = _mm256_min_ps(row12, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row14; row14 = _mm256_min_ps(row14, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row15; row15 = _mm256_min_ps(row15, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row18; row18 = _mm256_min_ps(row18, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row19; row19 = _mm256_min_ps(row19, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row22; row22 = _mm256_min_ps(row22, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row24; row24 = _mm256_min_ps(row24, row25); row25 = _mm256_max_ps(temp, row25); \
+    temp = row26; row26 = _mm256_min_ps(row26, row29); row29 = _mm256_max_ps(temp, row29); \
+    temp = row27; row27 = _mm256_min_ps(row27, row28); row28 = _mm256_max_ps(temp, row28); \
+    temp = row30; row30 = _mm256_min_ps(row30, row33); row33 = _mm256_max_ps(temp, row33); \
+    temp = row31; row31 = _mm256_min_ps(row31, row32); row32 = _mm256_max_ps(temp, row32); \
+    temp = row34; row34 = _mm256_min_ps(row34, row35); row35 = _mm256_max_ps(temp, row35); \
+    temp = row37; row37 = _mm256_min_ps(row37, row42); row42 = _mm256_max_ps(temp, row42); \
+    temp = row38; row38 = _mm256_min_ps(row38, row39); row39 = _mm256_max_ps(temp, row39); \
+    temp = row40; row40 = _mm256_min_ps(row40, row47); row47 = _mm256_max_ps(temp, row47); \
+    temp = row43; row43 = _mm256_min_ps(row43, row45); row45 = _mm256_max_ps(temp, row45); \
+    temp = row44; row44 = _mm256_min_ps(row44, row46); row46 = _mm256_max_ps(temp, row46); \
+    temp = row0; row0 = _mm256_min_ps(row0, row2); row2 = _mm256_max_ps(temp, row2); \
+    temp = row1; row1 = _mm256_min_ps(row1, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row5; row5 = _mm256_min_ps(row5, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row9; row9 = _mm256_min_ps(row9, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row12; row12 = _mm256_min_ps(row12, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row13; row13 = _mm256_min_ps(row13, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row17; row17 = _mm256_min_ps(row17, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row21; row21 = _mm256_min_ps(row21, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row24; row24 = _mm256_min_ps(row24, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row25; row25 = _mm256_min_ps(row25, row30); row30 = _mm256_max_ps(temp, row30); \
+    temp = row29; row29 = _mm256_min_ps(row29, row34); row34 = _mm256_max_ps(temp, row34); \
+    temp = row33; row33 = _mm256_min_ps(row33, row35); row35 = _mm256_max_ps(temp, row35); \
+    temp = row36; row36 = _mm256_min_ps(row36, row40); row40 = _mm256_max_ps(temp, row40); \
+    temp = row37; row37 = _mm256_min_ps(row37, row38); row38 = _mm256_max_ps(temp, row38); \
+    temp = row39; row39 = _mm256_min_ps(row39, row42); row42 = _mm256_max_ps(temp, row42); \
+    temp = row43; row43 = _mm256_min_ps(row43, row44); row44 = _mm256_max_ps(temp, row44); \
+    temp = row45; row45 = _mm256_min_ps(row45, row46); row46 = _mm256_max_ps(temp, row46); \
+    temp = row47; row47 = _mm256_min_ps(row47, row48); row48 = _mm256_max_ps(temp, row48); \
+    temp = row0; row0 = _mm256_min_ps(row0, row3); row3 = _mm256_max_ps(temp, row3); \
+    temp = row1; row1 = _mm256_min_ps(row1, row2); row2 = _mm256_max_ps(temp, row2); \
+    temp = row4; row4 = _mm256_min_ps(row4, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row5; row5 = _mm256_min_ps(row5, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row8; row8 = _mm256_min_ps(row8, row11); row11 = _mm256_max_ps(temp, row11); \
+    temp = row9; row9 = _mm256_min_ps(row9, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row12; row12 = _mm256_min_ps(row12, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row13; row13 = _mm256_min_ps(row13, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row16; row16 = _mm256_min_ps(row16, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row17; row17 = _mm256_min_ps(row17, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row20; row20 = _mm256_min_ps(row20, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row21; row21 = _mm256_min_ps(row21, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row24; row24 = _mm256_min_ps(row24, row27); row27 = _mm256_max_ps(temp, row27); \
+    temp = row25; row25 = _mm256_min_ps(row25, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row28; row28 = _mm256_min_ps(row28, row30); row30 = _mm256_max_ps(temp, row30); \
+    temp = row29; row29 = _mm256_min_ps(row29, row31); row31 = _mm256_max_ps(temp, row31); \
+    temp = row32; row32 = _mm256_min_ps(row32, row35); row35 = _mm256_max_ps(temp, row35); \
+    temp = row33; row33 = _mm256_min_ps(row33, row34); row34 = _mm256_max_ps(temp, row34); \
+    temp = row40; row40 = _mm256_min_ps(row40, row42); row42 = _mm256_max_ps(temp, row42); \
+    temp = row41; row41 = _mm256_min_ps(row41, row45); row45 = _mm256_max_ps(temp, row45); \
+    temp = row44; row44 = _mm256_min_ps(row44, row47); row47 = _mm256_max_ps(temp, row47); \
+    temp = row46; row46 = _mm256_min_ps(row46, row48); row48 = _mm256_max_ps(temp, row48); \
+    temp = row0; row0 = _mm256_min_ps(row0, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row1; row1 = _mm256_min_ps(row1, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row3; row3 = _mm256_min_ps(row3, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row6; row6 = _mm256_min_ps(row6, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row7; row7 = _mm256_min_ps(row7, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row11; row11 = _mm256_min_ps(row11, row23); row23 = _mm256_max_ps(temp, row23); \
+    temp = row13; row13 = _mm256_min_ps(row13, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row15; row15 = _mm256_min_ps(row15, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row18; row18 = _mm256_min_ps(row18, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row19; row19 = _mm256_min_ps(row19, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row25; row25 = _mm256_min_ps(row25, row28); row28 = _mm256_max_ps(temp, row28); \
+    temp = row27; row27 = _mm256_min_ps(row27, row29); row29 = _mm256_max_ps(temp, row29); \
+    temp = row30; row30 = _mm256_min_ps(row30, row32); row32 = _mm256_max_ps(temp, row32); \
+    temp = row31; row31 = _mm256_min_ps(row31, row34); row34 = _mm256_max_ps(temp, row34); \
+    temp = row36; row36 = _mm256_min_ps(row36, row41); row41 = _mm256_max_ps(temp, row41); \
+    temp = row39; row39 = _mm256_min_ps(row39, row44); row44 = _mm256_max_ps(temp, row44); \
+    temp = row40; row40 = _mm256_min_ps(row40, row43); row43 = _mm256_max_ps(temp, row43); \
+    temp = row42; row42 = _mm256_min_ps(row42, row47); row47 = _mm256_max_ps(temp, row47); \
+    temp = row45; row45 = _mm256_min_ps(row45, row46); row46 = _mm256_max_ps(temp, row46); \
+    temp = row1; row1 = _mm256_min_ps(row1, row3); row3 = _mm256_max_ps(temp, row3); \
+    temp = row2; row2 = _mm256_min_ps(row2, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row6; row6 = _mm256_min_ps(row6, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row8; row8 = _mm256_min_ps(row8, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row13; row13 = _mm256_min_ps(row13, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row14; row14 = _mm256_min_ps(row14, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row18; row18 = _mm256_min_ps(row18, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row20; row20 = _mm256_min_ps(row20, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row25; row25 = _mm256_min_ps(row25, row27); row27 = _mm256_max_ps(temp, row27); \
+    temp = row26; row26 = _mm256_min_ps(row26, row29); row29 = _mm256_max_ps(temp, row29); \
+    temp = row30; row30 = _mm256_min_ps(row30, row33); row33 = _mm256_max_ps(temp, row33); \
+    temp = row32; row32 = _mm256_min_ps(row32, row34); row34 = _mm256_max_ps(temp, row34); \
+    temp = row36; row36 = _mm256_min_ps(row36, row37); row37 = _mm256_max_ps(temp, row37); \
+    temp = row38; row38 = _mm256_min_ps(row38, row41); row41 = _mm256_max_ps(temp, row41); \
+    temp = row42; row42 = _mm256_min_ps(row42, row45); row45 = _mm256_max_ps(temp, row45); \
+    temp = row43; row43 = _mm256_min_ps(row43, row44); row44 = _mm256_max_ps(temp, row44); \
+    temp = row46; row46 = _mm256_min_ps(row46, row47); row47 = _mm256_max_ps(temp, row47); \
+    temp = row1; row1 = _mm256_min_ps(row1, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row2; row2 = _mm256_min_ps(row2, row3); row3 = _mm256_max_ps(temp, row3); \
+    temp = row4; row4 = _mm256_min_ps(row4, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row6; row6 = _mm256_min_ps(row6, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row8; row8 = _mm256_min_ps(row8, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row10; row10 = _mm256_min_ps(row10, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row12; row12 = _mm256_min_ps(row12, row36); row36 = _mm256_max_ps(temp, row36); \
+    temp = row14; row14 = _mm256_min_ps(row14, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row16; row16 = _mm256_min_ps(row16, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row18; row18 = _mm256_min_ps(row18, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row20; row20 = _mm256_min_ps(row20, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row26; row26 = _mm256_min_ps(row26, row27); row27 = _mm256_max_ps(temp, row27); \
+    temp = row28; row28 = _mm256_min_ps(row28, row29); row29 = _mm256_max_ps(temp, row29); \
+    temp = row30; row30 = _mm256_min_ps(row30, row31); row31 = _mm256_max_ps(temp, row31); \
+    temp = row32; row32 = _mm256_min_ps(row32, row33); row33 = _mm256_max_ps(temp, row33); \
+    temp = row35; row35 = _mm256_min_ps(row35, row47); row47 = _mm256_max_ps(temp, row47); \
+    temp = row37; row37 = _mm256_min_ps(row37, row39); row39 = _mm256_max_ps(temp, row39); \
+    temp = row38; row38 = _mm256_min_ps(row38, row40); row40 = _mm256_max_ps(temp, row40); \
+    temp = row41; row41 = _mm256_min_ps(row41, row42); row42 = _mm256_max_ps(temp, row42); \
+    temp = row45; row45 = _mm256_min_ps(row45, row46); row46 = _mm256_max_ps(temp, row46); \
+    temp = row0; row0 = _mm256_min_ps(row0, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row2; row2 = _mm256_min_ps(row2, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row4; row4 = _mm256_min_ps(row4, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row5; row5 = _mm256_min_ps(row5, row7); row7 = _mm256_max_ps(temp, row7); \
+    temp = row9; row9 = _mm256_min_ps(row9, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row11; row11 = _mm256_min_ps(row11, row35); row35 = _mm256_max_ps(temp, row35); \
+    temp = row16; row16 = _mm256_min_ps(row16, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row17; row17 = _mm256_min_ps(row17, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row23; row23 = _mm256_min_ps(row23, row47); row47 = _mm256_max_ps(temp, row47); \
+    temp = row24; row24 = _mm256_min_ps(row24, row36); row36 = _mm256_max_ps(temp, row36); \
+    temp = row28; row28 = _mm256_min_ps(row28, row30); row30 = _mm256_max_ps(temp, row30); \
+    temp = row29; row29 = _mm256_min_ps(row29, row31); row31 = _mm256_max_ps(temp, row31); \
+    temp = row34; row34 = _mm256_min_ps(row34, row46); row46 = _mm256_max_ps(temp, row46); \
+    temp = row37; row37 = _mm256_min_ps(row37, row38); row38 = _mm256_max_ps(temp, row38); \
+    temp = row39; row39 = _mm256_min_ps(row39, row40); row40 = _mm256_max_ps(temp, row40); \
+    temp = row41; row41 = _mm256_min_ps(row41, row43); row43 = _mm256_max_ps(temp, row43); \
+    temp = row42; row42 = _mm256_min_ps(row42, row44); row44 = _mm256_max_ps(temp, row44); \
+    temp = row3; row3 = _mm256_min_ps(row3, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row5; row5 = _mm256_min_ps(row5, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row7; row7 = _mm256_min_ps(row7, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row10; row10 = _mm256_min_ps(row10, row34); row34 = _mm256_max_ps(temp, row34); \
+    temp = row12; row12 = _mm256_min_ps(row12, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row15; row15 = _mm256_min_ps(row15, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row17; row17 = _mm256_min_ps(row17, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row19; row19 = _mm256_min_ps(row19, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row22; row22 = _mm256_min_ps(row22, row46); row46 = _mm256_max_ps(temp, row46); \
+    temp = row23; row23 = _mm256_min_ps(row23, row35); row35 = _mm256_max_ps(temp, row35); \
+    temp = row25; row25 = _mm256_min_ps(row25, row37); row37 = _mm256_max_ps(temp, row37); \
+    temp = row27; row27 = _mm256_min_ps(row27, row28); row28 = _mm256_max_ps(temp, row28); \
+    temp = row29; row29 = _mm256_min_ps(row29, row30); row30 = _mm256_max_ps(temp, row30); \
+    temp = row31; row31 = _mm256_min_ps(row31, row32); row32 = _mm256_max_ps(temp, row32); \
+    temp = row38; row38 = _mm256_min_ps(row38, row39); row39 = _mm256_max_ps(temp, row39); \
+    temp = row40; row40 = _mm256_min_ps(row40, row41); row41 = _mm256_max_ps(temp, row41); \
+    temp = row42; row42 = _mm256_min_ps(row42, row43); row43 = _mm256_max_ps(temp, row43); \
+    temp = row44; row44 = _mm256_min_ps(row44, row45); row45 = _mm256_max_ps(temp, row45); \
+    temp = row1; row1 = _mm256_min_ps(row1, row25); row25 = _mm256_max_ps(temp, row25); \
+    temp = row3; row3 = _mm256_min_ps(row3, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row4; row4 = _mm256_min_ps(row4, row28); row28 = _mm256_max_ps(temp, row28); \
+    temp = row5; row5 = _mm256_min_ps(row5, row29); row29 = _mm256_max_ps(temp, row29); \
+    temp = row6; row6 = _mm256_min_ps(row6, row30); row30 = _mm256_max_ps(temp, row30); \
+    temp = row7; row7 = _mm256_min_ps(row7, row31); row31 = _mm256_max_ps(temp, row31); \
+    temp = row8; row8 = _mm256_min_ps(row8, row32); row32 = _mm256_max_ps(temp, row32); \
+    temp = row13; row13 = _mm256_min_ps(row13, row37); row37 = _mm256_max_ps(temp, row37); \
+    temp = row19; row19 = _mm256_min_ps(row19, row43); row43 = _mm256_max_ps(temp, row43); \
+    temp = row20; row20 = _mm256_min_ps(row20, row48); row48 = _mm256_max_ps(temp, row48); \
+    temp = row22; row22 = _mm256_min_ps(row22, row34); row34 = _mm256_max_ps(temp, row34); \
+    temp = row26; row26 = _mm256_min_ps(row26, row38); row38 = _mm256_max_ps(temp, row38); \
+    temp = row33; row33 = _mm256_min_ps(row33, row45); row45 = _mm256_max_ps(temp, row45); \
+    temp = row39; row39 = _mm256_min_ps(row39, row40); row40 = _mm256_max_ps(temp, row40); \
+    temp = row41; row41 = _mm256_min_ps(row41, row42); row42 = _mm256_max_ps(temp, row42); \
+    temp = row2; row2 = _mm256_min_ps(row2, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row4; row4 = _mm256_min_ps(row4, row40); row40 = _mm256_max_ps(temp, row40); \
+    temp = row7; row7 = _mm256_min_ps(row7, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row8; row8 = _mm256_min_ps(row8, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row9; row9 = _mm256_min_ps(row9, row33); row33 = _mm256_max_ps(temp, row33); \
+    temp = row13; row13 = _mm256_min_ps(row13, row25); row25 = _mm256_max_ps(temp, row25); \
+    temp = row14; row14 = _mm256_min_ps(row14, row38); row38 = _mm256_max_ps(temp, row38); \
+    temp = row16; row16 = _mm256_min_ps(row16, row28); row28 = _mm256_max_ps(temp, row28); \
+    temp = row17; row17 = _mm256_min_ps(row17, row41); row41 = _mm256_max_ps(temp, row41); \
+    temp = row18; row18 = _mm256_min_ps(row18, row42); row42 = _mm256_max_ps(temp, row42); \
+    temp = row21; row21 = _mm256_min_ps(row21, row45); row45 = _mm256_max_ps(temp, row45); \
+    temp = row27; row27 = _mm256_min_ps(row27, row39); row39 = _mm256_max_ps(temp, row39); \
+    temp = row31; row31 = _mm256_min_ps(row31, row43); row43 = _mm256_max_ps(temp, row43); \
+    temp = row32; row32 = _mm256_min_ps(row32, row48); row48 = _mm256_max_ps(temp, row48); \
+    temp = row3; row3 = _mm256_min_ps(row3, row27); row27 = _mm256_max_ps(temp, row27); \
+    temp = row5; row5 = _mm256_min_ps(row5, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row6; row6 = _mm256_min_ps(row6, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row9; row9 = _mm256_min_ps(row9, row37); row37 = _mm256_max_ps(temp, row37); \
+    temp = row10; row10 = _mm256_min_ps(row10, row38); row38 = _mm256_max_ps(temp, row38); \
+    temp = row14; row14 = _mm256_min_ps(row14, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row15; row15 = _mm256_min_ps(row15, row39); row39 = _mm256_max_ps(temp, row39); \
+    temp = row19; row19 = _mm256_min_ps(row19, row31); row31 = _mm256_max_ps(temp, row31); \
+    temp = row20; row20 = _mm256_min_ps(row20, row32); row32 = _mm256_max_ps(temp, row32); \
+    temp = row21; row21 = _mm256_min_ps(row21, row33); row33 = _mm256_max_ps(temp, row33); \
+    temp = row28; row28 = _mm256_min_ps(row28, row44); row44 = _mm256_max_ps(temp, row44); \
+    temp = row29; row29 = _mm256_min_ps(row29, row41); row41 = _mm256_max_ps(temp, row41); \
+    temp = row30; row30 = _mm256_min_ps(row30, row42); row42 = _mm256_max_ps(temp, row42); \
+    temp = row35; row35 = _mm256_min_ps(row35, row43); row43 = _mm256_max_ps(temp, row43); \
+    temp = row36; row36 = _mm256_min_ps(row36, row40); row40 = _mm256_max_ps(temp, row40); \
+    temp = row5; row5 = _mm256_min_ps(row5, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row6; row6 = _mm256_min_ps(row6, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row8; row8 = _mm256_min_ps(row8, row28); row28 = _mm256_max_ps(temp, row28); \
+    temp = row9; row9 = _mm256_min_ps(row9, row25); row25 = _mm256_max_ps(temp, row25); \
+    temp = row10; row10 = _mm256_min_ps(row10, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row11; row11 = _mm256_min_ps(row11, row39); row39 = _mm256_max_ps(temp, row39); \
+    temp = row15; row15 = _mm256_min_ps(row15, row27); row27 = _mm256_max_ps(temp, row27); \
+    temp = row16; row16 = _mm256_min_ps(row16, row36); row36 = _mm256_max_ps(temp, row36); \
+    temp = row17; row17 = _mm256_min_ps(row17, row29); row29 = _mm256_max_ps(temp, row29); \
+    temp = row18; row18 = _mm256_min_ps(row18, row30); row30 = _mm256_max_ps(temp, row30); \
+    temp = row20; row20 = _mm256_min_ps(row20, row40); row40 = _mm256_max_ps(temp, row40); \
+    temp = row21; row21 = _mm256_min_ps(row21, row37); row37 = _mm256_max_ps(temp, row37); \
+    temp = row22; row22 = _mm256_min_ps(row22, row38); row38 = _mm256_max_ps(temp, row38); \
+    temp = row32; row32 = _mm256_min_ps(row32, row44); row44 = _mm256_max_ps(temp, row44); \
+    temp = row33; row33 = _mm256_min_ps(row33, row41); row41 = _mm256_max_ps(temp, row41); \
+    temp = row34; row34 = _mm256_min_ps(row34, row42); row42 = _mm256_max_ps(temp, row42); \
+    temp = row43; row43 = _mm256_min_ps(row43, row46); row46 = _mm256_max_ps(temp, row46); \
+    temp = row4; row4 = _mm256_min_ps(row4, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row7; row7 = _mm256_min_ps(row7, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row8; row8 = _mm256_min_ps(row8, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row9; row9 = _mm256_min_ps(row9, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row10; row10 = _mm256_min_ps(row10, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row11; row11 = _mm256_min_ps(row11, row27); row27 = _mm256_max_ps(temp, row27); \
+    temp = row17; row17 = _mm256_min_ps(row17, row25); row25 = _mm256_max_ps(temp, row25); \
+    temp = row18; row18 = _mm256_min_ps(row18, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row21; row21 = _mm256_min_ps(row21, row29); row29 = _mm256_max_ps(temp, row29); \
+    temp = row22; row22 = _mm256_min_ps(row22, row30); row30 = _mm256_max_ps(temp, row30); \
+    temp = row23; row23 = _mm256_min_ps(row23, row39); row39 = _mm256_max_ps(temp, row39); \
+    temp = row28; row28 = _mm256_min_ps(row28, row36); row36 = _mm256_max_ps(temp, row36); \
+    temp = row32; row32 = _mm256_min_ps(row32, row40); row40 = _mm256_max_ps(temp, row40); \
+    temp = row33; row33 = _mm256_min_ps(row33, row37); row37 = _mm256_max_ps(temp, row37); \
+    temp = row34; row34 = _mm256_min_ps(row34, row38); row38 = _mm256_max_ps(temp, row38); \
+    temp = row42; row42 = _mm256_min_ps(row42, row48); row48 = _mm256_max_ps(temp, row48); \
+    temp = row3; row3 = _mm256_min_ps(row3, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row4; row4 = _mm256_min_ps(row4, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row11; row11 = _mm256_min_ps(row11, row15); row15 = _mm256_max_ps(temp, row15); \
+    temp = row13; row13 = _mm256_min_ps(row13, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row14; row14 = _mm256_min_ps(row14, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row19; row19 = _mm256_min_ps(row19, row27); row27 = _mm256_max_ps(temp, row27); \
+    temp = row21; row21 = _mm256_min_ps(row21, row25); row25 = _mm256_max_ps(temp, row25); \
+    temp = row22; row22 = _mm256_min_ps(row22, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row23; row23 = _mm256_min_ps(row23, row31); row31 = _mm256_max_ps(temp, row31); \
+    temp = row24; row24 = _mm256_min_ps(row24, row28); row28 = _mm256_max_ps(temp, row28); \
+    temp = row29; row29 = _mm256_min_ps(row29, row33); row33 = _mm256_max_ps(temp, row33); \
+    temp = row30; row30 = _mm256_min_ps(row30, row34); row34 = _mm256_max_ps(temp, row34); \
+    temp = row32; row32 = _mm256_min_ps(row32, row36); row36 = _mm256_max_ps(temp, row36); \
+    temp = row35; row35 = _mm256_min_ps(row35, row39); row39 = _mm256_max_ps(temp, row39); \
+    temp = row38; row38 = _mm256_min_ps(row38, row44); row44 = _mm256_max_ps(temp, row44); \
+    temp = row43; row43 = _mm256_min_ps(row43, row48); row48 = _mm256_max_ps(temp, row48); \
+    temp = row1; row1 = _mm256_min_ps(row1, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row3; row3 = _mm256_min_ps(row3, row5); row5 = _mm256_max_ps(temp, row5); \
+    temp = row7; row7 = _mm256_min_ps(row7, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row8; row8 = _mm256_min_ps(row8, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row11; row11 = _mm256_min_ps(row11, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row15; row15 = _mm256_min_ps(row15, row19); row19 = _mm256_max_ps(temp, row19); \
+    temp = row16; row16 = _mm256_min_ps(row16, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row20; row20 = _mm256_min_ps(row20, row28); row28 = _mm256_max_ps(temp, row28); \
+    temp = row23; row23 = _mm256_min_ps(row23, row27); row27 = _mm256_max_ps(temp, row27); \
+    temp = row30; row30 = _mm256_min_ps(row30, row36); row36 = _mm256_max_ps(temp, row36); \
+    temp = row31; row31 = _mm256_min_ps(row31, row35); row35 = _mm256_max_ps(temp, row35); \
+    temp = row34; row34 = _mm256_min_ps(row34, row40); row40 = _mm256_max_ps(temp, row40); \
+    temp = row39; row39 = _mm256_min_ps(row39, row45); row45 = _mm256_max_ps(temp, row45); \
+    temp = row2; row2 = _mm256_min_ps(row2, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row7; row7 = _mm256_min_ps(row7, row9); row9 = _mm256_max_ps(temp, row9); \
+    temp = row12; row12 = _mm256_min_ps(row12, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row15; row15 = _mm256_min_ps(row15, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row19; row19 = _mm256_min_ps(row19, row25); row25 = _mm256_max_ps(temp, row25); \
+    temp = row20; row20 = _mm256_min_ps(row20, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row23; row23 = _mm256_min_ps(row23, row29); row29 = _mm256_max_ps(temp, row29); \
+    temp = row27; row27 = _mm256_min_ps(row27, row33); row33 = _mm256_max_ps(temp, row33); \
+    temp = row28; row28 = _mm256_min_ps(row28, row32); row32 = _mm256_max_ps(temp, row32); \
+    temp = row31; row31 = _mm256_min_ps(row31, row37); row37 = _mm256_max_ps(temp, row37); \
+    temp = row34; row34 = _mm256_min_ps(row34, row36); row36 = _mm256_max_ps(temp, row36); \
+    temp = row35; row35 = _mm256_min_ps(row35, row41); row41 = _mm256_max_ps(temp, row41); \
+    temp = row39; row39 = _mm256_min_ps(row39, row42); row42 = _mm256_max_ps(temp, row42); \
+    temp = row45; row45 = _mm256_min_ps(row45, row48); row48 = _mm256_max_ps(temp, row48); \
+    temp = row2; row2 = _mm256_min_ps(row2, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row6; row6 = _mm256_min_ps(row6, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row10; row10 = _mm256_min_ps(row10, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row14; row14 = _mm256_min_ps(row14, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row18; row18 = _mm256_min_ps(row18, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row19; row19 = _mm256_min_ps(row19, row21); row21 = _mm256_max_ps(temp, row21); \
+    temp = row22; row22 = _mm256_min_ps(row22, row28); row28 = _mm256_max_ps(temp, row28); \
+    temp = row23; row23 = _mm256_min_ps(row23, row25); row25 = _mm256_max_ps(temp, row25); \
+    temp = row26; row26 = _mm256_min_ps(row26, row32); row32 = _mm256_max_ps(temp, row32); \
+    temp = row29; row29 = _mm256_min_ps(row29, row30); row30 = _mm256_max_ps(temp, row30); \
+    temp = row31; row31 = _mm256_min_ps(row31, row33); row33 = _mm256_max_ps(temp, row33); \
+    temp = row35; row35 = _mm256_min_ps(row35, row38); row38 = _mm256_max_ps(temp, row38); \
+    temp = row37; row37 = _mm256_min_ps(row37, row40); row40 = _mm256_max_ps(temp, row40); \
+    temp = row39; row39 = _mm256_min_ps(row39, row44); row44 = _mm256_max_ps(temp, row44); \
+    temp = row43; row43 = _mm256_min_ps(row43, row45); row45 = _mm256_max_ps(temp, row45); \
+    temp = row46; row46 = _mm256_min_ps(row46, row48); row48 = _mm256_max_ps(temp, row48); \
+    temp = row6; row6 = _mm256_min_ps(row6, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row10; row10 = _mm256_min_ps(row10, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row11; row11 = _mm256_min_ps(row11, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row13; row13 = _mm256_min_ps(row13, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row15; row15 = _mm256_min_ps(row15, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row17; row17 = _mm256_min_ps(row17, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row22; row22 = _mm256_min_ps(row22, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row26; row26 = _mm256_min_ps(row26, row28); row28 = _mm256_max_ps(temp, row28); \
+    temp = row27; row27 = _mm256_min_ps(row27, row32); row32 = _mm256_max_ps(temp, row32); \
+    temp = row31; row31 = _mm256_min_ps(row31, row34); row34 = _mm256_max_ps(temp, row34); \
+    temp = row33; row33 = _mm256_min_ps(row33, row36); row36 = _mm256_max_ps(temp, row36); \
+    temp = row35; row35 = _mm256_min_ps(row35, row37); row37 = _mm256_max_ps(temp, row37); \
+    temp = row38; row38 = _mm256_min_ps(row38, row40); row40 = _mm256_max_ps(temp, row40); \
+    temp = row41; row41 = _mm256_min_ps(row41, row44); row44 = _mm256_max_ps(temp, row44); \
+    temp = row47; row47 = _mm256_min_ps(row47, row48); row48 = _mm256_max_ps(temp, row48); \
+    temp = row3; row3 = _mm256_min_ps(row3, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row5; row5 = _mm256_min_ps(row5, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row7; row7 = _mm256_min_ps(row7, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row9; row9 = _mm256_min_ps(row9, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row11; row11 = _mm256_min_ps(row11, row13); row13 = _mm256_max_ps(temp, row13); \
+    temp = row14; row14 = _mm256_min_ps(row14, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row15; row15 = _mm256_min_ps(row15, row17); row17 = _mm256_max_ps(temp, row17); \
+    temp = row18; row18 = _mm256_min_ps(row18, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row19; row19 = _mm256_min_ps(row19, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row21; row21 = _mm256_min_ps(row21, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row23; row23 = _mm256_min_ps(row23, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row25; row25 = _mm256_min_ps(row25, row28); row28 = _mm256_max_ps(temp, row28); \
+    temp = row27; row27 = _mm256_min_ps(row27, row29); row29 = _mm256_max_ps(temp, row29); \
+    temp = row30; row30 = _mm256_min_ps(row30, row32); row32 = _mm256_max_ps(temp, row32); \
+    temp = row33; row33 = _mm256_min_ps(row33, row34); row34 = _mm256_max_ps(temp, row34); \
+    temp = row35; row35 = _mm256_min_ps(row35, row36); row36 = _mm256_max_ps(temp, row36); \
+    temp = row37; row37 = _mm256_min_ps(row37, row38); row38 = _mm256_max_ps(temp, row38); \
+    temp = row39; row39 = _mm256_min_ps(row39, row41); row41 = _mm256_max_ps(temp, row41); \
+    temp = row42; row42 = _mm256_min_ps(row42, row44); row44 = _mm256_max_ps(temp, row44); \
+    temp = row3; row3 = _mm256_min_ps(row3, row4); row4 = _mm256_max_ps(temp, row4); \
+    temp = row5; row5 = _mm256_min_ps(row5, row6); row6 = _mm256_max_ps(temp, row6); \
+    temp = row7; row7 = _mm256_min_ps(row7, row8); row8 = _mm256_max_ps(temp, row8); \
+    temp = row9; row9 = _mm256_min_ps(row9, row10); row10 = _mm256_max_ps(temp, row10); \
+    temp = row11; row11 = _mm256_min_ps(row11, row12); row12 = _mm256_max_ps(temp, row12); \
+    temp = row13; row13 = _mm256_min_ps(row13, row14); row14 = _mm256_max_ps(temp, row14); \
+    temp = row15; row15 = _mm256_min_ps(row15, row16); row16 = _mm256_max_ps(temp, row16); \
+    temp = row17; row17 = _mm256_min_ps(row17, row18); row18 = _mm256_max_ps(temp, row18); \
+    temp = row19; row19 = _mm256_min_ps(row19, row20); row20 = _mm256_max_ps(temp, row20); \
+    temp = row21; row21 = _mm256_min_ps(row21, row22); row22 = _mm256_max_ps(temp, row22); \
+    temp = row23; row23 = _mm256_min_ps(row23, row24); row24 = _mm256_max_ps(temp, row24); \
+    temp = row25; row25 = _mm256_min_ps(row25, row26); row26 = _mm256_max_ps(temp, row26); \
+    temp = row27; row27 = _mm256_min_ps(row27, row28); row28 = _mm256_max_ps(temp, row28); \
+    temp = row29; row29 = _mm256_min_ps(row29, row30); row30 = _mm256_max_ps(temp, row30); \
+    temp = row31; row31 = _mm256_min_ps(row31, row32); row32 = _mm256_max_ps(temp, row32); \
+    temp = row39; row39 = _mm256_min_ps(row39, row40); row40 = _mm256_max_ps(temp, row40); \
+    temp = row43; row43 = _mm256_min_ps(row43, row44); row44 = _mm256_max_ps(temp, row44); \
+} while (0)
+
+#define _MM256_TRANSFER_EPI8(a, b, idx) _mm256_insert_epi8(b, _mm256_extract_epi8(a, idx), idx)
+#define _MM256_TRANSFER_EPI16(a, b, idx) _mm256_insert_epi16(b, _mm256_extract_epi16(a, idx), idx)
+#define _MM256_TRANSFER_PS(a, b, idx) _mm256_castsi256_ps(_mm256_insert_epi32(b, _mm256_extract_epi32(_mm256_castps_si256(a), idx), idx))
+
+static inline __m256 _mm256_avg_ps(__m256 a, __m256 b) {
+    return _mm256_div_ps(_mm256_add_ps(a, b), _mm256_set1_ps(2.0F));
+}
+
+static inline __m256i _mm256_reassignment_epi8(__m256i a, __m256i idx) {
+    __m256i branch0 = _mm256_shuffle_epi8(_mm256_permute4x64_epi64(a, 0x44), idx);
+    __m256i branch1 = _mm256_shuffle_epi8(_mm256_permute4x64_epi64(a, 0xEE), idx);
+    return _mm256_blendv_epi8(branch0, branch1, _mm256_cmpgt_epi8(idx, _mm256_set1_epi8(15)));
+}
+
+static inline __m256i _mm256_reassignment_epi16(__m256i a, __m256i idx) {
+    idx = _mm256_slli_epi16(idx, 1);
+    idx = _mm256_or_si256(idx, _mm256_slli_epi16(_mm256_or_si256(idx, _mm256_set1_epi16(1)), 8));
+    return _mm256_reassignment_epi8(a, idx);
+}
+
+static inline __m256 _mm256_reassignment_ps(__m256 a, __m256i idx) {
+    __m256 mask = _mm256_castsi256_ps(_mm256_cmpgt_epi32(_mm256_setzero_si256(), idx));
+    return _mm256_blendv_ps(_mm256_permutevar8x32_ps(a, idx), _mm256_set1_ps(-FLT_MAX), mask);
+}
+
+static void get_median_blur_radius1_8(
+    const void *restrict srcp, void *restrict dstp, int src_w, int src_h, ptrdiff_t stride, int radius UNUSED
+) {
+    const uint8_t *restrict ptrs = srcp;
+    uint8_t *restrict ptrd = dstp;
+    int tail = src_w % 32;
+    if (!tail) tail = 32;
+    int mod32_w = src_w - tail;
+    int x = 0;
+    
+    __m256i left_idx = _mm256_setr_epi8(
+        -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+        15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30
+    );
+    __m256i right_idx = _mm256_setr_epi8(
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+        17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, -1
+    );
+    
+    __m256i pix[3][3];
+    
+    pix[1][1] = _mm256_loadu_si256((const __m256i *)ptrs);
+    pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs + 1));
+    pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride));
+    pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 1));
+    pix[1][0] = _mm256_reassignment_epi8(pix[1][1], left_idx);
+    pix[2][0] = _mm256_reassignment_epi8(pix[2][1], left_idx);
+    _MM256_SORT6_EPU8(pix[1][0], pix[1][1], pix[1][2], pix[2][0], pix[2][1], pix[2][2]);
+    pix[1][2] = _mm256_avg_epu8(pix[1][2], pix[2][0]);
+    pix[1][2] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[2][0], pix[2][1]), pix[1][2], 0);
+    _mm256_storeu_si256((__m256i *)ptrd, pix[1][2]);
+    
+    for (x = 32; x < mod32_w; x += 32) {
+        pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+        pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+        pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 1));
+        pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+        pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+        pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 1));
+        _MM256_SORT6_EPU8(pix[1][0], pix[1][1], pix[1][2], pix[2][0], pix[2][1], pix[2][2]);
+        pix[1][2] = _mm256_avg_epu8(pix[1][2], pix[2][0]);
+        _mm256_storeu_si256((__m256i *)(ptrd + x), pix[1][2]);
+    }
+    
+    x = src_w - 32;
+    pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+    pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+    pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+    pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+    pix[1][2] = _mm256_reassignment_epi8(pix[1][1], right_idx);
+    pix[2][2] = _mm256_reassignment_epi8(pix[2][1], right_idx);
+    _MM256_SORT6_EPU8(pix[1][0], pix[1][1], pix[1][2], pix[2][0], pix[2][1], pix[2][2]);
+    pix[1][2] = _mm256_avg_epu8(pix[1][2], pix[2][0]);
+    pix[1][2] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[2][0], pix[2][1]), pix[1][2], 31);
+    _mm256_storeu_si256((__m256i *)(ptrd + x), pix[1][2]);
+    
+    ptrs += stride;
+    ptrd += stride;
+    
+    for (int y = 1; y < src_h - 1; y++) {
+        pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride));
+        pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 1));
+        pix[1][1] = _mm256_loadu_si256((const __m256i *)ptrs);
+        pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs + 1));
+        pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride));
+        pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 1));
+        pix[0][0] = _mm256_reassignment_epi8(pix[0][1], left_idx);
+        pix[1][0] = _mm256_reassignment_epi8(pix[1][1], left_idx);
+        pix[2][0] = _mm256_reassignment_epi8(pix[2][1], left_idx);
+        _MM256_SORT9_EPU8(
+            pix[0][0], pix[0][1], pix[0][2], pix[1][0], pix[1][1], pix[1][2], pix[2][0], pix[2][1], pix[2][2]
+        );
+        pix[1][1] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[1][2], pix[2][0]), pix[1][1], 0);
+        _mm256_storeu_si256((__m256i *)ptrd, pix[1][1]);
+        
+        for (x = 32; x < mod32_w; x += 32) {
+            pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+            pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+            pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 1));
+            pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+            pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+            pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 1));
+            pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+            pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+            pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 1));
+            _MM256_SORT9_EPU8(
+                pix[0][0], pix[0][1], pix[0][2], pix[1][0], pix[1][1], pix[1][2], pix[2][0], pix[2][1], pix[2][2]
+            );
+            _mm256_storeu_si256((__m256i *)(ptrd + x), pix[1][1]);
+        }
+        
+        x = src_w - 32;
+        pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+        pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+        pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+        pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+        pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+        pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+        pix[0][2] = _mm256_reassignment_epi8(pix[0][1], right_idx);
+        pix[1][2] = _mm256_reassignment_epi8(pix[1][1], right_idx);
+        pix[2][2] = _mm256_reassignment_epi8(pix[2][1], right_idx);
+        _MM256_SORT9_EPU8(
+            pix[0][0], pix[0][1], pix[0][2], pix[1][0], pix[1][1], pix[1][2], pix[2][0], pix[2][1], pix[2][2]
+        );
+        pix[1][1] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[1][2], pix[2][0]), pix[1][1], 31);
+        _mm256_storeu_si256((__m256i *)(ptrd + x), pix[1][1]);
+        
+        ptrs += stride;
+        ptrd += stride;
+    }
+    
+    pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride));
+    pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 1));
+    pix[1][1] = _mm256_loadu_si256((const __m256i *)ptrs);
+    pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs + 1));
+    pix[0][0] = _mm256_reassignment_epi8(pix[0][1], left_idx);
+    pix[1][0] = _mm256_reassignment_epi8(pix[1][1], left_idx);
+    _MM256_SORT6_EPU8(pix[0][0], pix[0][1], pix[0][2], pix[1][0], pix[1][1], pix[1][2]);
+    pix[0][2] = _mm256_avg_epu8(pix[0][2], pix[1][0]);
+    pix[0][2] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[1][0], pix[1][1]), pix[0][2], 0);
+    _mm256_storeu_si256((__m256i *)ptrd, pix[0][2]);
+    
+    for (x = 32; x < mod32_w; x += 32) {
+        pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+        pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+        pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 1));
+        pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+        pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+        pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 1));
+        _MM256_SORT6_EPU8(pix[0][0], pix[0][1], pix[0][2], pix[1][0], pix[1][1], pix[1][2]);
+        pix[0][2] = _mm256_avg_epu8(pix[0][2], pix[1][0]);
+        _mm256_storeu_si256((__m256i *)(ptrd + x), pix[0][2]);
+    }
+    
+    x = src_w - 32;
+    pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+    pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+    pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+    pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+    pix[0][2] = _mm256_reassignment_epi8(pix[0][1], right_idx);
+    pix[1][2] = _mm256_reassignment_epi8(pix[1][1], right_idx);
+    _MM256_SORT6_EPU8(pix[0][0], pix[0][1], pix[0][2], pix[1][0], pix[1][1], pix[1][2]);
+    pix[0][2] = _mm256_avg_epu8(pix[0][2], pix[1][0]);
+    pix[0][2] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[1][0], pix[1][1]), pix[0][2], 31);
+    _mm256_storeu_si256((__m256i *)(ptrd + x), pix[0][2]);
+}
+
+static void get_median_blur_radius1_16(
+    const void *restrict srcp, void *restrict dstp, int src_w, int src_h, ptrdiff_t stride, int radius UNUSED
+) {
+    const uint16_t *restrict ptrs = srcp;
+    uint16_t *restrict ptrd = dstp;
+    int tail = src_w % 16;
+    if (!tail) tail = 16;
+    int mod16_w = src_w - tail;
+    int x = 0;
+    
+    __m256i left_idx = _mm256_setr_epi16(-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14);
+    __m256i right_idx = _mm256_setr_epi16(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, -1);
+    
+    __m256i pix[3][3];
+    
+    pix[1][1] = _mm256_loadu_si256((const __m256i *)ptrs);
+    pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs + 1));
+    pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride));
+    pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 1));
+    pix[1][0] = _mm256_reassignment_epi16(pix[1][1], left_idx);
+    pix[2][0] = _mm256_reassignment_epi16(pix[2][1], left_idx);
+    _MM256_SORT6_EPU16(pix[1][0], pix[1][1], pix[1][2], pix[2][0], pix[2][1], pix[2][2]);
+    pix[1][2] = _mm256_avg_epu16(pix[1][2], pix[2][0]);
+    pix[1][2] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[2][0], pix[2][1]), pix[1][2], 0);
+    _mm256_storeu_si256((__m256i *)ptrd, pix[1][2]);
+    
+    for (x = 16; x < mod16_w; x += 16) {
+        pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+        pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+        pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 1));
+        pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+        pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+        pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 1));
+        _MM256_SORT6_EPU16(pix[1][0], pix[1][1], pix[1][2], pix[2][0], pix[2][1], pix[2][2]);
+        pix[1][2] = _mm256_avg_epu16(pix[1][2], pix[2][0]);
+        _mm256_storeu_si256((__m256i *)(ptrd + x), pix[1][2]);
+    }
+    
+    x = src_w - 16;
+    pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+    pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+    pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+    pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+    pix[1][2] = _mm256_reassignment_epi16(pix[1][1], right_idx);
+    pix[2][2] = _mm256_reassignment_epi16(pix[2][1], right_idx);
+    _MM256_SORT6_EPU16(pix[1][0], pix[1][1], pix[1][2], pix[2][0], pix[2][1], pix[2][2]);
+    pix[1][2] = _mm256_avg_epu16(pix[1][2], pix[2][0]);
+    pix[1][2] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[2][0], pix[2][1]), pix[1][2], 15);
+    _mm256_storeu_si256((__m256i *)(ptrd + x), pix[1][2]);
+    
+    ptrs += stride;
+    ptrd += stride;
+    
+    for (int y = 1; y < src_h - 1; y++) {
+        pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride));
+        pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 1));
+        pix[1][1] = _mm256_loadu_si256((const __m256i *)ptrs);
+        pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs + 1));
+        pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride));
+        pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 1));
+        pix[0][0] = _mm256_reassignment_epi16(pix[0][1], left_idx);
+        pix[1][0] = _mm256_reassignment_epi16(pix[1][1], left_idx);
+        pix[2][0] = _mm256_reassignment_epi16(pix[2][1], left_idx);
+        _MM256_SORT9_EPU16(
+            pix[0][0], pix[0][1], pix[0][2], pix[1][0], pix[1][1], pix[1][2], pix[2][0], pix[2][1], pix[2][2]
+        );
+        pix[1][1] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[1][2], pix[2][0]), pix[1][1], 0);
+        _mm256_storeu_si256((__m256i *)ptrd, pix[1][1]);
+        
+        for (x = 16; x < mod16_w; x += 16) {
+            pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+            pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+            pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 1));
+            pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+            pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+            pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 1));
+            pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+            pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+            pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 1));
+            _MM256_SORT9_EPU16(
+                pix[0][0], pix[0][1], pix[0][2], pix[1][0], pix[1][1], pix[1][2], pix[2][0], pix[2][1], pix[2][2]
+            );
+            _mm256_storeu_si256((__m256i *)(ptrd + x), pix[1][1]);
+        }
+        
+        x = src_w - 16;
+        pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+        pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+        pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+        pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+        pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+        pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+        pix[0][2] = _mm256_reassignment_epi16(pix[0][1], right_idx);
+        pix[1][2] = _mm256_reassignment_epi16(pix[1][1], right_idx);
+        pix[2][2] = _mm256_reassignment_epi16(pix[2][1], right_idx);
+        _MM256_SORT9_EPU16(
+            pix[0][0], pix[0][1], pix[0][2], pix[1][0], pix[1][1], pix[1][2], pix[2][0], pix[2][1], pix[2][2]
+        );
+        pix[1][1] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[1][2], pix[2][0]), pix[1][1], 15);
+        _mm256_storeu_si256((__m256i *)(ptrd + x), pix[1][1]);
+        
+        ptrs += stride;
+        ptrd += stride;
+    }
+    
+    pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride));
+    pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 1));
+    pix[1][1] = _mm256_loadu_si256((const __m256i *)ptrs);
+    pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs + 1));
+    pix[0][0] = _mm256_reassignment_epi16(pix[0][1], left_idx);
+    pix[1][0] = _mm256_reassignment_epi16(pix[1][1], left_idx);
+    _MM256_SORT6_EPU16(pix[0][0], pix[0][1], pix[0][2], pix[1][0], pix[1][1], pix[1][2]);
+    pix[0][2] = _mm256_avg_epu16(pix[0][2], pix[1][0]);
+    pix[0][2] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[1][0], pix[1][1]), pix[0][2], 0);
+    _mm256_storeu_si256((__m256i *)ptrd, pix[0][2]);
+    
+    for (x = 16; x < mod16_w; x += 16) {
+        pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+        pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+        pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 1));
+        pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+        pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+        pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 1));
+        _MM256_SORT6_EPU16(pix[0][0], pix[0][1], pix[0][2], pix[1][0], pix[1][1], pix[1][2]);
+        pix[0][2] = _mm256_avg_epu16(pix[0][2], pix[1][0]);
+        _mm256_storeu_si256((__m256i *)(ptrd + x), pix[0][2]);
+    }
+    
+    x = src_w - 16;
+    pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+    pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+    pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+    pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+    pix[0][2] = _mm256_reassignment_epi16(pix[0][1], right_idx);
+    pix[1][2] = _mm256_reassignment_epi16(pix[1][1], right_idx);
+    _MM256_SORT6_EPU16(pix[0][0], pix[0][1], pix[0][2], pix[1][0], pix[1][1], pix[1][2]);
+    pix[0][2] = _mm256_avg_epu16(pix[0][2], pix[1][0]);
+    pix[0][2] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[1][0], pix[1][1]), pix[0][2], 15);
+    _mm256_storeu_si256((__m256i *)(ptrd + x), pix[0][2]);
+}
+
+static void get_median_blur_radius1_32(
+    const void *restrict srcp, void *restrict dstp, int src_w, int src_h, ptrdiff_t stride, int radius UNUSED
+) {
+    const float *restrict ptrs = srcp;
+    float *restrict ptrd = dstp;
+    int tail = src_w % 8;
+    if (!tail) tail = 8;
+    int mod8_w = src_w - tail;
+    int x = 0;
+    
+    __m256i left_idx = _mm256_setr_epi32(-1, 0, 1, 2, 3, 4, 5, 6);
+    __m256i right_idx = _mm256_setr_epi32(1, 2, 3, 4, 5, 6, 7, -1);
+    
+    __m256 pix[3][3];
+    
+    pix[1][1] = _mm256_loadu_ps(ptrs);
+    pix[1][2] = _mm256_loadu_ps(ptrs + 1);
+    pix[2][1] = _mm256_loadu_ps(ptrs + stride);
+    pix[2][2] = _mm256_loadu_ps(ptrs + stride + 1);
+    pix[1][0] = _mm256_reassignment_ps(pix[1][1], left_idx);
+    pix[2][0] = _mm256_reassignment_ps(pix[2][1], left_idx);
+    _MM256_SORT6_PS(pix[1][0], pix[1][1], pix[1][2], pix[2][0], pix[2][1], pix[2][2]);
+    pix[1][2] = _mm256_avg_ps(pix[1][2], pix[2][0]);
+    pix[1][2] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[2][0], pix[2][1]), pix[1][2], 0);
+    _mm256_storeu_ps(ptrd, pix[1][2]);
+    
+    for (x = 8; x < mod8_w; x += 8) {
+        pix[1][0] = _mm256_loadu_ps(ptrs + x - 1);
+        pix[1][1] = _mm256_loadu_ps(ptrs + x);
+        pix[1][2] = _mm256_loadu_ps(ptrs + x + 1);
+        pix[2][0] = _mm256_loadu_ps(ptrs + stride + x - 1);
+        pix[2][1] = _mm256_loadu_ps(ptrs + stride + x);
+        pix[2][2] = _mm256_loadu_ps(ptrs + stride + x + 1);
+        _MM256_SORT6_PS(pix[1][0], pix[1][1], pix[1][2], pix[2][0], pix[2][1], pix[2][2]);
+        pix[1][2] = _mm256_avg_ps(pix[1][2], pix[2][0]);
+        _mm256_storeu_ps(ptrd + x, pix[1][2]);
+    }
+    
+    x = src_w - 8;
+    pix[1][0] = _mm256_loadu_ps(ptrs + x - 1);
+    pix[1][1] = _mm256_loadu_ps(ptrs + x);
+    pix[2][0] = _mm256_loadu_ps(ptrs + stride + x - 1);
+    pix[2][1] = _mm256_loadu_ps(ptrs + stride + x);
+    pix[1][2] = _mm256_reassignment_ps(pix[1][1], right_idx);
+    pix[2][2] = _mm256_reassignment_ps(pix[2][1], right_idx);
+    _MM256_SORT6_PS(pix[1][0], pix[1][1], pix[1][2], pix[2][0], pix[2][1], pix[2][2]);
+    pix[1][2] = _mm256_avg_ps(pix[1][2], pix[2][0]);
+    pix[1][2] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[2][0], pix[2][1]), pix[1][2], 7);
+    _mm256_storeu_ps(ptrd + x, pix[1][2]);
+    
+    ptrs += stride;
+    ptrd += stride;
+    
+    for (int y = 1; y < src_h - 1; y++) {
+        pix[0][1] = _mm256_loadu_ps(ptrs - stride);
+        pix[0][2] = _mm256_loadu_ps(ptrs - stride + 1);
+        pix[1][1] = _mm256_loadu_ps(ptrs);
+        pix[1][2] = _mm256_loadu_ps(ptrs + 1);
+        pix[2][1] = _mm256_loadu_ps(ptrs + stride);
+        pix[2][2] = _mm256_loadu_ps(ptrs + stride + 1);
+        pix[0][0] = _mm256_reassignment_ps(pix[0][1], left_idx);
+        pix[1][0] = _mm256_reassignment_ps(pix[1][1], left_idx);
+        pix[2][0] = _mm256_reassignment_ps(pix[2][1], left_idx);
+        _MM256_SORT9_PS(
+            pix[0][0], pix[0][1], pix[0][2], pix[1][0], pix[1][1], pix[1][2], pix[2][0], pix[2][1], pix[2][2]
+        );
+        pix[1][1] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[1][2], pix[2][0]), pix[1][1], 0);
+        _mm256_storeu_ps(ptrd, pix[1][1]);
+        
+        for (x = 8; x < mod8_w; x += 8) {
+            pix[0][0] = _mm256_loadu_ps(ptrs - stride + x - 1);
+            pix[0][1] = _mm256_loadu_ps(ptrs - stride + x);
+            pix[0][2] = _mm256_loadu_ps(ptrs - stride + x + 1);
+            pix[1][0] = _mm256_loadu_ps(ptrs + x - 1);
+            pix[1][1] = _mm256_loadu_ps(ptrs + x);
+            pix[1][2] = _mm256_loadu_ps(ptrs + x + 1);
+            pix[2][0] = _mm256_loadu_ps(ptrs + stride + x - 1);
+            pix[2][1] = _mm256_loadu_ps(ptrs + stride + x);
+            pix[2][2] = _mm256_loadu_ps(ptrs + stride + x + 1);
+            _MM256_SORT9_PS(
+                pix[0][0], pix[0][1], pix[0][2], pix[1][0], pix[1][1], pix[1][2], pix[2][0], pix[2][1], pix[2][2]
+            );
+            _mm256_storeu_ps(ptrd + x, pix[1][1]);
+        }
+        
+        x = src_w - 8;
+        pix[0][0] = _mm256_loadu_ps(ptrs - stride + x - 1);
+        pix[0][1] = _mm256_loadu_ps(ptrs - stride + x);
+        pix[1][0] = _mm256_loadu_ps(ptrs + x - 1);
+        pix[1][1] = _mm256_loadu_ps(ptrs + x);
+        pix[2][0] = _mm256_loadu_ps(ptrs + stride + x - 1);
+        pix[2][1] = _mm256_loadu_ps(ptrs + stride + x);
+        pix[0][2] = _mm256_reassignment_ps(pix[0][1], right_idx);
+        pix[1][2] = _mm256_reassignment_ps(pix[1][1], right_idx);
+        pix[2][2] = _mm256_reassignment_ps(pix[2][1], right_idx);
+        _MM256_SORT9_PS(
+            pix[0][0], pix[0][1], pix[0][2], pix[1][0], pix[1][1], pix[1][2], pix[2][0], pix[2][1], pix[2][2]
+        );
+        pix[1][1] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[1][2], pix[2][0]), pix[1][1], 7);
+        _mm256_storeu_ps(ptrd + x, pix[1][1]);
+        
+        ptrs += stride;
+        ptrd += stride;
+    }
+    
+    pix[0][1] = _mm256_loadu_ps(ptrs - stride);
+    pix[0][2] = _mm256_loadu_ps(ptrs - stride + 1);
+    pix[1][1] = _mm256_loadu_ps(ptrs);
+    pix[1][2] = _mm256_loadu_ps(ptrs + 1);
+    pix[0][0] = _mm256_reassignment_ps(pix[0][1], left_idx);
+    pix[1][0] = _mm256_reassignment_ps(pix[1][1], left_idx);
+    _MM256_SORT6_PS(pix[0][0], pix[0][1], pix[0][2], pix[1][0], pix[1][1], pix[1][2]);
+    pix[0][2] = _mm256_avg_ps(pix[0][2], pix[1][0]);
+    pix[0][2] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[1][0], pix[1][1]), pix[0][2], 0);
+    _mm256_storeu_ps(ptrd, pix[0][2]);
+    
+    for (x = 8; x < mod8_w; x += 8) {
+        pix[0][0] = _mm256_loadu_ps(ptrs - stride + x - 1);
+        pix[0][1] = _mm256_loadu_ps(ptrs - stride + x);
+        pix[0][2] = _mm256_loadu_ps(ptrs - stride + x + 1);
+        pix[1][0] = _mm256_loadu_ps(ptrs + x - 1);
+        pix[1][1] = _mm256_loadu_ps(ptrs + x);
+        pix[1][2] = _mm256_loadu_ps(ptrs + x + 1);
+        _MM256_SORT6_PS(pix[0][0], pix[0][1], pix[0][2], pix[1][0], pix[1][1], pix[1][2]);
+        pix[0][2] = _mm256_avg_ps(pix[0][2], pix[1][0]);
+        _mm256_storeu_ps(ptrd + x, pix[0][2]);
+    }
+    
+    x = src_w - 8;
+    pix[0][0] = _mm256_loadu_ps(ptrs - stride + x - 1);
+    pix[0][1] = _mm256_loadu_ps(ptrs - stride + x);
+    pix[1][0] = _mm256_loadu_ps(ptrs + x - 1);
+    pix[1][1] = _mm256_loadu_ps(ptrs + x);
+    pix[0][2] = _mm256_reassignment_ps(pix[0][1], right_idx);
+    pix[1][2] = _mm256_reassignment_ps(pix[1][1], right_idx);
+    _MM256_SORT6_PS(pix[0][0], pix[0][1], pix[0][2], pix[1][0], pix[1][1], pix[1][2]);
+    pix[0][2] = _mm256_avg_ps(pix[0][2], pix[1][0]);
+    pix[0][2] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[1][0], pix[1][1]), pix[0][2], 7);
+    _mm256_storeu_ps(ptrd + x, pix[0][2]);
+}
+
+static void get_median_blur_radius2_8(
+    const void *restrict srcp, void *restrict dstp, int src_w, int src_h, ptrdiff_t stride, int radius UNUSED
+) {
+    const uint8_t *restrict ptrs = srcp;
+    uint8_t *restrict ptrd = dstp;
+    int tail = src_w % 32;
+    if (!tail) tail = 32;
+    int mod32_w = src_w - tail;
+    int x = 0;
+    
+    __m256i left_idx = _mm256_setr_epi8(
+        -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+        15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30
+    );
+    __m256i right_idx = _mm256_setr_epi8(
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+        17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, -1
+    );
+    
+    __m256i pix[5][5];
+    
+    pix[2][2] = _mm256_loadu_si256((const __m256i *)ptrs);
+    pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs + 1));
+    pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs + 2));
+    pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride));
+    pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 1));
+    pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 2));
+    pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2));
+    pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 1));
+    pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 2));
+    pix[2][1] = _mm256_reassignment_epi8(pix[2][2], left_idx);
+    pix[2][0] = _mm256_reassignment_epi8(pix[2][1], left_idx);
+    pix[3][1] = _mm256_reassignment_epi8(pix[3][2], left_idx);
+    pix[3][0] = _mm256_reassignment_epi8(pix[3][1], left_idx);
+    pix[4][1] = _mm256_reassignment_epi8(pix[4][2], left_idx);
+    pix[4][0] = _mm256_reassignment_epi8(pix[4][1], left_idx);
+    _MM256_SORT15_EPU8(
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4]
+    );
+    pix[3][2] = _MM256_TRANSFER_EPI8(pix[4][0], pix[3][2], 0);
+    pix[3][2] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[3][3], pix[3][4]), pix[3][2], 1);
+    _mm256_storeu_si256((__m256i *)ptrd, pix[3][2]);
+    
+    for (x = 32; x < mod32_w; x += 32) {
+        pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+        pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+        pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+        pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 1));
+        pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 2));
+        pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+        pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+        pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+        pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 1));
+        pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 2));
+        pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+        pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+        pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+        pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 1));
+        pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 2));
+        _MM256_SORT15_EPU8(
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4]
+        );
+        _mm256_storeu_si256((__m256i *)(ptrd + x), pix[3][2]);
+    }
+    
+    x = src_w - 32;
+    pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+    pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+    pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+    pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+    pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+    pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+    pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+    pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+    pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+    pix[2][3] = _mm256_reassignment_epi8(pix[2][2], right_idx);
+    pix[2][4] = _mm256_reassignment_epi8(pix[2][3], right_idx);
+    pix[3][3] = _mm256_reassignment_epi8(pix[3][2], right_idx);
+    pix[3][4] = _mm256_reassignment_epi8(pix[3][3], right_idx);
+    pix[4][3] = _mm256_reassignment_epi8(pix[4][2], right_idx);
+    pix[4][4] = _mm256_reassignment_epi8(pix[4][3], right_idx);
+    _MM256_SORT15_EPU8(
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4]
+    );
+    pix[3][2] = _MM256_TRANSFER_EPI8(pix[4][0], pix[3][2], 31);
+    pix[3][2] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[3][3], pix[3][4]), pix[3][2], 30);
+    _mm256_storeu_si256((__m256i *)(ptrd + x), pix[3][2]);
+    
+    ptrs += stride;
+    ptrd += stride;
+    
+    pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride));
+    pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 1));
+    pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 2));
+    pix[2][2] = _mm256_loadu_si256((const __m256i *)ptrs);
+    pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs + 1));
+    pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs + 2));
+    pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride));
+    pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 1));
+    pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 2));
+    pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2));
+    pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 1));
+    pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 2));
+    pix[1][1] = _mm256_reassignment_epi8(pix[1][2], left_idx);
+    pix[1][0] = _mm256_reassignment_epi8(pix[1][1], left_idx);
+    pix[2][1] = _mm256_reassignment_epi8(pix[2][2], left_idx);
+    pix[2][0] = _mm256_reassignment_epi8(pix[2][1], left_idx);
+    pix[3][1] = _mm256_reassignment_epi8(pix[3][2], left_idx);
+    pix[3][0] = _mm256_reassignment_epi8(pix[3][1], left_idx);
+    pix[4][1] = _mm256_reassignment_epi8(pix[4][2], left_idx);
+    pix[4][0] = _mm256_reassignment_epi8(pix[4][1], left_idx);
+    _MM256_SORT20_EPU8(
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4]
+    );
+    pix[2][4] = _mm256_avg_epu8(pix[2][4], pix[3][0]);
+    pix[2][4] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[3][3], pix[3][4]), pix[2][4], 0);
+    pix[2][4] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[3][1], pix[3][2]), pix[2][4], 1);
+    _mm256_storeu_si256((__m256i *)ptrd, pix[2][4]);
+    
+    for (x = 32; x < mod32_w; x += 32) {
+        pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+        pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+        pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+        pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 1));
+        pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 2));
+        pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+        pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+        pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+        pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 1));
+        pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 2));
+        pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+        pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+        pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+        pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 1));
+        pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 2));
+        pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+        pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+        pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+        pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 1));
+        pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 2));
+        _MM256_SORT20_EPU8(
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4]
+        );
+        pix[2][4] = _mm256_avg_epu8(pix[2][4], pix[3][0]);
+        _mm256_storeu_si256((__m256i *)(ptrd + x), pix[2][4]);
+    }
+    
+    x = src_w - 32;
+    pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+    pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+    pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+    pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+    pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+    pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+    pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+    pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+    pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+    pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+    pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+    pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+    pix[1][3] = _mm256_reassignment_epi8(pix[1][2], right_idx);
+    pix[1][4] = _mm256_reassignment_epi8(pix[1][3], right_idx);
+    pix[2][3] = _mm256_reassignment_epi8(pix[2][2], right_idx);
+    pix[2][4] = _mm256_reassignment_epi8(pix[2][3], right_idx);
+    pix[3][3] = _mm256_reassignment_epi8(pix[3][2], right_idx);
+    pix[3][4] = _mm256_reassignment_epi8(pix[3][3], right_idx);
+    pix[4][3] = _mm256_reassignment_epi8(pix[4][2], right_idx);
+    pix[4][4] = _mm256_reassignment_epi8(pix[4][3], right_idx);
+    _MM256_SORT20_EPU8(
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4]
+    );
+    pix[2][4] = _mm256_avg_epu8(pix[2][4], pix[3][0]);
+    pix[2][4] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[3][3], pix[3][4]), pix[2][4], 31);
+    pix[2][4] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[3][1], pix[3][2]), pix[2][4], 30);
+    _mm256_storeu_si256((__m256i *)(ptrd + x), pix[2][4]);
+    
+    ptrs += stride;
+    ptrd += stride;
+    
+    for (int y = 2; y < src_h - 2; y++) {
+        pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2));
+        pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 1));
+        pix[0][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 2));
+        pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride));
+        pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 1));
+        pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 2));
+        pix[2][2] = _mm256_loadu_si256((const __m256i *)ptrs);
+        pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs + 1));
+        pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs + 2));
+        pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride));
+        pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 1));
+        pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 2));
+        pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2));
+        pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 1));
+        pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 2));
+        pix[0][1] = _mm256_reassignment_epi8(pix[0][2], left_idx);
+        pix[0][0] = _mm256_reassignment_epi8(pix[0][1], left_idx);
+        pix[1][1] = _mm256_reassignment_epi8(pix[1][2], left_idx);
+        pix[1][0] = _mm256_reassignment_epi8(pix[1][1], left_idx);
+        pix[2][1] = _mm256_reassignment_epi8(pix[2][2], left_idx);
+        pix[2][0] = _mm256_reassignment_epi8(pix[2][1], left_idx);
+        pix[3][1] = _mm256_reassignment_epi8(pix[3][2], left_idx);
+        pix[3][0] = _mm256_reassignment_epi8(pix[3][1], left_idx);
+        pix[4][1] = _mm256_reassignment_epi8(pix[4][2], left_idx);
+        pix[4][0] = _mm256_reassignment_epi8(pix[4][1], left_idx);
+        _MM256_SORT25_EPU8(
+            pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4],
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4]
+        );
+        pix[2][2] = _MM256_TRANSFER_EPI8(pix[3][2], pix[2][2], 0);
+        pix[2][2] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[2][4], pix[3][0]), pix[2][2], 1);
+        _mm256_storeu_si256((__m256i *)ptrd, pix[2][2]);
+        
+        for (x = 32; x < mod32_w; x += 32) {
+            pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+            pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+            pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+            pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 1));
+            pix[0][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 2));
+            pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+            pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+            pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+            pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 1));
+            pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 2));
+            pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+            pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+            pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+            pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 1));
+            pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 2));
+            pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+            pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+            pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+            pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 1));
+            pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 2));
+            pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+            pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+            pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+            pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 1));
+            pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 2));
+            _MM256_SORT25_EPU8(
+                pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4],
+                pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+                pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+                pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4],
+                pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4]
+            );
+            _mm256_storeu_si256((__m256i *)(ptrd + x), pix[2][2]);
+        }
+        
+        x = src_w - 32;
+        pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+        pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+        pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+        pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+        pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+        pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+        pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+        pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+        pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+        pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+        pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+        pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+        pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+        pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+        pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+        pix[0][3] = _mm256_reassignment_epi8(pix[0][2], right_idx);
+        pix[0][4] = _mm256_reassignment_epi8(pix[0][3], right_idx);
+        pix[1][3] = _mm256_reassignment_epi8(pix[1][2], right_idx);
+        pix[1][4] = _mm256_reassignment_epi8(pix[1][3], right_idx);
+        pix[2][3] = _mm256_reassignment_epi8(pix[2][2], right_idx);
+        pix[2][4] = _mm256_reassignment_epi8(pix[2][3], right_idx);
+        pix[3][3] = _mm256_reassignment_epi8(pix[3][2], right_idx);
+        pix[3][4] = _mm256_reassignment_epi8(pix[3][3], right_idx);
+        pix[4][3] = _mm256_reassignment_epi8(pix[4][2], right_idx);
+        pix[4][4] = _mm256_reassignment_epi8(pix[4][3], right_idx);
+        _MM256_SORT25_EPU8(
+            pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4],
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4]
+        );
+        pix[2][2] = _MM256_TRANSFER_EPI8(pix[3][2], pix[2][2], 31);
+        pix[2][2] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[2][4], pix[3][0]), pix[2][2], 30);
+        _mm256_storeu_si256((__m256i *)(ptrd + x), pix[2][2]);
+        
+        ptrs += stride;
+        ptrd += stride;
+    }
+    
+    pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2));
+    pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 1));
+    pix[0][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 2));
+    pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride));
+    pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 1));
+    pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 2));
+    pix[2][2] = _mm256_loadu_si256((const __m256i *)ptrs);
+    pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs + 1));
+    pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs + 2));
+    pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride));
+    pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 1));
+    pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 2));
+    pix[0][1] = _mm256_reassignment_epi8(pix[0][2], left_idx);
+    pix[0][0] = _mm256_reassignment_epi8(pix[0][1], left_idx);
+    pix[1][1] = _mm256_reassignment_epi8(pix[1][2], left_idx);
+    pix[1][0] = _mm256_reassignment_epi8(pix[1][1], left_idx);
+    pix[2][1] = _mm256_reassignment_epi8(pix[2][2], left_idx);
+    pix[2][0] = _mm256_reassignment_epi8(pix[2][1], left_idx);
+    pix[3][1] = _mm256_reassignment_epi8(pix[3][2], left_idx);
+    pix[3][0] = _mm256_reassignment_epi8(pix[3][1], left_idx);
+    _MM256_SORT20_EPU8(
+        pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4],
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4]
+    );
+    pix[1][4] = _mm256_avg_epu8(pix[1][4], pix[2][0]);
+    pix[1][4] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[2][3], pix[2][4]), pix[1][4], 0);
+    pix[1][4] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[2][1], pix[2][2]), pix[1][4], 1);
+    _mm256_storeu_si256((__m256i *)ptrd, pix[1][4]);
+    
+    for (x = 32; x < mod32_w; x += 32) {
+        pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+        pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+        pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+        pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 1));
+        pix[0][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 2));
+        pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+        pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+        pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+        pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 1));
+        pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 2));
+        pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+        pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+        pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+        pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 1));
+        pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 2));
+        pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+        pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+        pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+        pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 1));
+        pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 2));
+        _MM256_SORT20_EPU8(
+            pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4],
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4]
+        );
+        pix[1][4] = _mm256_avg_epu8(pix[1][4], pix[2][0]);
+        _mm256_storeu_si256((__m256i *)(ptrd + x), pix[1][4]);
+    }
+    
+    x = src_w - 32;
+    pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+    pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+    pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+    pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+    pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+    pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+    pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+    pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+    pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+    pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+    pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+    pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+    pix[0][3] = _mm256_reassignment_epi8(pix[0][2], right_idx);
+    pix[0][4] = _mm256_reassignment_epi8(pix[0][3], right_idx);
+    pix[1][3] = _mm256_reassignment_epi8(pix[1][2], right_idx);
+    pix[1][4] = _mm256_reassignment_epi8(pix[1][3], right_idx);
+    pix[2][3] = _mm256_reassignment_epi8(pix[2][2], right_idx);
+    pix[2][4] = _mm256_reassignment_epi8(pix[2][3], right_idx);
+    pix[3][3] = _mm256_reassignment_epi8(pix[3][2], right_idx);
+    pix[3][4] = _mm256_reassignment_epi8(pix[3][3], right_idx);
+    _MM256_SORT20_EPU8(
+        pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4],
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4]
+    );
+    pix[1][4] = _mm256_avg_epu8(pix[1][4], pix[2][0]);
+    pix[1][4] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[2][3], pix[2][4]), pix[1][4], 31);
+    pix[1][4] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[2][1], pix[2][2]), pix[1][4], 30);
+    _mm256_storeu_si256((__m256i *)(ptrd + x), pix[1][4]);
+    
+    ptrs += stride;
+    ptrd += stride;
+    
+    pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2));
+    pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 1));
+    pix[0][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 2));
+    pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride));
+    pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 1));
+    pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 2));
+    pix[2][2] = _mm256_loadu_si256((const __m256i *)ptrs);
+    pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs + 1));
+    pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs + 2));
+    pix[0][1] = _mm256_reassignment_epi8(pix[0][2], left_idx);
+    pix[0][0] = _mm256_reassignment_epi8(pix[0][1], left_idx);
+    pix[1][1] = _mm256_reassignment_epi8(pix[1][2], left_idx);
+    pix[1][0] = _mm256_reassignment_epi8(pix[1][1], left_idx);
+    pix[2][1] = _mm256_reassignment_epi8(pix[2][2], left_idx);
+    pix[2][0] = _mm256_reassignment_epi8(pix[2][1], left_idx);
+    _MM256_SORT15_EPU8(
+        pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4],
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4]
+    );
+    pix[1][2] = _MM256_TRANSFER_EPI8(pix[2][0], pix[1][2], 0);
+    pix[1][2] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[1][3], pix[1][4]), pix[1][2], 1);
+    _mm256_storeu_si256((__m256i *)ptrd, pix[1][2]);
+    
+    for (x = 32; x < mod32_w; x += 32) {
+        pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+        pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+        pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+        pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 1));
+        pix[0][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 2));
+        pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+        pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+        pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+        pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 1));
+        pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 2));
+        pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+        pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+        pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+        pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 1));
+        pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 2));
+        _MM256_SORT15_EPU8(
+            pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4],
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4]
+        );
+        _mm256_storeu_si256((__m256i *)(ptrd + x), pix[1][2]);
+    }
+    
+    x = src_w - 32;
+    pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+    pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+    pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+    pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+    pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+    pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+    pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+    pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+    pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+    pix[0][3] = _mm256_reassignment_epi8(pix[0][2], right_idx);
+    pix[0][4] = _mm256_reassignment_epi8(pix[0][3], right_idx);
+    pix[1][3] = _mm256_reassignment_epi8(pix[1][2], right_idx);
+    pix[1][4] = _mm256_reassignment_epi8(pix[1][3], right_idx);
+    pix[2][3] = _mm256_reassignment_epi8(pix[2][2], right_idx);
+    pix[2][4] = _mm256_reassignment_epi8(pix[2][3], right_idx);
+    _MM256_SORT15_EPU8(
+        pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4],
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4]
+    );
+    pix[1][2] = _MM256_TRANSFER_EPI8(pix[2][0], pix[1][2], 31);
+    pix[1][2] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[1][3], pix[1][4]), pix[1][2], 30);
+    _mm256_storeu_si256((__m256i *)(ptrd + x), pix[1][2]);
+}
+
+static void get_median_blur_radius2_16(
+    const void *restrict srcp, void *restrict dstp, int src_w, int src_h, ptrdiff_t stride, int radius UNUSED
+) {
+    const uint16_t *restrict ptrs = srcp;
+    uint16_t *restrict ptrd = dstp;
+    int tail = src_w % 16;
+    if (!tail) tail = 16;
+    int mod16_w = src_w - tail;
+    int x = 0;
+    
+    __m256i left_idx = _mm256_setr_epi16(-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14);
+    __m256i right_idx = _mm256_setr_epi16(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, -1);
+    
+    __m256i pix[5][5];
+    
+    pix[2][2] = _mm256_loadu_si256((const __m256i *)ptrs);
+    pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs + 1));
+    pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs + 2));
+    pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride));
+    pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 1));
+    pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 2));
+    pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2));
+    pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 1));
+    pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 2));
+    pix[2][1] = _mm256_reassignment_epi16(pix[2][2], left_idx);
+    pix[2][0] = _mm256_reassignment_epi16(pix[2][1], left_idx);
+    pix[3][1] = _mm256_reassignment_epi16(pix[3][2], left_idx);
+    pix[3][0] = _mm256_reassignment_epi16(pix[3][1], left_idx);
+    pix[4][1] = _mm256_reassignment_epi16(pix[4][2], left_idx);
+    pix[4][0] = _mm256_reassignment_epi16(pix[4][1], left_idx);
+    _MM256_SORT15_EPU16(
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4]
+    );
+    pix[3][2] = _MM256_TRANSFER_EPI16(pix[4][0], pix[3][2], 0);
+    pix[3][2] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[3][3], pix[3][4]), pix[3][2], 1);
+    _mm256_storeu_si256((__m256i *)ptrd, pix[3][2]);
+    
+    for (x = 16; x < mod16_w; x += 16) {
+        pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+        pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+        pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+        pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 1));
+        pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 2));
+        pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+        pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+        pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+        pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 1));
+        pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 2));
+        pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+        pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+        pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+        pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 1));
+        pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 2));
+        _MM256_SORT15_EPU16(
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4]
+        );
+        _mm256_storeu_si256((__m256i *)(ptrd + x), pix[3][2]);
+    }
+    
+    x = src_w - 16;
+    pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+    pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+    pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+    pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+    pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+    pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+    pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+    pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+    pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+    pix[2][3] = _mm256_reassignment_epi16(pix[2][2], right_idx);
+    pix[2][4] = _mm256_reassignment_epi16(pix[2][3], right_idx);
+    pix[3][3] = _mm256_reassignment_epi16(pix[3][2], right_idx);
+    pix[3][4] = _mm256_reassignment_epi16(pix[3][3], right_idx);
+    pix[4][3] = _mm256_reassignment_epi16(pix[4][2], right_idx);
+    pix[4][4] = _mm256_reassignment_epi16(pix[4][3], right_idx);
+    _MM256_SORT15_EPU16(
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4]
+    );
+    pix[3][2] = _MM256_TRANSFER_EPI16(pix[4][0], pix[3][2], 15);
+    pix[3][2] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[3][3], pix[3][4]), pix[3][2], 14);
+    _mm256_storeu_si256((__m256i *)(ptrd + x), pix[3][2]);
+    
+    ptrs += stride;
+    ptrd += stride;
+    
+    pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride));
+    pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 1));
+    pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 2));
+    pix[2][2] = _mm256_loadu_si256((const __m256i *)ptrs);
+    pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs + 1));
+    pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs + 2));
+    pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride));
+    pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 1));
+    pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 2));
+    pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2));
+    pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 1));
+    pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 2));
+    pix[1][1] = _mm256_reassignment_epi16(pix[1][2], left_idx);
+    pix[1][0] = _mm256_reassignment_epi16(pix[1][1], left_idx);
+    pix[2][1] = _mm256_reassignment_epi16(pix[2][2], left_idx);
+    pix[2][0] = _mm256_reassignment_epi16(pix[2][1], left_idx);
+    pix[3][1] = _mm256_reassignment_epi16(pix[3][2], left_idx);
+    pix[3][0] = _mm256_reassignment_epi16(pix[3][1], left_idx);
+    pix[4][1] = _mm256_reassignment_epi16(pix[4][2], left_idx);
+    pix[4][0] = _mm256_reassignment_epi16(pix[4][1], left_idx);
+    _MM256_SORT20_EPU16(
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4]
+    );
+    pix[2][4] = _mm256_avg_epu16(pix[2][4], pix[3][0]);
+    pix[2][4] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[3][3], pix[3][4]), pix[2][4], 0);
+    pix[2][4] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[3][1], pix[3][2]), pix[2][4], 1);
+    _mm256_storeu_si256((__m256i *)ptrd, pix[2][4]);
+    
+    for (x = 16; x < mod16_w; x += 16) {
+        pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+        pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+        pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+        pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 1));
+        pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 2));
+        pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+        pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+        pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+        pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 1));
+        pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 2));
+        pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+        pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+        pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+        pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 1));
+        pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 2));
+        pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+        pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+        pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+        pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 1));
+        pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 2));
+        _MM256_SORT20_EPU16(
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4]
+        );
+        pix[2][4] = _mm256_avg_epu16(pix[2][4], pix[3][0]);
+        _mm256_storeu_si256((__m256i *)(ptrd + x), pix[2][4]);
+    }
+    
+    x = src_w - 16;
+    pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+    pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+    pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+    pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+    pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+    pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+    pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+    pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+    pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+    pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+    pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+    pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+    pix[1][3] = _mm256_reassignment_epi16(pix[1][2], right_idx);
+    pix[1][4] = _mm256_reassignment_epi16(pix[1][3], right_idx);
+    pix[2][3] = _mm256_reassignment_epi16(pix[2][2], right_idx);
+    pix[2][4] = _mm256_reassignment_epi16(pix[2][3], right_idx);
+    pix[3][3] = _mm256_reassignment_epi16(pix[3][2], right_idx);
+    pix[3][4] = _mm256_reassignment_epi16(pix[3][3], right_idx);
+    pix[4][3] = _mm256_reassignment_epi16(pix[4][2], right_idx);
+    pix[4][4] = _mm256_reassignment_epi16(pix[4][3], right_idx);
+    _MM256_SORT20_EPU16(
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4]
+    );
+    pix[2][4] = _mm256_avg_epu16(pix[2][4], pix[3][0]);
+    pix[2][4] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[3][3], pix[3][4]), pix[2][4], 15);
+    pix[2][4] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[3][1], pix[3][2]), pix[2][4], 14);
+    _mm256_storeu_si256((__m256i *)(ptrd + x), pix[2][4]);
+    
+    ptrs += stride;
+    ptrd += stride;
+    
+    for (int y = 2; y < src_h - 2; y++) {
+        pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2));
+        pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 1));
+        pix[0][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 2));
+        pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride));
+        pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 1));
+        pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 2));
+        pix[2][2] = _mm256_loadu_si256((const __m256i *)ptrs);
+        pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs + 1));
+        pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs + 2));
+        pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride));
+        pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 1));
+        pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 2));
+        pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2));
+        pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 1));
+        pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 2));
+        pix[0][1] = _mm256_reassignment_epi16(pix[0][2], left_idx);
+        pix[0][0] = _mm256_reassignment_epi16(pix[0][1], left_idx);
+        pix[1][1] = _mm256_reassignment_epi16(pix[1][2], left_idx);
+        pix[1][0] = _mm256_reassignment_epi16(pix[1][1], left_idx);
+        pix[2][1] = _mm256_reassignment_epi16(pix[2][2], left_idx);
+        pix[2][0] = _mm256_reassignment_epi16(pix[2][1], left_idx);
+        pix[3][1] = _mm256_reassignment_epi16(pix[3][2], left_idx);
+        pix[3][0] = _mm256_reassignment_epi16(pix[3][1], left_idx);
+        pix[4][1] = _mm256_reassignment_epi16(pix[4][2], left_idx);
+        pix[4][0] = _mm256_reassignment_epi16(pix[4][1], left_idx);
+        _MM256_SORT25_EPU16(
+            pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4],
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4]
+        );
+        pix[2][2] = _MM256_TRANSFER_EPI16(pix[3][2], pix[2][2], 0);
+        pix[2][2] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[2][4], pix[3][0]), pix[2][2], 1);
+        _mm256_storeu_si256((__m256i *)ptrd, pix[2][2]);
+        
+        for (x = 16; x < mod16_w; x += 16) {
+            pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+            pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+            pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+            pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 1));
+            pix[0][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 2));
+            pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+            pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+            pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+            pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 1));
+            pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 2));
+            pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+            pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+            pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+            pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 1));
+            pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 2));
+            pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+            pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+            pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+            pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 1));
+            pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 2));
+            pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+            pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+            pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+            pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 1));
+            pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 2));
+            _MM256_SORT25_EPU16(
+                pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4],
+                pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+                pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+                pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4],
+                pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4]
+            );
+            _mm256_storeu_si256((__m256i *)(ptrd + x), pix[2][2]);
+        }
+        
+        x = src_w - 16;
+        pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+        pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+        pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+        pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+        pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+        pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+        pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+        pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+        pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+        pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+        pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+        pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+        pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+        pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+        pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+        pix[0][3] = _mm256_reassignment_epi16(pix[0][2], right_idx);
+        pix[0][4] = _mm256_reassignment_epi16(pix[0][3], right_idx);
+        pix[1][3] = _mm256_reassignment_epi16(pix[1][2], right_idx);
+        pix[1][4] = _mm256_reassignment_epi16(pix[1][3], right_idx);
+        pix[2][3] = _mm256_reassignment_epi16(pix[2][2], right_idx);
+        pix[2][4] = _mm256_reassignment_epi16(pix[2][3], right_idx);
+        pix[3][3] = _mm256_reassignment_epi16(pix[3][2], right_idx);
+        pix[3][4] = _mm256_reassignment_epi16(pix[3][3], right_idx);
+        pix[4][3] = _mm256_reassignment_epi16(pix[4][2], right_idx);
+        pix[4][4] = _mm256_reassignment_epi16(pix[4][3], right_idx);
+        _MM256_SORT25_EPU16(
+            pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4],
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4]
+        );
+        pix[2][2] = _MM256_TRANSFER_EPI16(pix[3][2], pix[2][2], 15);
+        pix[2][2] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[2][4], pix[3][0]), pix[2][2], 14);
+        _mm256_storeu_si256((__m256i *)(ptrd + x), pix[2][2]);
+        
+        ptrs += stride;
+        ptrd += stride;
+    }
+    
+    pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2));
+    pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 1));
+    pix[0][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 2));
+    pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride));
+    pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 1));
+    pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 2));
+    pix[2][2] = _mm256_loadu_si256((const __m256i *)ptrs);
+    pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs + 1));
+    pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs + 2));
+    pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride));
+    pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 1));
+    pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 2));
+    pix[0][1] = _mm256_reassignment_epi16(pix[0][2], left_idx);
+    pix[0][0] = _mm256_reassignment_epi16(pix[0][1], left_idx);
+    pix[1][1] = _mm256_reassignment_epi16(pix[1][2], left_idx);
+    pix[1][0] = _mm256_reassignment_epi16(pix[1][1], left_idx);
+    pix[2][1] = _mm256_reassignment_epi16(pix[2][2], left_idx);
+    pix[2][0] = _mm256_reassignment_epi16(pix[2][1], left_idx);
+    pix[3][1] = _mm256_reassignment_epi16(pix[3][2], left_idx);
+    pix[3][0] = _mm256_reassignment_epi16(pix[3][1], left_idx);
+    _MM256_SORT20_EPU16(
+        pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4],
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4]
+    );
+    pix[1][4] = _mm256_avg_epu16(pix[1][4], pix[2][0]);
+    pix[1][4] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[2][3], pix[2][4]), pix[1][4], 0);
+    pix[1][4] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[2][1], pix[2][2]), pix[1][4], 1);
+    _mm256_storeu_si256((__m256i *)ptrd, pix[1][4]);
+    
+    for (x = 16; x < mod16_w; x += 16) {
+        pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+        pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+        pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+        pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 1));
+        pix[0][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 2));
+        pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+        pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+        pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+        pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 1));
+        pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 2));
+        pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+        pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+        pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+        pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 1));
+        pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 2));
+        pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+        pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+        pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+        pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 1));
+        pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 2));
+        _MM256_SORT20_EPU16(
+            pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4],
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4]
+        );
+        pix[1][4] = _mm256_avg_epu16(pix[1][4], pix[2][0]);
+        _mm256_storeu_si256((__m256i *)(ptrd + x), pix[1][4]);
+    }
+    
+    x = src_w - 16;
+    pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+    pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+    pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+    pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+    pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+    pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+    pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+    pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+    pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+    pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+    pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+    pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+    pix[0][3] = _mm256_reassignment_epi16(pix[0][2], right_idx);
+    pix[0][4] = _mm256_reassignment_epi16(pix[0][3], right_idx);
+    pix[1][3] = _mm256_reassignment_epi16(pix[1][2], right_idx);
+    pix[1][4] = _mm256_reassignment_epi16(pix[1][3], right_idx);
+    pix[2][3] = _mm256_reassignment_epi16(pix[2][2], right_idx);
+    pix[2][4] = _mm256_reassignment_epi16(pix[2][3], right_idx);
+    pix[3][3] = _mm256_reassignment_epi16(pix[3][2], right_idx);
+    pix[3][4] = _mm256_reassignment_epi16(pix[3][3], right_idx);
+    _MM256_SORT20_EPU16(
+        pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4],
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4]
+    );
+    pix[1][4] = _mm256_avg_epu16(pix[1][4], pix[2][0]);
+    pix[1][4] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[2][3], pix[2][4]), pix[1][4], 15);
+    pix[1][4] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[2][1], pix[2][2]), pix[1][4], 14);
+    _mm256_storeu_si256((__m256i *)(ptrd + x), pix[1][4]);
+    
+    ptrs += stride;
+    ptrd += stride;
+    
+    pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2));
+    pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 1));
+    pix[0][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 2));
+    pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride));
+    pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 1));
+    pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 2));
+    pix[2][2] = _mm256_loadu_si256((const __m256i *)ptrs);
+    pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs + 1));
+    pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs + 2));
+    pix[0][1] = _mm256_reassignment_epi16(pix[0][2], left_idx);
+    pix[0][0] = _mm256_reassignment_epi16(pix[0][1], left_idx);
+    pix[1][1] = _mm256_reassignment_epi16(pix[1][2], left_idx);
+    pix[1][0] = _mm256_reassignment_epi16(pix[1][1], left_idx);
+    pix[2][1] = _mm256_reassignment_epi16(pix[2][2], left_idx);
+    pix[2][0] = _mm256_reassignment_epi16(pix[2][1], left_idx);
+    _MM256_SORT15_EPU16(
+        pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4],
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4]
+    );
+    pix[1][2] = _MM256_TRANSFER_EPI16(pix[2][0], pix[1][2], 0);
+    pix[1][2] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[1][3], pix[1][4]), pix[1][2], 1);
+    _mm256_storeu_si256((__m256i *)ptrd, pix[1][2]);
+    
+    for (x = 16; x < mod16_w; x += 16) {
+        pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+        pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+        pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+        pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 1));
+        pix[0][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 2));
+        pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+        pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+        pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+        pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 1));
+        pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 2));
+        pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+        pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+        pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+        pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 1));
+        pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 2));
+        _MM256_SORT15_EPU16(
+            pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4],
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4]
+        );
+        _mm256_storeu_si256((__m256i *)(ptrd + x), pix[1][2]);
+    }
+    
+    x = src_w - 16;
+    pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+    pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+    pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+    pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+    pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+    pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+    pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+    pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+    pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+    pix[0][3] = _mm256_reassignment_epi16(pix[0][2], right_idx);
+    pix[0][4] = _mm256_reassignment_epi16(pix[0][3], right_idx);
+    pix[1][3] = _mm256_reassignment_epi16(pix[1][2], right_idx);
+    pix[1][4] = _mm256_reassignment_epi16(pix[1][3], right_idx);
+    pix[2][3] = _mm256_reassignment_epi16(pix[2][2], right_idx);
+    pix[2][4] = _mm256_reassignment_epi16(pix[2][3], right_idx);
+    _MM256_SORT15_EPU16(
+        pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4],
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4]
+    );
+    pix[1][2] = _MM256_TRANSFER_EPI16(pix[2][0], pix[1][2], 15);
+    pix[1][2] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[1][3], pix[1][4]), pix[1][2], 14);
+    _mm256_storeu_si256((__m256i *)(ptrd + x), pix[1][2]);
+}
+
+static void get_median_blur_radius2_32(
+    const void *restrict srcp, void *restrict dstp, int src_w, int src_h, ptrdiff_t stride, int radius UNUSED
+) {
+    const float *restrict ptrs = srcp;
+    float *restrict ptrd = dstp;
+    int tail = src_w % 8;
+    if (!tail) tail = 8;
+    int mod8_w = src_w - tail;
+    int x = 0;
+    
+    __m256i left_idx = _mm256_setr_epi32(-1, 0, 1, 2, 3, 4, 5, 6);
+    __m256i right_idx = _mm256_setr_epi32(1, 2, 3, 4, 5, 6, 7, -1);
+    
+    __m256 pix[5][5];
+    
+    pix[2][2] = _mm256_loadu_ps(ptrs);
+    pix[2][3] = _mm256_loadu_ps(ptrs + 1);
+    pix[2][4] = _mm256_loadu_ps(ptrs + 2);
+    pix[3][2] = _mm256_loadu_ps(ptrs + stride);
+    pix[3][3] = _mm256_loadu_ps(ptrs + stride + 1);
+    pix[3][4] = _mm256_loadu_ps(ptrs + stride + 2);
+    pix[4][2] = _mm256_loadu_ps(ptrs + stride * 2);
+    pix[4][3] = _mm256_loadu_ps(ptrs + stride * 2 + 1);
+    pix[4][4] = _mm256_loadu_ps(ptrs + stride * 2 + 2);
+    pix[2][1] = _mm256_reassignment_ps(pix[2][2], left_idx);
+    pix[2][0] = _mm256_reassignment_ps(pix[2][1], left_idx);
+    pix[3][1] = _mm256_reassignment_ps(pix[3][2], left_idx);
+    pix[3][0] = _mm256_reassignment_ps(pix[3][1], left_idx);
+    pix[4][1] = _mm256_reassignment_ps(pix[4][2], left_idx);
+    pix[4][0] = _mm256_reassignment_ps(pix[4][1], left_idx);
+    _MM256_SORT15_PS(
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4]
+    );
+    pix[3][2] = _MM256_TRANSFER_PS(pix[4][0], pix[3][2], 0);
+    pix[3][2] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[3][3], pix[3][4]), pix[3][2], 1);
+    _mm256_storeu_ps(ptrd, pix[3][2]);
+    
+    for (x = 8; x < mod8_w; x += 8) {
+        pix[2][0] = _mm256_loadu_ps(ptrs + x - 2);
+        pix[2][1] = _mm256_loadu_ps(ptrs + x - 1);
+        pix[2][2] = _mm256_loadu_ps(ptrs + x);
+        pix[2][3] = _mm256_loadu_ps(ptrs + x + 1);
+        pix[2][4] = _mm256_loadu_ps(ptrs + x + 2);
+        pix[3][0] = _mm256_loadu_ps(ptrs + stride + x - 2);
+        pix[3][1] = _mm256_loadu_ps(ptrs + stride + x - 1);
+        pix[3][2] = _mm256_loadu_ps(ptrs + stride + x);
+        pix[3][3] = _mm256_loadu_ps(ptrs + stride + x + 1);
+        pix[3][4] = _mm256_loadu_ps(ptrs + stride + x + 2);
+        pix[4][0] = _mm256_loadu_ps(ptrs + stride * 2 + x - 2);
+        pix[4][1] = _mm256_loadu_ps(ptrs + stride * 2 + x - 1);
+        pix[4][2] = _mm256_loadu_ps(ptrs + stride * 2 + x);
+        pix[4][3] = _mm256_loadu_ps(ptrs + stride * 2 + x + 1);
+        pix[4][4] = _mm256_loadu_ps(ptrs + stride * 2 + x + 2);
+        _MM256_SORT15_PS(
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4]
+        );
+        _mm256_storeu_ps(ptrd + x, pix[3][2]);
+    }
+    
+    x = src_w - 8;
+    pix[2][0] = _mm256_loadu_ps(ptrs + x - 2);
+    pix[2][1] = _mm256_loadu_ps(ptrs + x - 1);
+    pix[2][2] = _mm256_loadu_ps(ptrs + x);
+    pix[3][0] = _mm256_loadu_ps(ptrs + stride + x - 2);
+    pix[3][1] = _mm256_loadu_ps(ptrs + stride + x - 1);
+    pix[3][2] = _mm256_loadu_ps(ptrs + stride + x);
+    pix[4][0] = _mm256_loadu_ps(ptrs + stride * 2 + x - 2);
+    pix[4][1] = _mm256_loadu_ps(ptrs + stride * 2 + x - 1);
+    pix[4][2] = _mm256_loadu_ps(ptrs + stride * 2 + x);
+    pix[2][3] = _mm256_reassignment_ps(pix[2][2], right_idx);
+    pix[2][4] = _mm256_reassignment_ps(pix[2][3], right_idx);
+    pix[3][3] = _mm256_reassignment_ps(pix[3][2], right_idx);
+    pix[3][4] = _mm256_reassignment_ps(pix[3][3], right_idx);
+    pix[4][3] = _mm256_reassignment_ps(pix[4][2], right_idx);
+    pix[4][4] = _mm256_reassignment_ps(pix[4][3], right_idx);
+    _MM256_SORT15_PS(
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4]
+    );
+    pix[3][2] = _MM256_TRANSFER_PS(pix[4][0], pix[3][2], 7);
+    pix[3][2] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[3][3], pix[3][4]), pix[3][2], 6);
+    _mm256_storeu_ps(ptrd + x, pix[3][2]);
+    
+    ptrs += stride;
+    ptrd += stride;
+    
+    pix[1][2] = _mm256_loadu_ps(ptrs - stride);
+    pix[1][3] = _mm256_loadu_ps(ptrs - stride + 1);
+    pix[1][4] = _mm256_loadu_ps(ptrs - stride + 2);
+    pix[2][2] = _mm256_loadu_ps(ptrs);
+    pix[2][3] = _mm256_loadu_ps(ptrs + 1);
+    pix[2][4] = _mm256_loadu_ps(ptrs + 2);
+    pix[3][2] = _mm256_loadu_ps(ptrs + stride);
+    pix[3][3] = _mm256_loadu_ps(ptrs + stride + 1);
+    pix[3][4] = _mm256_loadu_ps(ptrs + stride + 2);
+    pix[4][2] = _mm256_loadu_ps(ptrs + stride * 2);
+    pix[4][3] = _mm256_loadu_ps(ptrs + stride * 2 + 1);
+    pix[4][4] = _mm256_loadu_ps(ptrs + stride * 2 + 2);
+    pix[1][1] = _mm256_reassignment_ps(pix[1][2], left_idx);
+    pix[1][0] = _mm256_reassignment_ps(pix[1][1], left_idx);
+    pix[2][1] = _mm256_reassignment_ps(pix[2][2], left_idx);
+    pix[2][0] = _mm256_reassignment_ps(pix[2][1], left_idx);
+    pix[3][1] = _mm256_reassignment_ps(pix[3][2], left_idx);
+    pix[3][0] = _mm256_reassignment_ps(pix[3][1], left_idx);
+    pix[4][1] = _mm256_reassignment_ps(pix[4][2], left_idx);
+    pix[4][0] = _mm256_reassignment_ps(pix[4][1], left_idx);
+    _MM256_SORT20_PS(
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4]
+    );
+    pix[2][4] = _mm256_avg_ps(pix[2][4], pix[3][0]);
+    pix[2][4] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[3][3], pix[3][4]), pix[2][4], 0);
+    pix[2][4] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[3][1], pix[3][2]), pix[2][4], 1);
+    _mm256_storeu_ps(ptrd, pix[2][4]);
+    
+    for (x = 8; x < mod8_w; x += 8) {
+        pix[1][0] = _mm256_loadu_ps(ptrs - stride + x - 2);
+        pix[1][1] = _mm256_loadu_ps(ptrs - stride + x - 1);
+        pix[1][2] = _mm256_loadu_ps(ptrs - stride + x);
+        pix[1][3] = _mm256_loadu_ps(ptrs - stride + x + 1);
+        pix[1][4] = _mm256_loadu_ps(ptrs - stride + x + 2);
+        pix[2][0] = _mm256_loadu_ps(ptrs + x - 2);
+        pix[2][1] = _mm256_loadu_ps(ptrs + x - 1);
+        pix[2][2] = _mm256_loadu_ps(ptrs + x);
+        pix[2][3] = _mm256_loadu_ps(ptrs + x + 1);
+        pix[2][4] = _mm256_loadu_ps(ptrs + x + 2);
+        pix[3][0] = _mm256_loadu_ps(ptrs + stride + x - 2);
+        pix[3][1] = _mm256_loadu_ps(ptrs + stride + x - 1);
+        pix[3][2] = _mm256_loadu_ps(ptrs + stride + x);
+        pix[3][3] = _mm256_loadu_ps(ptrs + stride + x + 1);
+        pix[3][4] = _mm256_loadu_ps(ptrs + stride + x + 2);
+        pix[4][0] = _mm256_loadu_ps(ptrs + stride * 2 + x - 2);
+        pix[4][1] = _mm256_loadu_ps(ptrs + stride * 2 + x - 1);
+        pix[4][2] = _mm256_loadu_ps(ptrs + stride * 2 + x);
+        pix[4][3] = _mm256_loadu_ps(ptrs + stride * 2 + x + 1);
+        pix[4][4] = _mm256_loadu_ps(ptrs + stride * 2 + x + 2);
+        _MM256_SORT20_PS(
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4]
+        );
+        pix[2][4] = _mm256_avg_ps(pix[2][4], pix[3][0]);
+        _mm256_storeu_ps(ptrd + x, pix[2][4]);
+    }
+    
+    x = src_w - 8;
+    pix[1][0] = _mm256_loadu_ps(ptrs - stride + x - 2);
+    pix[1][1] = _mm256_loadu_ps(ptrs - stride + x - 1);
+    pix[1][2] = _mm256_loadu_ps(ptrs - stride + x);
+    pix[2][0] = _mm256_loadu_ps(ptrs + x - 2);
+    pix[2][1] = _mm256_loadu_ps(ptrs + x - 1);
+    pix[2][2] = _mm256_loadu_ps(ptrs + x);
+    pix[3][0] = _mm256_loadu_ps(ptrs + stride + x - 2);
+    pix[3][1] = _mm256_loadu_ps(ptrs + stride + x - 1);
+    pix[3][2] = _mm256_loadu_ps(ptrs + stride + x);
+    pix[4][0] = _mm256_loadu_ps(ptrs + stride * 2 + x - 2);
+    pix[4][1] = _mm256_loadu_ps(ptrs + stride * 2 + x - 1);
+    pix[4][2] = _mm256_loadu_ps(ptrs + stride * 2 + x);
+    pix[1][3] = _mm256_reassignment_ps(pix[1][2], right_idx);
+    pix[1][4] = _mm256_reassignment_ps(pix[1][3], right_idx);
+    pix[2][3] = _mm256_reassignment_ps(pix[2][2], right_idx);
+    pix[2][4] = _mm256_reassignment_ps(pix[2][3], right_idx);
+    pix[3][3] = _mm256_reassignment_ps(pix[3][2], right_idx);
+    pix[3][4] = _mm256_reassignment_ps(pix[3][3], right_idx);
+    pix[4][3] = _mm256_reassignment_ps(pix[4][2], right_idx);
+    pix[4][4] = _mm256_reassignment_ps(pix[4][3], right_idx);
+    _MM256_SORT20_PS(
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4]
+    );
+    pix[2][4] = _mm256_avg_ps(pix[2][4], pix[3][0]);
+    pix[2][4] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[3][3], pix[3][4]), pix[2][4], 7);
+    pix[2][4] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[3][1], pix[3][2]), pix[2][4], 6);
+    _mm256_storeu_ps(ptrd + x, pix[2][4]);
+    
+    ptrs += stride;
+    ptrd += stride;
+    
+    for (int y = 2; y < src_h - 2; y++) {
+        pix[0][2] = _mm256_loadu_ps(ptrs - stride * 2);
+        pix[0][3] = _mm256_loadu_ps(ptrs - stride * 2 + 1);
+        pix[0][4] = _mm256_loadu_ps(ptrs - stride * 2 + 2);
+        pix[1][2] = _mm256_loadu_ps(ptrs - stride);
+        pix[1][3] = _mm256_loadu_ps(ptrs - stride + 1);
+        pix[1][4] = _mm256_loadu_ps(ptrs - stride + 2);
+        pix[2][2] = _mm256_loadu_ps(ptrs);
+        pix[2][3] = _mm256_loadu_ps(ptrs + 1);
+        pix[2][4] = _mm256_loadu_ps(ptrs + 2);
+        pix[3][2] = _mm256_loadu_ps(ptrs + stride);
+        pix[3][3] = _mm256_loadu_ps(ptrs + stride + 1);
+        pix[3][4] = _mm256_loadu_ps(ptrs + stride + 2);
+        pix[4][2] = _mm256_loadu_ps(ptrs + stride * 2);
+        pix[4][3] = _mm256_loadu_ps(ptrs + stride * 2 + 1);
+        pix[4][4] = _mm256_loadu_ps(ptrs + stride * 2 + 2);
+        pix[0][1] = _mm256_reassignment_ps(pix[0][2], left_idx);
+        pix[0][0] = _mm256_reassignment_ps(pix[0][1], left_idx);
+        pix[1][1] = _mm256_reassignment_ps(pix[1][2], left_idx);
+        pix[1][0] = _mm256_reassignment_ps(pix[1][1], left_idx);
+        pix[2][1] = _mm256_reassignment_ps(pix[2][2], left_idx);
+        pix[2][0] = _mm256_reassignment_ps(pix[2][1], left_idx);
+        pix[3][1] = _mm256_reassignment_ps(pix[3][2], left_idx);
+        pix[3][0] = _mm256_reassignment_ps(pix[3][1], left_idx);
+        pix[4][1] = _mm256_reassignment_ps(pix[4][2], left_idx);
+        pix[4][0] = _mm256_reassignment_ps(pix[4][1], left_idx);
+        _MM256_SORT25_PS(
+            pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4],
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4]
+        );
+        pix[2][2] = _MM256_TRANSFER_PS(pix[3][2], pix[2][2], 0);
+        pix[2][2] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[2][4], pix[3][0]), pix[2][2], 1);
+        _mm256_storeu_ps(ptrd, pix[2][2]);
+        
+        for (x = 8; x < mod8_w; x += 8) {
+            pix[0][0] = _mm256_loadu_ps(ptrs - stride * 2 + x - 2);
+            pix[0][1] = _mm256_loadu_ps(ptrs - stride * 2 + x - 1);
+            pix[0][2] = _mm256_loadu_ps(ptrs - stride * 2 + x);
+            pix[0][3] = _mm256_loadu_ps(ptrs - stride * 2 + x + 1);
+            pix[0][4] = _mm256_loadu_ps(ptrs - stride * 2 + x + 2);
+            pix[1][0] = _mm256_loadu_ps(ptrs - stride + x - 2);
+            pix[1][1] = _mm256_loadu_ps(ptrs - stride + x - 1);
+            pix[1][2] = _mm256_loadu_ps(ptrs - stride + x);
+            pix[1][3] = _mm256_loadu_ps(ptrs - stride + x + 1);
+            pix[1][4] = _mm256_loadu_ps(ptrs - stride + x + 2);
+            pix[2][0] = _mm256_loadu_ps(ptrs + x - 2);
+            pix[2][1] = _mm256_loadu_ps(ptrs + x - 1);
+            pix[2][2] = _mm256_loadu_ps(ptrs + x);
+            pix[2][3] = _mm256_loadu_ps(ptrs + x + 1);
+            pix[2][4] = _mm256_loadu_ps(ptrs + x + 2);
+            pix[3][0] = _mm256_loadu_ps(ptrs + stride + x - 2);
+            pix[3][1] = _mm256_loadu_ps(ptrs + stride + x - 1);
+            pix[3][2] = _mm256_loadu_ps(ptrs + stride + x);
+            pix[3][3] = _mm256_loadu_ps(ptrs + stride + x + 1);
+            pix[3][4] = _mm256_loadu_ps(ptrs + stride + x + 2);
+            pix[4][0] = _mm256_loadu_ps(ptrs + stride * 2 + x - 2);
+            pix[4][1] = _mm256_loadu_ps(ptrs + stride * 2 + x - 1);
+            pix[4][2] = _mm256_loadu_ps(ptrs + stride * 2 + x);
+            pix[4][3] = _mm256_loadu_ps(ptrs + stride * 2 + x + 1);
+            pix[4][4] = _mm256_loadu_ps(ptrs + stride * 2 + x + 2);
+            _MM256_SORT25_PS(
+                pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4],
+                pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+                pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+                pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4],
+                pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4]
+            );
+            _mm256_storeu_ps(ptrd + x, pix[2][2]);
+        }
+        
+        x = src_w - 8;
+        pix[0][0] = _mm256_loadu_ps(ptrs - stride * 2 + x - 2);
+        pix[0][1] = _mm256_loadu_ps(ptrs - stride * 2 + x - 1);
+        pix[0][2] = _mm256_loadu_ps(ptrs - stride * 2 + x);
+        pix[1][0] = _mm256_loadu_ps(ptrs - stride + x - 2);
+        pix[1][1] = _mm256_loadu_ps(ptrs - stride + x - 1);
+        pix[1][2] = _mm256_loadu_ps(ptrs - stride + x);
+        pix[2][0] = _mm256_loadu_ps(ptrs + x - 2);
+        pix[2][1] = _mm256_loadu_ps(ptrs + x - 1);
+        pix[2][2] = _mm256_loadu_ps(ptrs + x);
+        pix[3][0] = _mm256_loadu_ps(ptrs + stride + x - 2);
+        pix[3][1] = _mm256_loadu_ps(ptrs + stride + x - 1);
+        pix[3][2] = _mm256_loadu_ps(ptrs + stride + x);
+        pix[4][0] = _mm256_loadu_ps(ptrs + stride * 2 + x - 2);
+        pix[4][1] = _mm256_loadu_ps(ptrs + stride * 2 + x - 1);
+        pix[4][2] = _mm256_loadu_ps(ptrs + stride * 2 + x);
+        pix[0][3] = _mm256_reassignment_ps(pix[0][2], right_idx);
+        pix[0][4] = _mm256_reassignment_ps(pix[0][3], right_idx);
+        pix[1][3] = _mm256_reassignment_ps(pix[1][2], right_idx);
+        pix[1][4] = _mm256_reassignment_ps(pix[1][3], right_idx);
+        pix[2][3] = _mm256_reassignment_ps(pix[2][2], right_idx);
+        pix[2][4] = _mm256_reassignment_ps(pix[2][3], right_idx);
+        pix[3][3] = _mm256_reassignment_ps(pix[3][2], right_idx);
+        pix[3][4] = _mm256_reassignment_ps(pix[3][3], right_idx);
+        pix[4][3] = _mm256_reassignment_ps(pix[4][2], right_idx);
+        pix[4][4] = _mm256_reassignment_ps(pix[4][3], right_idx);
+        _MM256_SORT25_PS(
+            pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4],
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4]
+        );
+        pix[2][2] = _MM256_TRANSFER_PS(pix[3][2], pix[2][2], 7);
+        pix[2][2] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[2][4], pix[3][0]), pix[2][2], 6);
+        _mm256_storeu_ps(ptrd + x, pix[2][2]);
+        
+        ptrs += stride;
+        ptrd += stride;
+    }
+    
+    pix[0][2] = _mm256_loadu_ps(ptrs - stride * 2);
+    pix[0][3] = _mm256_loadu_ps(ptrs - stride * 2 + 1);
+    pix[0][4] = _mm256_loadu_ps(ptrs - stride * 2 + 2);
+    pix[1][2] = _mm256_loadu_ps(ptrs - stride);
+    pix[1][3] = _mm256_loadu_ps(ptrs - stride + 1);
+    pix[1][4] = _mm256_loadu_ps(ptrs - stride + 2);
+    pix[2][2] = _mm256_loadu_ps(ptrs);
+    pix[2][3] = _mm256_loadu_ps(ptrs + 1);
+    pix[2][4] = _mm256_loadu_ps(ptrs + 2);
+    pix[3][2] = _mm256_loadu_ps(ptrs + stride);
+    pix[3][3] = _mm256_loadu_ps(ptrs + stride + 1);
+    pix[3][4] = _mm256_loadu_ps(ptrs + stride + 2);
+    pix[0][1] = _mm256_reassignment_ps(pix[0][2], left_idx);
+    pix[0][0] = _mm256_reassignment_ps(pix[0][1], left_idx);
+    pix[1][1] = _mm256_reassignment_ps(pix[1][2], left_idx);
+    pix[1][0] = _mm256_reassignment_ps(pix[1][1], left_idx);
+    pix[2][1] = _mm256_reassignment_ps(pix[2][2], left_idx);
+    pix[2][0] = _mm256_reassignment_ps(pix[2][1], left_idx);
+    pix[3][1] = _mm256_reassignment_ps(pix[3][2], left_idx);
+    pix[3][0] = _mm256_reassignment_ps(pix[3][1], left_idx);
+    _MM256_SORT20_PS(
+        pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4],
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4]
+    );
+    pix[1][4] = _mm256_avg_ps(pix[1][4], pix[2][0]);
+    pix[1][4] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[2][3], pix[2][4]), pix[1][4], 0);
+    pix[1][4] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[2][1], pix[2][2]), pix[1][4], 1);
+    _mm256_storeu_ps(ptrd, pix[1][4]);
+    
+    for (x = 8; x < mod8_w; x += 8) {
+        pix[0][0] = _mm256_loadu_ps(ptrs - stride * 2 + x - 2);
+        pix[0][1] = _mm256_loadu_ps(ptrs - stride * 2 + x - 1);
+        pix[0][2] = _mm256_loadu_ps(ptrs - stride * 2 + x);
+        pix[0][3] = _mm256_loadu_ps(ptrs - stride * 2 + x + 1);
+        pix[0][4] = _mm256_loadu_ps(ptrs - stride * 2 + x + 2);
+        pix[1][0] = _mm256_loadu_ps(ptrs - stride + x - 2);
+        pix[1][1] = _mm256_loadu_ps(ptrs - stride + x - 1);
+        pix[1][2] = _mm256_loadu_ps(ptrs - stride + x);
+        pix[1][3] = _mm256_loadu_ps(ptrs - stride + x + 1);
+        pix[1][4] = _mm256_loadu_ps(ptrs - stride + x + 2);
+        pix[2][0] = _mm256_loadu_ps(ptrs + x - 2);
+        pix[2][1] = _mm256_loadu_ps(ptrs + x - 1);
+        pix[2][2] = _mm256_loadu_ps(ptrs + x);
+        pix[2][3] = _mm256_loadu_ps(ptrs + x + 1);
+        pix[2][4] = _mm256_loadu_ps(ptrs + x + 2);
+        pix[3][0] = _mm256_loadu_ps(ptrs + stride + x - 2);
+        pix[3][1] = _mm256_loadu_ps(ptrs + stride + x - 1);
+        pix[3][2] = _mm256_loadu_ps(ptrs + stride + x);
+        pix[3][3] = _mm256_loadu_ps(ptrs + stride + x + 1);
+        pix[3][4] = _mm256_loadu_ps(ptrs + stride + x + 2);
+        _MM256_SORT20_PS(
+            pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4],
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4]
+        );
+        pix[1][4] = _mm256_avg_ps(pix[1][4], pix[2][0]);
+        _mm256_storeu_ps(ptrd + x, pix[1][4]);
+    }
+    
+    x = src_w - 8;
+    pix[0][0] = _mm256_loadu_ps(ptrs - stride * 2 + x - 2);
+    pix[0][1] = _mm256_loadu_ps(ptrs - stride * 2 + x - 1);
+    pix[0][2] = _mm256_loadu_ps(ptrs - stride * 2 + x);
+    pix[1][0] = _mm256_loadu_ps(ptrs - stride + x - 2);
+    pix[1][1] = _mm256_loadu_ps(ptrs - stride + x - 1);
+    pix[1][2] = _mm256_loadu_ps(ptrs - stride + x);
+    pix[2][0] = _mm256_loadu_ps(ptrs + x - 2);
+    pix[2][1] = _mm256_loadu_ps(ptrs + x - 1);
+    pix[2][2] = _mm256_loadu_ps(ptrs + x);
+    pix[3][0] = _mm256_loadu_ps(ptrs + stride + x - 2);
+    pix[3][1] = _mm256_loadu_ps(ptrs + stride + x - 1);
+    pix[3][2] = _mm256_loadu_ps(ptrs + stride + x);
+    pix[0][3] = _mm256_reassignment_ps(pix[0][2], right_idx);
+    pix[0][4] = _mm256_reassignment_ps(pix[0][3], right_idx);
+    pix[1][3] = _mm256_reassignment_ps(pix[1][2], right_idx);
+    pix[1][4] = _mm256_reassignment_ps(pix[1][3], right_idx);
+    pix[2][3] = _mm256_reassignment_ps(pix[2][2], right_idx);
+    pix[2][4] = _mm256_reassignment_ps(pix[2][3], right_idx);
+    pix[3][3] = _mm256_reassignment_ps(pix[3][2], right_idx);
+    pix[3][4] = _mm256_reassignment_ps(pix[3][3], right_idx);
+    _MM256_SORT20_PS(
+        pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4],
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4]
+    );
+    pix[1][4] = _mm256_avg_ps(pix[1][4], pix[2][0]);
+    pix[1][4] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[2][3], pix[2][4]), pix[1][4], 7);
+    pix[1][4] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[2][1], pix[2][2]), pix[1][4], 6);
+    _mm256_storeu_ps(ptrd + x, pix[1][4]);
+    
+    ptrs += stride;
+    ptrd += stride;
+    
+    pix[0][2] = _mm256_loadu_ps(ptrs - stride * 2);
+    pix[0][3] = _mm256_loadu_ps(ptrs - stride * 2 + 1);
+    pix[0][4] = _mm256_loadu_ps(ptrs - stride * 2 + 2);
+    pix[1][2] = _mm256_loadu_ps(ptrs - stride);
+    pix[1][3] = _mm256_loadu_ps(ptrs - stride + 1);
+    pix[1][4] = _mm256_loadu_ps(ptrs - stride + 2);
+    pix[2][2] = _mm256_loadu_ps(ptrs);
+    pix[2][3] = _mm256_loadu_ps(ptrs + 1);
+    pix[2][4] = _mm256_loadu_ps(ptrs + 2);
+    pix[0][1] = _mm256_reassignment_ps(pix[0][2], left_idx);
+    pix[0][0] = _mm256_reassignment_ps(pix[0][1], left_idx);
+    pix[1][1] = _mm256_reassignment_ps(pix[1][2], left_idx);
+    pix[1][0] = _mm256_reassignment_ps(pix[1][1], left_idx);
+    pix[2][1] = _mm256_reassignment_ps(pix[2][2], left_idx);
+    pix[2][0] = _mm256_reassignment_ps(pix[2][1], left_idx);
+    _MM256_SORT15_PS(
+        pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4],
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4]
+    );
+    pix[1][2] = _MM256_TRANSFER_PS(pix[2][0], pix[1][2], 0);
+    pix[1][2] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[1][3], pix[1][4]), pix[1][2], 1);
+    _mm256_storeu_ps(ptrd, pix[1][2]);
+    
+    for (x = 8; x < mod8_w; x += 8) {
+        pix[0][0] = _mm256_loadu_ps(ptrs - stride * 2 + x - 2);
+        pix[0][1] = _mm256_loadu_ps(ptrs - stride * 2 + x - 1);
+        pix[0][2] = _mm256_loadu_ps(ptrs - stride * 2 + x);
+        pix[0][3] = _mm256_loadu_ps(ptrs - stride * 2 + x + 1);
+        pix[0][4] = _mm256_loadu_ps(ptrs - stride * 2 + x + 2);
+        pix[1][0] = _mm256_loadu_ps(ptrs - stride + x - 2);
+        pix[1][1] = _mm256_loadu_ps(ptrs - stride + x - 1);
+        pix[1][2] = _mm256_loadu_ps(ptrs - stride + x);
+        pix[1][3] = _mm256_loadu_ps(ptrs - stride + x + 1);
+        pix[1][4] = _mm256_loadu_ps(ptrs - stride + x + 2);
+        pix[2][0] = _mm256_loadu_ps(ptrs + x - 2);
+        pix[2][1] = _mm256_loadu_ps(ptrs + x - 1);
+        pix[2][2] = _mm256_loadu_ps(ptrs + x);
+        pix[2][3] = _mm256_loadu_ps(ptrs + x + 1);
+        pix[2][4] = _mm256_loadu_ps(ptrs + x + 2);
+        _MM256_SORT15_PS(
+            pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4],
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4]
+        );
+        _mm256_storeu_ps(ptrd + x, pix[1][2]);
+    }
+    
+    x = src_w - 8;
+    pix[0][0] = _mm256_loadu_ps(ptrs - stride * 2 + x - 2);
+    pix[0][1] = _mm256_loadu_ps(ptrs - stride * 2 + x - 1);
+    pix[0][2] = _mm256_loadu_ps(ptrs - stride * 2 + x);
+    pix[1][0] = _mm256_loadu_ps(ptrs - stride + x - 2);
+    pix[1][1] = _mm256_loadu_ps(ptrs - stride + x - 1);
+    pix[1][2] = _mm256_loadu_ps(ptrs - stride + x);
+    pix[2][0] = _mm256_loadu_ps(ptrs + x - 2);
+    pix[2][1] = _mm256_loadu_ps(ptrs + x - 1);
+    pix[2][2] = _mm256_loadu_ps(ptrs + x);
+    pix[0][3] = _mm256_reassignment_ps(pix[0][2], right_idx);
+    pix[0][4] = _mm256_reassignment_ps(pix[0][3], right_idx);
+    pix[1][3] = _mm256_reassignment_ps(pix[1][2], right_idx);
+    pix[1][4] = _mm256_reassignment_ps(pix[1][3], right_idx);
+    pix[2][3] = _mm256_reassignment_ps(pix[2][2], right_idx);
+    pix[2][4] = _mm256_reassignment_ps(pix[2][3], right_idx);
+    _MM256_SORT15_PS(
+        pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4],
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4]
+    );
+    pix[1][2] = _MM256_TRANSFER_PS(pix[2][0], pix[1][2], 7);
+    pix[1][2] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[1][3], pix[1][4]), pix[1][2], 6);
+    _mm256_storeu_ps(ptrd + x, pix[1][2]);
+}
+
+static void get_median_blur_radius3_8(
+    const void *restrict srcp, void *restrict dstp, int src_w, int src_h, ptrdiff_t stride, int radius UNUSED
+) {
+    const uint8_t *restrict ptrs = srcp;
+    uint8_t *restrict ptrd = dstp;
+    int tail = src_w % 32;
+    if (!tail) tail = 32;
+    int mod32_w = src_w - tail;
+    int x = 0;
+    
+    __m256i left_idx = _mm256_setr_epi8(
+        -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+        15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30
+    );
+    __m256i right_idx = _mm256_setr_epi8(
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+        17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, -1
+    );
+    
+    __m256i pix[7][7];
+    
+    pix[3][3] = _mm256_loadu_si256((const __m256i *)ptrs);
+    pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + 1));
+    pix[3][5] = _mm256_loadu_si256((const __m256i *)(ptrs + 2));
+    pix[3][6] = _mm256_loadu_si256((const __m256i *)(ptrs + 3));
+    pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride));
+    pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 1));
+    pix[4][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 2));
+    pix[4][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 3));
+    pix[5][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2));
+    pix[5][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 1));
+    pix[5][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 2));
+    pix[5][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 3));
+    pix[6][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3));
+    pix[6][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + 1));
+    pix[6][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + 2));
+    pix[6][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + 3));
+    pix[3][2] = _mm256_reassignment_epi8(pix[3][3], left_idx);
+    pix[3][1] = _mm256_reassignment_epi8(pix[3][2], left_idx);
+    pix[3][0] = _mm256_reassignment_epi8(pix[3][1], left_idx);
+    pix[4][2] = _mm256_reassignment_epi8(pix[4][3], left_idx);
+    pix[4][1] = _mm256_reassignment_epi8(pix[4][2], left_idx);
+    pix[4][0] = _mm256_reassignment_epi8(pix[4][1], left_idx);
+    pix[5][2] = _mm256_reassignment_epi8(pix[5][3], left_idx);
+    pix[5][1] = _mm256_reassignment_epi8(pix[5][2], left_idx);
+    pix[5][0] = _mm256_reassignment_epi8(pix[5][1], left_idx);
+    pix[6][2] = _mm256_reassignment_epi8(pix[6][3], left_idx);
+    pix[6][1] = _mm256_reassignment_epi8(pix[6][2], left_idx);
+    pix[6][0] = _mm256_reassignment_epi8(pix[6][1], left_idx);
+    _MM256_SORT28_EPU8(
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+        pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+        pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+    );
+    pix[4][6] = _mm256_avg_epu8(pix[4][6], pix[5][0]);
+    pix[4][6] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[5][5], pix[5][6]), pix[4][6], 0);
+    pix[4][6] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[5][3], pix[5][4]), pix[4][6], 1);
+    pix[4][6] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[5][1], pix[5][2]), pix[4][6], 2);
+    _mm256_storeu_si256((__m256i *)ptrd, pix[4][6]);
+    
+    for (x = 32; x < mod32_w; x += 32) {
+        pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 3));
+        pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+        pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+        pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+        pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 1));
+        pix[3][5] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 2));
+        pix[3][6] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 3));
+        pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 3));
+        pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+        pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+        pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+        pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 1));
+        pix[4][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 2));
+        pix[4][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 3));
+        pix[5][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 3));
+        pix[5][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+        pix[5][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+        pix[5][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+        pix[5][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 1));
+        pix[5][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 2));
+        pix[5][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 3));
+        pix[6][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 3));
+        pix[6][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 2));
+        pix[6][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 1));
+        pix[6][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x));
+        pix[6][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x + 1));
+        pix[6][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x + 2));
+        pix[6][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x + 3));
+        _MM256_SORT28_EPU8(
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+            pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+            pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+        );
+        pix[4][6] = _mm256_avg_epu8(pix[4][6], pix[5][0]);
+        _mm256_storeu_si256((__m256i *)(ptrd + x), pix[4][6]);
+    }
+    
+    x = src_w - 32;
+    pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 3));
+    pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+    pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+    pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+    pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 3));
+    pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+    pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+    pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+    pix[5][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 3));
+    pix[5][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+    pix[5][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+    pix[5][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+    pix[6][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 3));
+    pix[6][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 2));
+    pix[6][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 1));
+    pix[6][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x));
+    pix[3][4] = _mm256_reassignment_epi8(pix[3][3], right_idx);
+    pix[3][5] = _mm256_reassignment_epi8(pix[3][4], right_idx);
+    pix[3][6] = _mm256_reassignment_epi8(pix[3][5], right_idx);
+    pix[4][4] = _mm256_reassignment_epi8(pix[4][3], right_idx);
+    pix[4][5] = _mm256_reassignment_epi8(pix[4][4], right_idx);
+    pix[4][6] = _mm256_reassignment_epi8(pix[4][5], right_idx);
+    pix[5][4] = _mm256_reassignment_epi8(pix[5][3], right_idx);
+    pix[5][5] = _mm256_reassignment_epi8(pix[5][4], right_idx);
+    pix[5][6] = _mm256_reassignment_epi8(pix[5][5], right_idx);
+    pix[6][4] = _mm256_reassignment_epi8(pix[6][3], right_idx);
+    pix[6][5] = _mm256_reassignment_epi8(pix[6][4], right_idx);
+    pix[6][6] = _mm256_reassignment_epi8(pix[6][5], right_idx);
+    _MM256_SORT28_EPU8(
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+        pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+        pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+    );
+    pix[4][6] = _mm256_avg_epu8(pix[4][6], pix[5][0]);
+    pix[4][6] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[5][5], pix[5][6]), pix[4][6], 31);
+    pix[4][6] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[5][3], pix[5][4]), pix[4][6], 30);
+    pix[4][6] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[5][1], pix[5][2]), pix[4][6], 29);
+    _mm256_storeu_si256((__m256i *)(ptrd + x), pix[4][6]);
+    
+    ptrs += stride;
+    ptrd += stride;
+    
+    pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride));
+    pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 1));
+    pix[2][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 2));
+    pix[2][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 3));
+    pix[3][3] = _mm256_loadu_si256((const __m256i *)ptrs);
+    pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + 1));
+    pix[3][5] = _mm256_loadu_si256((const __m256i *)(ptrs + 2));
+    pix[3][6] = _mm256_loadu_si256((const __m256i *)(ptrs + 3));
+    pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride));
+    pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 1));
+    pix[4][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 2));
+    pix[4][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 3));
+    pix[5][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2));
+    pix[5][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 1));
+    pix[5][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 2));
+    pix[5][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 3));
+    pix[6][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3));
+    pix[6][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + 1));
+    pix[6][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + 2));
+    pix[6][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + 3));
+    pix[2][2] = _mm256_reassignment_epi8(pix[2][3], left_idx);
+    pix[2][1] = _mm256_reassignment_epi8(pix[2][2], left_idx);
+    pix[2][0] = _mm256_reassignment_epi8(pix[2][1], left_idx);
+    pix[3][2] = _mm256_reassignment_epi8(pix[3][3], left_idx);
+    pix[3][1] = _mm256_reassignment_epi8(pix[3][2], left_idx);
+    pix[3][0] = _mm256_reassignment_epi8(pix[3][1], left_idx);
+    pix[4][2] = _mm256_reassignment_epi8(pix[4][3], left_idx);
+    pix[4][1] = _mm256_reassignment_epi8(pix[4][2], left_idx);
+    pix[4][0] = _mm256_reassignment_epi8(pix[4][1], left_idx);
+    pix[5][2] = _mm256_reassignment_epi8(pix[5][3], left_idx);
+    pix[5][1] = _mm256_reassignment_epi8(pix[5][2], left_idx);
+    pix[5][0] = _mm256_reassignment_epi8(pix[5][1], left_idx);
+    pix[6][2] = _mm256_reassignment_epi8(pix[6][3], left_idx);
+    pix[6][1] = _mm256_reassignment_epi8(pix[6][2], left_idx);
+    pix[6][0] = _mm256_reassignment_epi8(pix[6][1], left_idx);
+    _MM256_SORT35_EPU8(
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+        pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+        pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+    );
+    pix[4][3] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[5][3], pix[5][4]), pix[4][3], 0);
+    pix[4][3] = _MM256_TRANSFER_EPI8(pix[5][1], pix[4][3], 1);
+    pix[4][3] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[4][5], pix[4][6]), pix[4][3], 2);
+    _mm256_storeu_si256((__m256i *)ptrd, pix[4][3]);
+    
+    for (x = 32; x < mod32_w; x += 32) {
+        pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 3));
+        pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+        pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+        pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+        pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 1));
+        pix[2][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 2));
+        pix[2][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 3));
+        pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 3));
+        pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+        pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+        pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+        pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 1));
+        pix[3][5] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 2));
+        pix[3][6] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 3));
+        pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 3));
+        pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+        pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+        pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+        pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 1));
+        pix[4][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 2));
+        pix[4][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 3));
+        pix[5][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 3));
+        pix[5][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+        pix[5][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+        pix[5][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+        pix[5][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 1));
+        pix[5][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 2));
+        pix[5][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 3));
+        pix[6][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 3));
+        pix[6][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 2));
+        pix[6][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 1));
+        pix[6][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x));
+        pix[6][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x + 1));
+        pix[6][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x + 2));
+        pix[6][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x + 3));
+        _MM256_SORT35_EPU8(
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+            pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+            pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+        );
+        _mm256_storeu_si256((__m256i *)(ptrd + x), pix[4][3]);
+    }
+    
+    x = src_w - 32;
+    pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 3));
+    pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+    pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+    pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+    pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 3));
+    pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+    pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+    pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+    pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 3));
+    pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+    pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+    pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+    pix[5][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 3));
+    pix[5][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+    pix[5][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+    pix[5][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+    pix[6][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 3));
+    pix[6][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 2));
+    pix[6][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 1));
+    pix[6][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x));
+    pix[2][4] = _mm256_reassignment_epi8(pix[2][3], right_idx);
+    pix[2][5] = _mm256_reassignment_epi8(pix[2][4], right_idx);
+    pix[2][6] = _mm256_reassignment_epi8(pix[2][5], right_idx);
+    pix[3][4] = _mm256_reassignment_epi8(pix[3][3], right_idx);
+    pix[3][5] = _mm256_reassignment_epi8(pix[3][4], right_idx);
+    pix[3][6] = _mm256_reassignment_epi8(pix[3][5], right_idx);
+    pix[4][4] = _mm256_reassignment_epi8(pix[4][3], right_idx);
+    pix[4][5] = _mm256_reassignment_epi8(pix[4][4], right_idx);
+    pix[4][6] = _mm256_reassignment_epi8(pix[4][5], right_idx);
+    pix[5][4] = _mm256_reassignment_epi8(pix[5][3], right_idx);
+    pix[5][5] = _mm256_reassignment_epi8(pix[5][4], right_idx);
+    pix[5][6] = _mm256_reassignment_epi8(pix[5][5], right_idx);
+    pix[6][4] = _mm256_reassignment_epi8(pix[6][3], right_idx);
+    pix[6][5] = _mm256_reassignment_epi8(pix[6][4], right_idx);
+    pix[6][6] = _mm256_reassignment_epi8(pix[6][5], right_idx);
+    _MM256_SORT35_EPU8(
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+        pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+        pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+    );
+    pix[4][3] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[5][3], pix[5][4]), pix[4][3], 31);
+    pix[4][3] = _MM256_TRANSFER_EPI8(pix[5][1], pix[4][3], 30);
+    pix[4][3] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[4][5], pix[4][6]), pix[4][3], 29);
+    _mm256_storeu_si256((__m256i *)(ptrd + x), pix[4][3]);
+    
+    ptrs += stride;
+    ptrd += stride;
+    
+    pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2));
+    pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 1));
+    pix[1][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 2));
+    pix[1][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 3));
+    pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride));
+    pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 1));
+    pix[2][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 2));
+    pix[2][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 3));
+    pix[3][3] = _mm256_loadu_si256((const __m256i *)ptrs);
+    pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + 1));
+    pix[3][5] = _mm256_loadu_si256((const __m256i *)(ptrs + 2));
+    pix[3][6] = _mm256_loadu_si256((const __m256i *)(ptrs + 3));
+    pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride));
+    pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 1));
+    pix[4][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 2));
+    pix[4][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 3));
+    pix[5][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2));
+    pix[5][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 1));
+    pix[5][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 2));
+    pix[5][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 3));
+    pix[6][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3));
+    pix[6][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + 1));
+    pix[6][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + 2));
+    pix[6][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + 3));
+    pix[1][2] = _mm256_reassignment_epi8(pix[1][3], left_idx);
+    pix[1][1] = _mm256_reassignment_epi8(pix[1][2], left_idx);
+    pix[1][0] = _mm256_reassignment_epi8(pix[1][1], left_idx);
+    pix[2][2] = _mm256_reassignment_epi8(pix[2][3], left_idx);
+    pix[2][1] = _mm256_reassignment_epi8(pix[2][2], left_idx);
+    pix[2][0] = _mm256_reassignment_epi8(pix[2][1], left_idx);
+    pix[3][2] = _mm256_reassignment_epi8(pix[3][3], left_idx);
+    pix[3][1] = _mm256_reassignment_epi8(pix[3][2], left_idx);
+    pix[3][0] = _mm256_reassignment_epi8(pix[3][1], left_idx);
+    pix[4][2] = _mm256_reassignment_epi8(pix[4][3], left_idx);
+    pix[4][1] = _mm256_reassignment_epi8(pix[4][2], left_idx);
+    pix[4][0] = _mm256_reassignment_epi8(pix[4][1], left_idx);
+    pix[5][2] = _mm256_reassignment_epi8(pix[5][3], left_idx);
+    pix[5][1] = _mm256_reassignment_epi8(pix[5][2], left_idx);
+    pix[5][0] = _mm256_reassignment_epi8(pix[5][1], left_idx);
+    pix[6][2] = _mm256_reassignment_epi8(pix[6][3], left_idx);
+    pix[6][1] = _mm256_reassignment_epi8(pix[6][2], left_idx);
+    pix[6][0] = _mm256_reassignment_epi8(pix[6][1], left_idx);
+    _MM256_SORT42_EPU8(
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+        pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+        pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+    );
+    pix[3][6] = _mm256_avg_epu8(pix[3][6], pix[4][0]);
+    pix[3][6] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[5][1], pix[5][2]), pix[3][6], 0);
+    pix[3][6] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[4][5], pix[4][6]), pix[3][6], 1);
+    pix[3][6] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[4][2], pix[4][3]), pix[3][6], 2);
+    _mm256_storeu_si256((__m256i *)ptrd, pix[3][6]);
+    
+    for (x = 32; x < mod32_w; x += 32) {
+        pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 3));
+        pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+        pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+        pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+        pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 1));
+        pix[1][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 2));
+        pix[1][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 3));
+        pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 3));
+        pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+        pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+        pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+        pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 1));
+        pix[2][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 2));
+        pix[2][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 3));
+        pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 3));
+        pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+        pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+        pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+        pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 1));
+        pix[3][5] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 2));
+        pix[3][6] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 3));
+        pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 3));
+        pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+        pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+        pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+        pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 1));
+        pix[4][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 2));
+        pix[4][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 3));
+        pix[5][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 3));
+        pix[5][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+        pix[5][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+        pix[5][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+        pix[5][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 1));
+        pix[5][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 2));
+        pix[5][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 3));
+        pix[6][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 3));
+        pix[6][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 2));
+        pix[6][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 1));
+        pix[6][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x));
+        pix[6][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x + 1));
+        pix[6][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x + 2));
+        pix[6][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x + 3));
+        _MM256_SORT42_EPU8(
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+            pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+            pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+        );
+        pix[3][6] = _mm256_avg_epu8(pix[3][6], pix[4][0]);
+        _mm256_storeu_si256((__m256i *)(ptrd + x), pix[3][6]);
+    }
+    
+    x = src_w - 32;
+    pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 3));
+    pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+    pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+    pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+    pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 3));
+    pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+    pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+    pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+    pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 3));
+    pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+    pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+    pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+    pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 3));
+    pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+    pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+    pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+    pix[5][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 3));
+    pix[5][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+    pix[5][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+    pix[5][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+    pix[6][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 3));
+    pix[6][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 2));
+    pix[6][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 1));
+    pix[6][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x));
+    pix[1][4] = _mm256_reassignment_epi8(pix[1][3], right_idx);
+    pix[1][5] = _mm256_reassignment_epi8(pix[1][4], right_idx);
+    pix[1][6] = _mm256_reassignment_epi8(pix[1][5], right_idx);
+    pix[2][4] = _mm256_reassignment_epi8(pix[2][3], right_idx);
+    pix[2][5] = _mm256_reassignment_epi8(pix[2][4], right_idx);
+    pix[2][6] = _mm256_reassignment_epi8(pix[2][5], right_idx);
+    pix[3][4] = _mm256_reassignment_epi8(pix[3][3], right_idx);
+    pix[3][5] = _mm256_reassignment_epi8(pix[3][4], right_idx);
+    pix[3][6] = _mm256_reassignment_epi8(pix[3][5], right_idx);
+    pix[4][4] = _mm256_reassignment_epi8(pix[4][3], right_idx);
+    pix[4][5] = _mm256_reassignment_epi8(pix[4][4], right_idx);
+    pix[4][6] = _mm256_reassignment_epi8(pix[4][5], right_idx);
+    pix[5][4] = _mm256_reassignment_epi8(pix[5][3], right_idx);
+    pix[5][5] = _mm256_reassignment_epi8(pix[5][4], right_idx);
+    pix[5][6] = _mm256_reassignment_epi8(pix[5][5], right_idx);
+    pix[6][4] = _mm256_reassignment_epi8(pix[6][3], right_idx);
+    pix[6][5] = _mm256_reassignment_epi8(pix[6][4], right_idx);
+    pix[6][6] = _mm256_reassignment_epi8(pix[6][5], right_idx);
+    _MM256_SORT42_EPU8(
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+        pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+        pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+    );
+    pix[3][6] = _mm256_avg_epu8(pix[3][6], pix[4][0]);
+    pix[3][6] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[5][1], pix[5][2]), pix[3][6], 31);
+    pix[3][6] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[4][5], pix[4][6]), pix[3][6], 30);
+    pix[3][6] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[4][2], pix[4][3]), pix[3][6], 29);
+    _mm256_storeu_si256((__m256i *)(ptrd + x), pix[3][6]);
+    
+    ptrs += stride;
+    ptrd += stride;
+    
+    for (int y = 3; y < src_h - 3; y++) {
+        pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3));
+        pix[0][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + 1));
+        pix[0][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + 2));
+        pix[0][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + 3));
+        pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2));
+        pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 1));
+        pix[1][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 2));
+        pix[1][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 3));
+        pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride));
+        pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 1));
+        pix[2][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 2));
+        pix[2][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 3));
+        pix[3][3] = _mm256_loadu_si256((const __m256i *)ptrs);
+        pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + 1));
+        pix[3][5] = _mm256_loadu_si256((const __m256i *)(ptrs + 2));
+        pix[3][6] = _mm256_loadu_si256((const __m256i *)(ptrs + 3));
+        pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride));
+        pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 1));
+        pix[4][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 2));
+        pix[4][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 3));
+        pix[5][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2));
+        pix[5][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 1));
+        pix[5][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 2));
+        pix[5][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 3));
+        pix[6][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3));
+        pix[6][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + 1));
+        pix[6][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + 2));
+        pix[6][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + 3));
+        pix[0][2] = _mm256_reassignment_epi8(pix[0][3], left_idx);
+        pix[0][1] = _mm256_reassignment_epi8(pix[0][2], left_idx);
+        pix[0][0] = _mm256_reassignment_epi8(pix[0][1], left_idx);
+        pix[1][2] = _mm256_reassignment_epi8(pix[1][3], left_idx);
+        pix[1][1] = _mm256_reassignment_epi8(pix[1][2], left_idx);
+        pix[1][0] = _mm256_reassignment_epi8(pix[1][1], left_idx);
+        pix[2][2] = _mm256_reassignment_epi8(pix[2][3], left_idx);
+        pix[2][1] = _mm256_reassignment_epi8(pix[2][2], left_idx);
+        pix[2][0] = _mm256_reassignment_epi8(pix[2][1], left_idx);
+        pix[3][2] = _mm256_reassignment_epi8(pix[3][3], left_idx);
+        pix[3][1] = _mm256_reassignment_epi8(pix[3][2], left_idx);
+        pix[3][0] = _mm256_reassignment_epi8(pix[3][1], left_idx);
+        pix[4][2] = _mm256_reassignment_epi8(pix[4][3], left_idx);
+        pix[4][1] = _mm256_reassignment_epi8(pix[4][2], left_idx);
+        pix[4][0] = _mm256_reassignment_epi8(pix[4][1], left_idx);
+        pix[5][2] = _mm256_reassignment_epi8(pix[5][3], left_idx);
+        pix[5][1] = _mm256_reassignment_epi8(pix[5][2], left_idx);
+        pix[5][0] = _mm256_reassignment_epi8(pix[5][1], left_idx);
+        pix[6][2] = _mm256_reassignment_epi8(pix[6][3], left_idx);
+        pix[6][1] = _mm256_reassignment_epi8(pix[6][2], left_idx);
+        pix[6][0] = _mm256_reassignment_epi8(pix[6][1], left_idx);
+        _MM256_SORT49_EPU8(
+            pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+            pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+            pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+        );
+        pix[3][3] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[4][6], pix[5][0]), pix[3][3], 0);
+        pix[3][3] = _MM256_TRANSFER_EPI8(pix[4][3], pix[3][3], 1);
+        pix[3][3] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[3][6], pix[4][0]), pix[3][3], 2);
+        _mm256_storeu_si256((__m256i *)ptrd, pix[3][3]);
+        
+        for (x = 32; x < mod32_w; x += 32) {
+            pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 3));
+            pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 2));
+            pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 1));
+            pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x));
+            pix[0][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x + 1));
+            pix[0][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x + 2));
+            pix[0][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x + 3));
+            pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 3));
+            pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+            pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+            pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+            pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 1));
+            pix[1][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 2));
+            pix[1][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 3));
+            pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 3));
+            pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+            pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+            pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+            pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 1));
+            pix[2][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 2));
+            pix[2][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 3));
+            pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 3));
+            pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+            pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+            pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+            pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 1));
+            pix[3][5] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 2));
+            pix[3][6] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 3));
+            pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 3));
+            pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+            pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+            pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+            pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 1));
+            pix[4][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 2));
+            pix[4][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 3));
+            pix[5][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 3));
+            pix[5][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+            pix[5][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+            pix[5][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+            pix[5][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 1));
+            pix[5][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 2));
+            pix[5][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 3));
+            pix[6][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 3));
+            pix[6][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 2));
+            pix[6][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 1));
+            pix[6][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x));
+            pix[6][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x + 1));
+            pix[6][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x + 2));
+            pix[6][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x + 3));
+            _MM256_SORT49_EPU8(
+                pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+                pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+                pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+                pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+                pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+                pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+                pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+            );
+            _mm256_storeu_si256((__m256i *)(ptrd + x), pix[3][3]);
+        }
+        
+        x = src_w - 32;
+        pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 3));
+        pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 2));
+        pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 1));
+        pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x));
+        pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 3));
+        pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+        pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+        pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+        pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 3));
+        pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+        pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+        pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+        pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 3));
+        pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+        pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+        pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+        pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 3));
+        pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+        pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+        pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+        pix[5][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 3));
+        pix[5][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+        pix[5][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+        pix[5][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+        pix[6][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 3));
+        pix[6][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 2));
+        pix[6][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 1));
+        pix[6][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x));
+        pix[0][4] = _mm256_reassignment_epi8(pix[0][3], right_idx);
+        pix[0][5] = _mm256_reassignment_epi8(pix[0][4], right_idx);
+        pix[0][6] = _mm256_reassignment_epi8(pix[0][5], right_idx);
+        pix[1][4] = _mm256_reassignment_epi8(pix[1][3], right_idx);
+        pix[1][5] = _mm256_reassignment_epi8(pix[1][4], right_idx);
+        pix[1][6] = _mm256_reassignment_epi8(pix[1][5], right_idx);
+        pix[2][4] = _mm256_reassignment_epi8(pix[2][3], right_idx);
+        pix[2][5] = _mm256_reassignment_epi8(pix[2][4], right_idx);
+        pix[2][6] = _mm256_reassignment_epi8(pix[2][5], right_idx);
+        pix[3][4] = _mm256_reassignment_epi8(pix[3][3], right_idx);
+        pix[3][5] = _mm256_reassignment_epi8(pix[3][4], right_idx);
+        pix[3][6] = _mm256_reassignment_epi8(pix[3][5], right_idx);
+        pix[4][4] = _mm256_reassignment_epi8(pix[4][3], right_idx);
+        pix[4][5] = _mm256_reassignment_epi8(pix[4][4], right_idx);
+        pix[4][6] = _mm256_reassignment_epi8(pix[4][5], right_idx);
+        pix[5][4] = _mm256_reassignment_epi8(pix[5][3], right_idx);
+        pix[5][5] = _mm256_reassignment_epi8(pix[5][4], right_idx);
+        pix[5][6] = _mm256_reassignment_epi8(pix[5][5], right_idx);
+        pix[6][4] = _mm256_reassignment_epi8(pix[6][3], right_idx);
+        pix[6][5] = _mm256_reassignment_epi8(pix[6][4], right_idx);
+        pix[6][6] = _mm256_reassignment_epi8(pix[6][5], right_idx);
+        _MM256_SORT49_EPU8(
+            pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+            pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+            pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+        );
+        pix[3][3] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[4][6], pix[5][0]), pix[3][3], 31);
+        pix[3][3] = _MM256_TRANSFER_EPI8(pix[4][3], pix[3][3], 30);
+        pix[3][3] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[3][6], pix[4][0]), pix[3][3], 29);
+        _mm256_storeu_si256((__m256i *)(ptrd + x), pix[3][3]);
+        
+        ptrs += stride;
+        ptrd += stride;
+    }
+    
+    pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3));
+    pix[0][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + 1));
+    pix[0][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + 2));
+    pix[0][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + 3));
+    pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2));
+    pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 1));
+    pix[1][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 2));
+    pix[1][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 3));
+    pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride));
+    pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 1));
+    pix[2][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 2));
+    pix[2][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 3));
+    pix[3][3] = _mm256_loadu_si256((const __m256i *)ptrs);
+    pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + 1));
+    pix[3][5] = _mm256_loadu_si256((const __m256i *)(ptrs + 2));
+    pix[3][6] = _mm256_loadu_si256((const __m256i *)(ptrs + 3));
+    pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride));
+    pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 1));
+    pix[4][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 2));
+    pix[4][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 3));
+    pix[5][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2));
+    pix[5][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 1));
+    pix[5][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 2));
+    pix[5][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 3));
+    pix[0][2] = _mm256_reassignment_epi8(pix[0][3], left_idx);
+    pix[0][1] = _mm256_reassignment_epi8(pix[0][2], left_idx);
+    pix[0][0] = _mm256_reassignment_epi8(pix[0][1], left_idx);
+    pix[1][2] = _mm256_reassignment_epi8(pix[1][3], left_idx);
+    pix[1][1] = _mm256_reassignment_epi8(pix[1][2], left_idx);
+    pix[1][0] = _mm256_reassignment_epi8(pix[1][1], left_idx);
+    pix[2][2] = _mm256_reassignment_epi8(pix[2][3], left_idx);
+    pix[2][1] = _mm256_reassignment_epi8(pix[2][2], left_idx);
+    pix[2][0] = _mm256_reassignment_epi8(pix[2][1], left_idx);
+    pix[3][2] = _mm256_reassignment_epi8(pix[3][3], left_idx);
+    pix[3][1] = _mm256_reassignment_epi8(pix[3][2], left_idx);
+    pix[3][0] = _mm256_reassignment_epi8(pix[3][1], left_idx);
+    pix[4][2] = _mm256_reassignment_epi8(pix[4][3], left_idx);
+    pix[4][1] = _mm256_reassignment_epi8(pix[4][2], left_idx);
+    pix[4][0] = _mm256_reassignment_epi8(pix[4][1], left_idx);
+    pix[5][2] = _mm256_reassignment_epi8(pix[5][3], left_idx);
+    pix[5][1] = _mm256_reassignment_epi8(pix[5][2], left_idx);
+    pix[5][0] = _mm256_reassignment_epi8(pix[5][1], left_idx);
+    _MM256_SORT42_EPU8(
+        pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+        pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6]
+    );
+    pix[2][6] = _mm256_avg_epu8(pix[2][6], pix[3][0]);
+    pix[2][6] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[4][1], pix[4][2]), pix[2][6], 0);
+    pix[2][6] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[3][5], pix[3][6]), pix[2][6], 1);
+    pix[2][6] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[3][2], pix[3][3]), pix[2][6], 2);
+    _mm256_storeu_si256((__m256i *)ptrd, pix[2][6]);
+    
+    for (x = 32; x < mod32_w; x += 32) {
+        pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 3));
+        pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 2));
+        pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 1));
+        pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x));
+        pix[0][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x + 1));
+        pix[0][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x + 2));
+        pix[0][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x + 3));
+        pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 3));
+        pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+        pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+        pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+        pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 1));
+        pix[1][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 2));
+        pix[1][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 3));
+        pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 3));
+        pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+        pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+        pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+        pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 1));
+        pix[2][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 2));
+        pix[2][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 3));
+        pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 3));
+        pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+        pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+        pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+        pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 1));
+        pix[3][5] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 2));
+        pix[3][6] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 3));
+        pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 3));
+        pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+        pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+        pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+        pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 1));
+        pix[4][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 2));
+        pix[4][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 3));
+        pix[5][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 3));
+        pix[5][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+        pix[5][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+        pix[5][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+        pix[5][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 1));
+        pix[5][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 2));
+        pix[5][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 3));
+        _MM256_SORT42_EPU8(
+            pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+            pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6]
+        );
+        pix[2][6] = _mm256_avg_epu8(pix[2][6], pix[3][0]);
+        _mm256_storeu_si256((__m256i *)(ptrd + x), pix[2][6]);
+    }
+    
+    x = src_w - 32;
+    pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 3));
+    pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 2));
+    pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 1));
+    pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x));
+    pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 3));
+    pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+    pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+    pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+    pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 3));
+    pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+    pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+    pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+    pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 3));
+    pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+    pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+    pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+    pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 3));
+    pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+    pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+    pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+    pix[5][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 3));
+    pix[5][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+    pix[5][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+    pix[5][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+    pix[0][4] = _mm256_reassignment_epi8(pix[0][3], right_idx);
+    pix[0][5] = _mm256_reassignment_epi8(pix[0][4], right_idx);
+    pix[0][6] = _mm256_reassignment_epi8(pix[0][5], right_idx);
+    pix[1][4] = _mm256_reassignment_epi8(pix[1][3], right_idx);
+    pix[1][5] = _mm256_reassignment_epi8(pix[1][4], right_idx);
+    pix[1][6] = _mm256_reassignment_epi8(pix[1][5], right_idx);
+    pix[2][4] = _mm256_reassignment_epi8(pix[2][3], right_idx);
+    pix[2][5] = _mm256_reassignment_epi8(pix[2][4], right_idx);
+    pix[2][6] = _mm256_reassignment_epi8(pix[2][5], right_idx);
+    pix[3][4] = _mm256_reassignment_epi8(pix[3][3], right_idx);
+    pix[3][5] = _mm256_reassignment_epi8(pix[3][4], right_idx);
+    pix[3][6] = _mm256_reassignment_epi8(pix[3][5], right_idx);
+    pix[4][4] = _mm256_reassignment_epi8(pix[4][3], right_idx);
+    pix[4][5] = _mm256_reassignment_epi8(pix[4][4], right_idx);
+    pix[4][6] = _mm256_reassignment_epi8(pix[4][5], right_idx);
+    pix[5][4] = _mm256_reassignment_epi8(pix[5][3], right_idx);
+    pix[5][5] = _mm256_reassignment_epi8(pix[5][4], right_idx);
+    pix[5][6] = _mm256_reassignment_epi8(pix[5][5], right_idx);
+    _MM256_SORT42_EPU8(
+        pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+        pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6]
+    );
+    pix[2][6] = _mm256_avg_epu8(pix[2][6], pix[3][0]);
+    pix[2][6] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[4][1], pix[4][2]), pix[2][6], 31);
+    pix[2][6] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[3][5], pix[3][6]), pix[2][6], 30);
+    pix[2][6] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[3][2], pix[3][3]), pix[2][6], 29);
+    _mm256_storeu_si256((__m256i *)(ptrd + x), pix[2][6]);
+    
+    ptrs += stride;
+    ptrd += stride;
+    
+    pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3));
+    pix[0][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + 1));
+    pix[0][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + 2));
+    pix[0][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + 3));
+    pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2));
+    pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 1));
+    pix[1][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 2));
+    pix[1][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 3));
+    pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride));
+    pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 1));
+    pix[2][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 2));
+    pix[2][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 3));
+    pix[3][3] = _mm256_loadu_si256((const __m256i *)ptrs);
+    pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + 1));
+    pix[3][5] = _mm256_loadu_si256((const __m256i *)(ptrs + 2));
+    pix[3][6] = _mm256_loadu_si256((const __m256i *)(ptrs + 3));
+    pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride));
+    pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 1));
+    pix[4][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 2));
+    pix[4][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 3));
+    pix[0][2] = _mm256_reassignment_epi8(pix[0][3], left_idx);
+    pix[0][1] = _mm256_reassignment_epi8(pix[0][2], left_idx);
+    pix[0][0] = _mm256_reassignment_epi8(pix[0][1], left_idx);
+    pix[1][2] = _mm256_reassignment_epi8(pix[1][3], left_idx);
+    pix[1][1] = _mm256_reassignment_epi8(pix[1][2], left_idx);
+    pix[1][0] = _mm256_reassignment_epi8(pix[1][1], left_idx);
+    pix[2][2] = _mm256_reassignment_epi8(pix[2][3], left_idx);
+    pix[2][1] = _mm256_reassignment_epi8(pix[2][2], left_idx);
+    pix[2][0] = _mm256_reassignment_epi8(pix[2][1], left_idx);
+    pix[3][2] = _mm256_reassignment_epi8(pix[3][3], left_idx);
+    pix[3][1] = _mm256_reassignment_epi8(pix[3][2], left_idx);
+    pix[3][0] = _mm256_reassignment_epi8(pix[3][1], left_idx);
+    pix[4][2] = _mm256_reassignment_epi8(pix[4][3], left_idx);
+    pix[4][1] = _mm256_reassignment_epi8(pix[4][2], left_idx);
+    pix[4][0] = _mm256_reassignment_epi8(pix[4][1], left_idx);
+    _MM256_SORT35_EPU8(
+        pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6]
+    );
+    pix[2][3] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[3][3], pix[3][4]), pix[2][3], 0);
+    pix[2][3] = _MM256_TRANSFER_EPI8(pix[3][1], pix[2][3], 1);
+    pix[2][3] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[2][5], pix[2][6]), pix[2][3], 2);
+    _mm256_storeu_si256((__m256i *)ptrd, pix[2][3]);
+    
+    for (x = 32; x < mod32_w; x += 32) {
+        pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 3));
+        pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 2));
+        pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 1));
+        pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x));
+        pix[0][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x + 1));
+        pix[0][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x + 2));
+        pix[0][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x + 3));
+        pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 3));
+        pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+        pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+        pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+        pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 1));
+        pix[1][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 2));
+        pix[1][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 3));
+        pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 3));
+        pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+        pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+        pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+        pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 1));
+        pix[2][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 2));
+        pix[2][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 3));
+        pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 3));
+        pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+        pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+        pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+        pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 1));
+        pix[3][5] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 2));
+        pix[3][6] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 3));
+        pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 3));
+        pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+        pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+        pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+        pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 1));
+        pix[4][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 2));
+        pix[4][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 3));
+        _MM256_SORT35_EPU8(
+            pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6]
+        );
+        _mm256_storeu_si256((__m256i *)(ptrd + x), pix[2][3]);
+    }
+    
+    x = src_w - 32;
+    pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 3));
+    pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 2));
+    pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 1));
+    pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x));
+    pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 3));
+    pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+    pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+    pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+    pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 3));
+    pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+    pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+    pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+    pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 3));
+    pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+    pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+    pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+    pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 3));
+    pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+    pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+    pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+    pix[0][4] = _mm256_reassignment_epi8(pix[0][3], right_idx);
+    pix[0][5] = _mm256_reassignment_epi8(pix[0][4], right_idx);
+    pix[0][6] = _mm256_reassignment_epi8(pix[0][5], right_idx);
+    pix[1][4] = _mm256_reassignment_epi8(pix[1][3], right_idx);
+    pix[1][5] = _mm256_reassignment_epi8(pix[1][4], right_idx);
+    pix[1][6] = _mm256_reassignment_epi8(pix[1][5], right_idx);
+    pix[2][4] = _mm256_reassignment_epi8(pix[2][3], right_idx);
+    pix[2][5] = _mm256_reassignment_epi8(pix[2][4], right_idx);
+    pix[2][6] = _mm256_reassignment_epi8(pix[2][5], right_idx);
+    pix[3][4] = _mm256_reassignment_epi8(pix[3][3], right_idx);
+    pix[3][5] = _mm256_reassignment_epi8(pix[3][4], right_idx);
+    pix[3][6] = _mm256_reassignment_epi8(pix[3][5], right_idx);
+    pix[4][4] = _mm256_reassignment_epi8(pix[4][3], right_idx);
+    pix[4][5] = _mm256_reassignment_epi8(pix[4][4], right_idx);
+    pix[4][6] = _mm256_reassignment_epi8(pix[4][5], right_idx);
+    _MM256_SORT35_EPU8(
+        pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6]
+    );
+    pix[2][3] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[3][3], pix[3][4]), pix[2][3], 31);
+    pix[2][3] = _MM256_TRANSFER_EPI8(pix[3][1], pix[2][3], 30);
+    pix[2][3] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[2][5], pix[2][6]), pix[2][3], 29);
+    _mm256_storeu_si256((__m256i *)(ptrd + x), pix[2][3]);
+    
+    ptrs += stride;
+    ptrd += stride;
+    
+    pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3));
+    pix[0][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + 1));
+    pix[0][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + 2));
+    pix[0][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + 3));
+    pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2));
+    pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 1));
+    pix[1][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 2));
+    pix[1][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 3));
+    pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride));
+    pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 1));
+    pix[2][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 2));
+    pix[2][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 3));
+    pix[3][3] = _mm256_loadu_si256((const __m256i *)ptrs);
+    pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + 1));
+    pix[3][5] = _mm256_loadu_si256((const __m256i *)(ptrs + 2));
+    pix[3][6] = _mm256_loadu_si256((const __m256i *)(ptrs + 3));
+    pix[0][2] = _mm256_reassignment_epi8(pix[0][3], left_idx);
+    pix[0][1] = _mm256_reassignment_epi8(pix[0][2], left_idx);
+    pix[0][0] = _mm256_reassignment_epi8(pix[0][1], left_idx);
+    pix[1][2] = _mm256_reassignment_epi8(pix[1][3], left_idx);
+    pix[1][1] = _mm256_reassignment_epi8(pix[1][2], left_idx);
+    pix[1][0] = _mm256_reassignment_epi8(pix[1][1], left_idx);
+    pix[2][2] = _mm256_reassignment_epi8(pix[2][3], left_idx);
+    pix[2][1] = _mm256_reassignment_epi8(pix[2][2], left_idx);
+    pix[2][0] = _mm256_reassignment_epi8(pix[2][1], left_idx);
+    pix[3][2] = _mm256_reassignment_epi8(pix[3][3], left_idx);
+    pix[3][1] = _mm256_reassignment_epi8(pix[3][2], left_idx);
+    pix[3][0] = _mm256_reassignment_epi8(pix[3][1], left_idx);
+    _MM256_SORT28_EPU8(
+        pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6]
+    );
+    pix[1][6] = _mm256_avg_epu8(pix[1][6], pix[2][0]);
+    pix[1][6] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[2][5], pix[2][6]), pix[1][6], 0);
+    pix[1][6] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[2][3], pix[2][4]), pix[1][6], 1);
+    pix[1][6] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[2][1], pix[2][2]), pix[1][6], 2);
+    _mm256_storeu_si256((__m256i *)ptrd, pix[1][6]);
+    
+    for (x = 32; x < mod32_w; x += 32) {
+        pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 3));
+        pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 2));
+        pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 1));
+        pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x));
+        pix[0][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x + 1));
+        pix[0][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x + 2));
+        pix[0][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x + 3));
+        pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 3));
+        pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+        pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+        pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+        pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 1));
+        pix[1][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 2));
+        pix[1][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 3));
+        pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 3));
+        pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+        pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+        pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+        pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 1));
+        pix[2][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 2));
+        pix[2][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 3));
+        pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 3));
+        pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+        pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+        pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+        pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 1));
+        pix[3][5] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 2));
+        pix[3][6] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 3));
+        _MM256_SORT28_EPU8(
+            pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6]
+        );
+        pix[1][6] = _mm256_avg_epu8(pix[1][6], pix[2][0]);
+        _mm256_storeu_si256((__m256i *)(ptrd + x), pix[1][6]);
+    }
+    
+    x = src_w - 32;
+    pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 3));
+    pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 2));
+    pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 1));
+    pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x));
+    pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 3));
+    pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+    pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+    pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+    pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 3));
+    pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+    pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+    pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+    pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 3));
+    pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+    pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+    pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+    pix[0][4] = _mm256_reassignment_epi8(pix[0][3], right_idx);
+    pix[0][5] = _mm256_reassignment_epi8(pix[0][4], right_idx);
+    pix[0][6] = _mm256_reassignment_epi8(pix[0][5], right_idx);
+    pix[1][4] = _mm256_reassignment_epi8(pix[1][3], right_idx);
+    pix[1][5] = _mm256_reassignment_epi8(pix[1][4], right_idx);
+    pix[1][6] = _mm256_reassignment_epi8(pix[1][5], right_idx);
+    pix[2][4] = _mm256_reassignment_epi8(pix[2][3], right_idx);
+    pix[2][5] = _mm256_reassignment_epi8(pix[2][4], right_idx);
+    pix[2][6] = _mm256_reassignment_epi8(pix[2][5], right_idx);
+    pix[3][4] = _mm256_reassignment_epi8(pix[3][3], right_idx);
+    pix[3][5] = _mm256_reassignment_epi8(pix[3][4], right_idx);
+    pix[3][6] = _mm256_reassignment_epi8(pix[3][5], right_idx);
+    _MM256_SORT28_EPU8(
+        pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6]
+    );
+    pix[1][6] = _mm256_avg_epu8(pix[1][6], pix[2][0]);
+    pix[1][6] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[2][5], pix[2][6]), pix[1][6], 31);
+    pix[1][6] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[2][3], pix[2][4]), pix[1][6], 30);
+    pix[1][6] = _MM256_TRANSFER_EPI8(_mm256_avg_epu8(pix[2][1], pix[2][2]), pix[1][6], 29);
+    _mm256_storeu_si256((__m256i *)(ptrd + x), pix[1][6]);
+}
+
+static void get_median_blur_radius3_16(
+    const void *restrict srcp, void *restrict dstp, int src_w, int src_h, ptrdiff_t stride, int radius UNUSED
+) {
+    const uint16_t *restrict ptrs = srcp;
+    uint16_t *restrict ptrd = dstp;
+    int tail = src_w % 16;
+    if (!tail) tail = 16;
+    int mod16_w = src_w - tail;
+    int x = 0;
+    
+    __m256i left_idx = _mm256_setr_epi16(-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14);
+    __m256i right_idx = _mm256_setr_epi16(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, -1);
+    
+    __m256i pix[7][7];
+    
+    pix[3][3] = _mm256_loadu_si256((const __m256i *)ptrs);
+    pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + 1));
+    pix[3][5] = _mm256_loadu_si256((const __m256i *)(ptrs + 2));
+    pix[3][6] = _mm256_loadu_si256((const __m256i *)(ptrs + 3));
+    pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride));
+    pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 1));
+    pix[4][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 2));
+    pix[4][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 3));
+    pix[5][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2));
+    pix[5][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 1));
+    pix[5][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 2));
+    pix[5][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 3));
+    pix[6][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3));
+    pix[6][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + 1));
+    pix[6][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + 2));
+    pix[6][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + 3));
+    pix[3][2] = _mm256_reassignment_epi16(pix[3][3], left_idx);
+    pix[3][1] = _mm256_reassignment_epi16(pix[3][2], left_idx);
+    pix[3][0] = _mm256_reassignment_epi16(pix[3][1], left_idx);
+    pix[4][2] = _mm256_reassignment_epi16(pix[4][3], left_idx);
+    pix[4][1] = _mm256_reassignment_epi16(pix[4][2], left_idx);
+    pix[4][0] = _mm256_reassignment_epi16(pix[4][1], left_idx);
+    pix[5][2] = _mm256_reassignment_epi16(pix[5][3], left_idx);
+    pix[5][1] = _mm256_reassignment_epi16(pix[5][2], left_idx);
+    pix[5][0] = _mm256_reassignment_epi16(pix[5][1], left_idx);
+    pix[6][2] = _mm256_reassignment_epi16(pix[6][3], left_idx);
+    pix[6][1] = _mm256_reassignment_epi16(pix[6][2], left_idx);
+    pix[6][0] = _mm256_reassignment_epi16(pix[6][1], left_idx);
+    _MM256_SORT28_EPU16(
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+        pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+        pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+    );
+    pix[4][6] = _mm256_avg_epu16(pix[4][6], pix[5][0]);
+    pix[4][6] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[5][5], pix[5][6]), pix[4][6], 0);
+    pix[4][6] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[5][3], pix[5][4]), pix[4][6], 1);
+    pix[4][6] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[5][1], pix[5][2]), pix[4][6], 2);
+    _mm256_storeu_si256((__m256i *)ptrd, pix[4][6]);
+    
+    for (x = 16; x < mod16_w; x += 16) {
+        pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 3));
+        pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+        pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+        pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+        pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 1));
+        pix[3][5] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 2));
+        pix[3][6] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 3));
+        pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 3));
+        pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+        pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+        pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+        pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 1));
+        pix[4][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 2));
+        pix[4][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 3));
+        pix[5][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 3));
+        pix[5][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+        pix[5][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+        pix[5][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+        pix[5][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 1));
+        pix[5][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 2));
+        pix[5][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 3));
+        pix[6][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 3));
+        pix[6][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 2));
+        pix[6][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 1));
+        pix[6][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x));
+        pix[6][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x + 1));
+        pix[6][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x + 2));
+        pix[6][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x + 3));
+        _MM256_SORT28_EPU16(
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+            pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+            pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+        );
+        pix[4][6] = _mm256_avg_epu16(pix[4][6], pix[5][0]);
+        _mm256_storeu_si256((__m256i *)(ptrd + x), pix[4][6]);
+    }
+    
+    x = src_w - 16;
+    pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 3));
+    pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+    pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+    pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+    pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 3));
+    pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+    pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+    pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+    pix[5][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 3));
+    pix[5][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+    pix[5][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+    pix[5][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+    pix[6][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 3));
+    pix[6][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 2));
+    pix[6][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 1));
+    pix[6][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x));
+    pix[3][4] = _mm256_reassignment_epi16(pix[3][3], right_idx);
+    pix[3][5] = _mm256_reassignment_epi16(pix[3][4], right_idx);
+    pix[3][6] = _mm256_reassignment_epi16(pix[3][5], right_idx);
+    pix[4][4] = _mm256_reassignment_epi16(pix[4][3], right_idx);
+    pix[4][5] = _mm256_reassignment_epi16(pix[4][4], right_idx);
+    pix[4][6] = _mm256_reassignment_epi16(pix[4][5], right_idx);
+    pix[5][4] = _mm256_reassignment_epi16(pix[5][3], right_idx);
+    pix[5][5] = _mm256_reassignment_epi16(pix[5][4], right_idx);
+    pix[5][6] = _mm256_reassignment_epi16(pix[5][5], right_idx);
+    pix[6][4] = _mm256_reassignment_epi16(pix[6][3], right_idx);
+    pix[6][5] = _mm256_reassignment_epi16(pix[6][4], right_idx);
+    pix[6][6] = _mm256_reassignment_epi16(pix[6][5], right_idx);
+    _MM256_SORT28_EPU16(
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+        pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+        pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+    );
+    pix[4][6] = _mm256_avg_epu16(pix[4][6], pix[5][0]);
+    pix[4][6] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[5][5], pix[5][6]), pix[4][6], 15);
+    pix[4][6] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[5][3], pix[5][4]), pix[4][6], 14);
+    pix[4][6] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[5][1], pix[5][2]), pix[4][6], 13);
+    _mm256_storeu_si256((__m256i *)(ptrd + x), pix[4][6]);
+    
+    ptrs += stride;
+    ptrd += stride;
+    
+    pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride));
+    pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 1));
+    pix[2][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 2));
+    pix[2][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 3));
+    pix[3][3] = _mm256_loadu_si256((const __m256i *)ptrs);
+    pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + 1));
+    pix[3][5] = _mm256_loadu_si256((const __m256i *)(ptrs + 2));
+    pix[3][6] = _mm256_loadu_si256((const __m256i *)(ptrs + 3));
+    pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride));
+    pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 1));
+    pix[4][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 2));
+    pix[4][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 3));
+    pix[5][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2));
+    pix[5][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 1));
+    pix[5][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 2));
+    pix[5][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 3));
+    pix[6][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3));
+    pix[6][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + 1));
+    pix[6][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + 2));
+    pix[6][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + 3));
+    pix[2][2] = _mm256_reassignment_epi16(pix[2][3], left_idx);
+    pix[2][1] = _mm256_reassignment_epi16(pix[2][2], left_idx);
+    pix[2][0] = _mm256_reassignment_epi16(pix[2][1], left_idx);
+    pix[3][2] = _mm256_reassignment_epi16(pix[3][3], left_idx);
+    pix[3][1] = _mm256_reassignment_epi16(pix[3][2], left_idx);
+    pix[3][0] = _mm256_reassignment_epi16(pix[3][1], left_idx);
+    pix[4][2] = _mm256_reassignment_epi16(pix[4][3], left_idx);
+    pix[4][1] = _mm256_reassignment_epi16(pix[4][2], left_idx);
+    pix[4][0] = _mm256_reassignment_epi16(pix[4][1], left_idx);
+    pix[5][2] = _mm256_reassignment_epi16(pix[5][3], left_idx);
+    pix[5][1] = _mm256_reassignment_epi16(pix[5][2], left_idx);
+    pix[5][0] = _mm256_reassignment_epi16(pix[5][1], left_idx);
+    pix[6][2] = _mm256_reassignment_epi16(pix[6][3], left_idx);
+    pix[6][1] = _mm256_reassignment_epi16(pix[6][2], left_idx);
+    pix[6][0] = _mm256_reassignment_epi16(pix[6][1], left_idx);
+    _MM256_SORT35_EPU16(
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+        pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+        pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+    );
+    pix[4][3] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[5][3], pix[5][4]), pix[4][3], 0);
+    pix[4][3] = _MM256_TRANSFER_EPI16(pix[5][1], pix[4][3], 1);
+    pix[4][3] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[4][5], pix[4][6]), pix[4][3], 2);
+    _mm256_storeu_si256((__m256i *)ptrd, pix[4][3]);
+    
+    for (x = 16; x < mod16_w; x += 16) {
+        pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 3));
+        pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+        pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+        pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+        pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 1));
+        pix[2][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 2));
+        pix[2][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 3));
+        pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 3));
+        pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+        pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+        pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+        pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 1));
+        pix[3][5] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 2));
+        pix[3][6] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 3));
+        pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 3));
+        pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+        pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+        pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+        pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 1));
+        pix[4][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 2));
+        pix[4][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 3));
+        pix[5][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 3));
+        pix[5][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+        pix[5][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+        pix[5][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+        pix[5][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 1));
+        pix[5][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 2));
+        pix[5][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 3));
+        pix[6][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 3));
+        pix[6][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 2));
+        pix[6][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 1));
+        pix[6][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x));
+        pix[6][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x + 1));
+        pix[6][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x + 2));
+        pix[6][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x + 3));
+        _MM256_SORT35_EPU16(
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+            pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+            pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+        );
+        _mm256_storeu_si256((__m256i *)(ptrd + x), pix[4][3]);
+    }
+    
+    x = src_w - 16;
+    pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 3));
+    pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+    pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+    pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+    pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 3));
+    pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+    pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+    pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+    pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 3));
+    pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+    pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+    pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+    pix[5][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 3));
+    pix[5][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+    pix[5][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+    pix[5][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+    pix[6][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 3));
+    pix[6][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 2));
+    pix[6][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 1));
+    pix[6][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x));
+    pix[2][4] = _mm256_reassignment_epi16(pix[2][3], right_idx);
+    pix[2][5] = _mm256_reassignment_epi16(pix[2][4], right_idx);
+    pix[2][6] = _mm256_reassignment_epi16(pix[2][5], right_idx);
+    pix[3][4] = _mm256_reassignment_epi16(pix[3][3], right_idx);
+    pix[3][5] = _mm256_reassignment_epi16(pix[3][4], right_idx);
+    pix[3][6] = _mm256_reassignment_epi16(pix[3][5], right_idx);
+    pix[4][4] = _mm256_reassignment_epi16(pix[4][3], right_idx);
+    pix[4][5] = _mm256_reassignment_epi16(pix[4][4], right_idx);
+    pix[4][6] = _mm256_reassignment_epi16(pix[4][5], right_idx);
+    pix[5][4] = _mm256_reassignment_epi16(pix[5][3], right_idx);
+    pix[5][5] = _mm256_reassignment_epi16(pix[5][4], right_idx);
+    pix[5][6] = _mm256_reassignment_epi16(pix[5][5], right_idx);
+    pix[6][4] = _mm256_reassignment_epi16(pix[6][3], right_idx);
+    pix[6][5] = _mm256_reassignment_epi16(pix[6][4], right_idx);
+    pix[6][6] = _mm256_reassignment_epi16(pix[6][5], right_idx);
+    _MM256_SORT35_EPU16(
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+        pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+        pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+    );
+    pix[4][3] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[5][3], pix[5][4]), pix[4][3], 15);
+    pix[4][3] = _MM256_TRANSFER_EPI16(pix[5][1], pix[4][3], 14);
+    pix[4][3] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[4][5], pix[4][6]), pix[4][3], 13);
+    _mm256_storeu_si256((__m256i *)(ptrd + x), pix[4][3]);
+    
+    ptrs += stride;
+    ptrd += stride;
+    
+    pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2));
+    pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 1));
+    pix[1][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 2));
+    pix[1][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 3));
+    pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride));
+    pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 1));
+    pix[2][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 2));
+    pix[2][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 3));
+    pix[3][3] = _mm256_loadu_si256((const __m256i *)ptrs);
+    pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + 1));
+    pix[3][5] = _mm256_loadu_si256((const __m256i *)(ptrs + 2));
+    pix[3][6] = _mm256_loadu_si256((const __m256i *)(ptrs + 3));
+    pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride));
+    pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 1));
+    pix[4][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 2));
+    pix[4][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 3));
+    pix[5][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2));
+    pix[5][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 1));
+    pix[5][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 2));
+    pix[5][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 3));
+    pix[6][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3));
+    pix[6][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + 1));
+    pix[6][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + 2));
+    pix[6][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + 3));
+    pix[1][2] = _mm256_reassignment_epi16(pix[1][3], left_idx);
+    pix[1][1] = _mm256_reassignment_epi16(pix[1][2], left_idx);
+    pix[1][0] = _mm256_reassignment_epi16(pix[1][1], left_idx);
+    pix[2][2] = _mm256_reassignment_epi16(pix[2][3], left_idx);
+    pix[2][1] = _mm256_reassignment_epi16(pix[2][2], left_idx);
+    pix[2][0] = _mm256_reassignment_epi16(pix[2][1], left_idx);
+    pix[3][2] = _mm256_reassignment_epi16(pix[3][3], left_idx);
+    pix[3][1] = _mm256_reassignment_epi16(pix[3][2], left_idx);
+    pix[3][0] = _mm256_reassignment_epi16(pix[3][1], left_idx);
+    pix[4][2] = _mm256_reassignment_epi16(pix[4][3], left_idx);
+    pix[4][1] = _mm256_reassignment_epi16(pix[4][2], left_idx);
+    pix[4][0] = _mm256_reassignment_epi16(pix[4][1], left_idx);
+    pix[5][2] = _mm256_reassignment_epi16(pix[5][3], left_idx);
+    pix[5][1] = _mm256_reassignment_epi16(pix[5][2], left_idx);
+    pix[5][0] = _mm256_reassignment_epi16(pix[5][1], left_idx);
+    pix[6][2] = _mm256_reassignment_epi16(pix[6][3], left_idx);
+    pix[6][1] = _mm256_reassignment_epi16(pix[6][2], left_idx);
+    pix[6][0] = _mm256_reassignment_epi16(pix[6][1], left_idx);
+    _MM256_SORT42_EPU16(
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+        pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+        pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+    );
+    pix[3][6] = _mm256_avg_epu16(pix[3][6], pix[4][0]);
+    pix[3][6] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[5][1], pix[5][2]), pix[3][6], 0);
+    pix[3][6] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[4][5], pix[4][6]), pix[3][6], 1);
+    pix[3][6] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[4][2], pix[4][3]), pix[3][6], 2);
+    _mm256_storeu_si256((__m256i *)ptrd, pix[3][6]);
+    
+    for (x = 16; x < mod16_w; x += 16) {
+        pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 3));
+        pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+        pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+        pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+        pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 1));
+        pix[1][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 2));
+        pix[1][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 3));
+        pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 3));
+        pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+        pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+        pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+        pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 1));
+        pix[2][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 2));
+        pix[2][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 3));
+        pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 3));
+        pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+        pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+        pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+        pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 1));
+        pix[3][5] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 2));
+        pix[3][6] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 3));
+        pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 3));
+        pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+        pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+        pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+        pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 1));
+        pix[4][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 2));
+        pix[4][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 3));
+        pix[5][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 3));
+        pix[5][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+        pix[5][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+        pix[5][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+        pix[5][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 1));
+        pix[5][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 2));
+        pix[5][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 3));
+        pix[6][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 3));
+        pix[6][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 2));
+        pix[6][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 1));
+        pix[6][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x));
+        pix[6][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x + 1));
+        pix[6][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x + 2));
+        pix[6][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x + 3));
+        _MM256_SORT42_EPU16(
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+            pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+            pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+        );
+        pix[3][6] = _mm256_avg_epu16(pix[3][6], pix[4][0]);
+        _mm256_storeu_si256((__m256i *)(ptrd + x), pix[3][6]);
+    }
+    
+    x = src_w - 16;
+    pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 3));
+    pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+    pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+    pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+    pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 3));
+    pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+    pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+    pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+    pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 3));
+    pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+    pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+    pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+    pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 3));
+    pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+    pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+    pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+    pix[5][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 3));
+    pix[5][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+    pix[5][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+    pix[5][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+    pix[6][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 3));
+    pix[6][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 2));
+    pix[6][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 1));
+    pix[6][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x));
+    pix[1][4] = _mm256_reassignment_epi16(pix[1][3], right_idx);
+    pix[1][5] = _mm256_reassignment_epi16(pix[1][4], right_idx);
+    pix[1][6] = _mm256_reassignment_epi16(pix[1][5], right_idx);
+    pix[2][4] = _mm256_reassignment_epi16(pix[2][3], right_idx);
+    pix[2][5] = _mm256_reassignment_epi16(pix[2][4], right_idx);
+    pix[2][6] = _mm256_reassignment_epi16(pix[2][5], right_idx);
+    pix[3][4] = _mm256_reassignment_epi16(pix[3][3], right_idx);
+    pix[3][5] = _mm256_reassignment_epi16(pix[3][4], right_idx);
+    pix[3][6] = _mm256_reassignment_epi16(pix[3][5], right_idx);
+    pix[4][4] = _mm256_reassignment_epi16(pix[4][3], right_idx);
+    pix[4][5] = _mm256_reassignment_epi16(pix[4][4], right_idx);
+    pix[4][6] = _mm256_reassignment_epi16(pix[4][5], right_idx);
+    pix[5][4] = _mm256_reassignment_epi16(pix[5][3], right_idx);
+    pix[5][5] = _mm256_reassignment_epi16(pix[5][4], right_idx);
+    pix[5][6] = _mm256_reassignment_epi16(pix[5][5], right_idx);
+    pix[6][4] = _mm256_reassignment_epi16(pix[6][3], right_idx);
+    pix[6][5] = _mm256_reassignment_epi16(pix[6][4], right_idx);
+    pix[6][6] = _mm256_reassignment_epi16(pix[6][5], right_idx);
+    _MM256_SORT42_EPU16(
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+        pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+        pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+    );
+    pix[3][6] = _mm256_avg_epu16(pix[3][6], pix[4][0]);
+    pix[3][6] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[5][1], pix[5][2]), pix[3][6], 15);
+    pix[3][6] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[4][5], pix[4][6]), pix[3][6], 14);
+    pix[3][6] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[4][2], pix[4][3]), pix[3][6], 13);
+    _mm256_storeu_si256((__m256i *)(ptrd + x), pix[3][6]);
+    
+    ptrs += stride;
+    ptrd += stride;
+    
+    for (int y = 3; y < src_h - 3; y++) {
+        pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3));
+        pix[0][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + 1));
+        pix[0][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + 2));
+        pix[0][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + 3));
+        pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2));
+        pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 1));
+        pix[1][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 2));
+        pix[1][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 3));
+        pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride));
+        pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 1));
+        pix[2][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 2));
+        pix[2][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 3));
+        pix[3][3] = _mm256_loadu_si256((const __m256i *)ptrs);
+        pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + 1));
+        pix[3][5] = _mm256_loadu_si256((const __m256i *)(ptrs + 2));
+        pix[3][6] = _mm256_loadu_si256((const __m256i *)(ptrs + 3));
+        pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride));
+        pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 1));
+        pix[4][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 2));
+        pix[4][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 3));
+        pix[5][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2));
+        pix[5][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 1));
+        pix[5][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 2));
+        pix[5][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 3));
+        pix[6][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3));
+        pix[6][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + 1));
+        pix[6][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + 2));
+        pix[6][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + 3));
+        pix[0][2] = _mm256_reassignment_epi16(pix[0][3], left_idx);
+        pix[0][1] = _mm256_reassignment_epi16(pix[0][2], left_idx);
+        pix[0][0] = _mm256_reassignment_epi16(pix[0][1], left_idx);
+        pix[1][2] = _mm256_reassignment_epi16(pix[1][3], left_idx);
+        pix[1][1] = _mm256_reassignment_epi16(pix[1][2], left_idx);
+        pix[1][0] = _mm256_reassignment_epi16(pix[1][1], left_idx);
+        pix[2][2] = _mm256_reassignment_epi16(pix[2][3], left_idx);
+        pix[2][1] = _mm256_reassignment_epi16(pix[2][2], left_idx);
+        pix[2][0] = _mm256_reassignment_epi16(pix[2][1], left_idx);
+        pix[3][2] = _mm256_reassignment_epi16(pix[3][3], left_idx);
+        pix[3][1] = _mm256_reassignment_epi16(pix[3][2], left_idx);
+        pix[3][0] = _mm256_reassignment_epi16(pix[3][1], left_idx);
+        pix[4][2] = _mm256_reassignment_epi16(pix[4][3], left_idx);
+        pix[4][1] = _mm256_reassignment_epi16(pix[4][2], left_idx);
+        pix[4][0] = _mm256_reassignment_epi16(pix[4][1], left_idx);
+        pix[5][2] = _mm256_reassignment_epi16(pix[5][3], left_idx);
+        pix[5][1] = _mm256_reassignment_epi16(pix[5][2], left_idx);
+        pix[5][0] = _mm256_reassignment_epi16(pix[5][1], left_idx);
+        pix[6][2] = _mm256_reassignment_epi16(pix[6][3], left_idx);
+        pix[6][1] = _mm256_reassignment_epi16(pix[6][2], left_idx);
+        pix[6][0] = _mm256_reassignment_epi16(pix[6][1], left_idx);
+        _MM256_SORT49_EPU16(
+            pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+            pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+            pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+        );
+        pix[3][3] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[4][6], pix[5][0]), pix[3][3], 0);
+        pix[3][3] = _MM256_TRANSFER_EPI16(pix[4][3], pix[3][3], 1);
+        pix[3][3] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[3][6], pix[4][0]), pix[3][3], 2);
+        _mm256_storeu_si256((__m256i *)ptrd, pix[3][3]);
+        
+        for (x = 16; x < mod16_w; x += 16) {
+            pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 3));
+            pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 2));
+            pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 1));
+            pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x));
+            pix[0][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x + 1));
+            pix[0][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x + 2));
+            pix[0][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x + 3));
+            pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 3));
+            pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+            pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+            pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+            pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 1));
+            pix[1][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 2));
+            pix[1][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 3));
+            pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 3));
+            pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+            pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+            pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+            pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 1));
+            pix[2][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 2));
+            pix[2][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 3));
+            pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 3));
+            pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+            pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+            pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+            pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 1));
+            pix[3][5] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 2));
+            pix[3][6] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 3));
+            pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 3));
+            pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+            pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+            pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+            pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 1));
+            pix[4][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 2));
+            pix[4][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 3));
+            pix[5][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 3));
+            pix[5][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+            pix[5][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+            pix[5][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+            pix[5][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 1));
+            pix[5][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 2));
+            pix[5][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 3));
+            pix[6][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 3));
+            pix[6][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 2));
+            pix[6][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 1));
+            pix[6][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x));
+            pix[6][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x + 1));
+            pix[6][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x + 2));
+            pix[6][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x + 3));
+            _MM256_SORT49_EPU16(
+                pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+                pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+                pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+                pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+                pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+                pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+                pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+            );
+            _mm256_storeu_si256((__m256i *)(ptrd + x), pix[3][3]);
+        }
+        
+        x = src_w - 16;
+        pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 3));
+        pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 2));
+        pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 1));
+        pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x));
+        pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 3));
+        pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+        pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+        pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+        pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 3));
+        pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+        pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+        pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+        pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 3));
+        pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+        pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+        pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+        pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 3));
+        pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+        pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+        pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+        pix[5][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 3));
+        pix[5][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+        pix[5][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+        pix[5][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+        pix[6][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 3));
+        pix[6][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 2));
+        pix[6][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x - 1));
+        pix[6][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 3 + x));
+        pix[0][4] = _mm256_reassignment_epi16(pix[0][3], right_idx);
+        pix[0][5] = _mm256_reassignment_epi16(pix[0][4], right_idx);
+        pix[0][6] = _mm256_reassignment_epi16(pix[0][5], right_idx);
+        pix[1][4] = _mm256_reassignment_epi16(pix[1][3], right_idx);
+        pix[1][5] = _mm256_reassignment_epi16(pix[1][4], right_idx);
+        pix[1][6] = _mm256_reassignment_epi16(pix[1][5], right_idx);
+        pix[2][4] = _mm256_reassignment_epi16(pix[2][3], right_idx);
+        pix[2][5] = _mm256_reassignment_epi16(pix[2][4], right_idx);
+        pix[2][6] = _mm256_reassignment_epi16(pix[2][5], right_idx);
+        pix[3][4] = _mm256_reassignment_epi16(pix[3][3], right_idx);
+        pix[3][5] = _mm256_reassignment_epi16(pix[3][4], right_idx);
+        pix[3][6] = _mm256_reassignment_epi16(pix[3][5], right_idx);
+        pix[4][4] = _mm256_reassignment_epi16(pix[4][3], right_idx);
+        pix[4][5] = _mm256_reassignment_epi16(pix[4][4], right_idx);
+        pix[4][6] = _mm256_reassignment_epi16(pix[4][5], right_idx);
+        pix[5][4] = _mm256_reassignment_epi16(pix[5][3], right_idx);
+        pix[5][5] = _mm256_reassignment_epi16(pix[5][4], right_idx);
+        pix[5][6] = _mm256_reassignment_epi16(pix[5][5], right_idx);
+        pix[6][4] = _mm256_reassignment_epi16(pix[6][3], right_idx);
+        pix[6][5] = _mm256_reassignment_epi16(pix[6][4], right_idx);
+        pix[6][6] = _mm256_reassignment_epi16(pix[6][5], right_idx);
+        _MM256_SORT49_EPU16(
+            pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+            pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+            pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+        );
+        pix[3][3] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[4][6], pix[5][0]), pix[3][3], 15);
+        pix[3][3] = _MM256_TRANSFER_EPI16(pix[4][3], pix[3][3], 14);
+        pix[3][3] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[3][6], pix[4][0]), pix[3][3], 13);
+        _mm256_storeu_si256((__m256i *)(ptrd + x), pix[3][3]);
+        
+        ptrs += stride;
+        ptrd += stride;
+    }
+    
+    pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3));
+    pix[0][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + 1));
+    pix[0][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + 2));
+    pix[0][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + 3));
+    pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2));
+    pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 1));
+    pix[1][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 2));
+    pix[1][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 3));
+    pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride));
+    pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 1));
+    pix[2][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 2));
+    pix[2][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 3));
+    pix[3][3] = _mm256_loadu_si256((const __m256i *)ptrs);
+    pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + 1));
+    pix[3][5] = _mm256_loadu_si256((const __m256i *)(ptrs + 2));
+    pix[3][6] = _mm256_loadu_si256((const __m256i *)(ptrs + 3));
+    pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride));
+    pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 1));
+    pix[4][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 2));
+    pix[4][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 3));
+    pix[5][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2));
+    pix[5][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 1));
+    pix[5][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 2));
+    pix[5][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + 3));
+    pix[0][2] = _mm256_reassignment_epi16(pix[0][3], left_idx);
+    pix[0][1] = _mm256_reassignment_epi16(pix[0][2], left_idx);
+    pix[0][0] = _mm256_reassignment_epi16(pix[0][1], left_idx);
+    pix[1][2] = _mm256_reassignment_epi16(pix[1][3], left_idx);
+    pix[1][1] = _mm256_reassignment_epi16(pix[1][2], left_idx);
+    pix[1][0] = _mm256_reassignment_epi16(pix[1][1], left_idx);
+    pix[2][2] = _mm256_reassignment_epi16(pix[2][3], left_idx);
+    pix[2][1] = _mm256_reassignment_epi16(pix[2][2], left_idx);
+    pix[2][0] = _mm256_reassignment_epi16(pix[2][1], left_idx);
+    pix[3][2] = _mm256_reassignment_epi16(pix[3][3], left_idx);
+    pix[3][1] = _mm256_reassignment_epi16(pix[3][2], left_idx);
+    pix[3][0] = _mm256_reassignment_epi16(pix[3][1], left_idx);
+    pix[4][2] = _mm256_reassignment_epi16(pix[4][3], left_idx);
+    pix[4][1] = _mm256_reassignment_epi16(pix[4][2], left_idx);
+    pix[4][0] = _mm256_reassignment_epi16(pix[4][1], left_idx);
+    pix[5][2] = _mm256_reassignment_epi16(pix[5][3], left_idx);
+    pix[5][1] = _mm256_reassignment_epi16(pix[5][2], left_idx);
+    pix[5][0] = _mm256_reassignment_epi16(pix[5][1], left_idx);
+    _MM256_SORT42_EPU16(
+        pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+        pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6]
+    );
+    pix[2][6] = _mm256_avg_epu16(pix[2][6], pix[3][0]);
+    pix[2][6] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[4][1], pix[4][2]), pix[2][6], 0);
+    pix[2][6] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[3][5], pix[3][6]), pix[2][6], 1);
+    pix[2][6] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[3][2], pix[3][3]), pix[2][6], 2);
+    _mm256_storeu_si256((__m256i *)ptrd, pix[2][6]);
+    
+    for (x = 16; x < mod16_w; x += 16) {
+        pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 3));
+        pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 2));
+        pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 1));
+        pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x));
+        pix[0][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x + 1));
+        pix[0][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x + 2));
+        pix[0][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x + 3));
+        pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 3));
+        pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+        pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+        pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+        pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 1));
+        pix[1][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 2));
+        pix[1][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 3));
+        pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 3));
+        pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+        pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+        pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+        pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 1));
+        pix[2][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 2));
+        pix[2][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 3));
+        pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 3));
+        pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+        pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+        pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+        pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 1));
+        pix[3][5] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 2));
+        pix[3][6] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 3));
+        pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 3));
+        pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+        pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+        pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+        pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 1));
+        pix[4][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 2));
+        pix[4][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 3));
+        pix[5][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 3));
+        pix[5][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+        pix[5][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+        pix[5][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+        pix[5][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 1));
+        pix[5][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 2));
+        pix[5][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x + 3));
+        _MM256_SORT42_EPU16(
+            pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+            pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6]
+        );
+        pix[2][6] = _mm256_avg_epu16(pix[2][6], pix[3][0]);
+        _mm256_storeu_si256((__m256i *)(ptrd + x), pix[2][6]);
+    }
+    
+    x = src_w - 16;
+    pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 3));
+    pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 2));
+    pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 1));
+    pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x));
+    pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 3));
+    pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+    pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+    pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+    pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 3));
+    pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+    pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+    pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+    pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 3));
+    pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+    pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+    pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+    pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 3));
+    pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+    pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+    pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+    pix[5][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 3));
+    pix[5][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 2));
+    pix[5][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x - 1));
+    pix[5][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride * 2 + x));
+    pix[0][4] = _mm256_reassignment_epi16(pix[0][3], right_idx);
+    pix[0][5] = _mm256_reassignment_epi16(pix[0][4], right_idx);
+    pix[0][6] = _mm256_reassignment_epi16(pix[0][5], right_idx);
+    pix[1][4] = _mm256_reassignment_epi16(pix[1][3], right_idx);
+    pix[1][5] = _mm256_reassignment_epi16(pix[1][4], right_idx);
+    pix[1][6] = _mm256_reassignment_epi16(pix[1][5], right_idx);
+    pix[2][4] = _mm256_reassignment_epi16(pix[2][3], right_idx);
+    pix[2][5] = _mm256_reassignment_epi16(pix[2][4], right_idx);
+    pix[2][6] = _mm256_reassignment_epi16(pix[2][5], right_idx);
+    pix[3][4] = _mm256_reassignment_epi16(pix[3][3], right_idx);
+    pix[3][5] = _mm256_reassignment_epi16(pix[3][4], right_idx);
+    pix[3][6] = _mm256_reassignment_epi16(pix[3][5], right_idx);
+    pix[4][4] = _mm256_reassignment_epi16(pix[4][3], right_idx);
+    pix[4][5] = _mm256_reassignment_epi16(pix[4][4], right_idx);
+    pix[4][6] = _mm256_reassignment_epi16(pix[4][5], right_idx);
+    pix[5][4] = _mm256_reassignment_epi16(pix[5][3], right_idx);
+    pix[5][5] = _mm256_reassignment_epi16(pix[5][4], right_idx);
+    pix[5][6] = _mm256_reassignment_epi16(pix[5][5], right_idx);
+    _MM256_SORT42_EPU16(
+        pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+        pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6]
+    );
+    pix[2][6] = _mm256_avg_epu16(pix[2][6], pix[3][0]);
+    pix[2][6] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[4][1], pix[4][2]), pix[2][6], 15);
+    pix[2][6] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[3][5], pix[3][6]), pix[2][6], 14);
+    pix[2][6] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[3][2], pix[3][3]), pix[2][6], 13);
+    _mm256_storeu_si256((__m256i *)(ptrd + x), pix[2][6]);
+    
+    ptrs += stride;
+    ptrd += stride;
+    
+    pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3));
+    pix[0][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + 1));
+    pix[0][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + 2));
+    pix[0][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + 3));
+    pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2));
+    pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 1));
+    pix[1][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 2));
+    pix[1][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 3));
+    pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride));
+    pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 1));
+    pix[2][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 2));
+    pix[2][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 3));
+    pix[3][3] = _mm256_loadu_si256((const __m256i *)ptrs);
+    pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + 1));
+    pix[3][5] = _mm256_loadu_si256((const __m256i *)(ptrs + 2));
+    pix[3][6] = _mm256_loadu_si256((const __m256i *)(ptrs + 3));
+    pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride));
+    pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 1));
+    pix[4][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 2));
+    pix[4][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + 3));
+    pix[0][2] = _mm256_reassignment_epi16(pix[0][3], left_idx);
+    pix[0][1] = _mm256_reassignment_epi16(pix[0][2], left_idx);
+    pix[0][0] = _mm256_reassignment_epi16(pix[0][1], left_idx);
+    pix[1][2] = _mm256_reassignment_epi16(pix[1][3], left_idx);
+    pix[1][1] = _mm256_reassignment_epi16(pix[1][2], left_idx);
+    pix[1][0] = _mm256_reassignment_epi16(pix[1][1], left_idx);
+    pix[2][2] = _mm256_reassignment_epi16(pix[2][3], left_idx);
+    pix[2][1] = _mm256_reassignment_epi16(pix[2][2], left_idx);
+    pix[2][0] = _mm256_reassignment_epi16(pix[2][1], left_idx);
+    pix[3][2] = _mm256_reassignment_epi16(pix[3][3], left_idx);
+    pix[3][1] = _mm256_reassignment_epi16(pix[3][2], left_idx);
+    pix[3][0] = _mm256_reassignment_epi16(pix[3][1], left_idx);
+    pix[4][2] = _mm256_reassignment_epi16(pix[4][3], left_idx);
+    pix[4][1] = _mm256_reassignment_epi16(pix[4][2], left_idx);
+    pix[4][0] = _mm256_reassignment_epi16(pix[4][1], left_idx);
+    _MM256_SORT35_EPU16(
+        pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6]
+    );
+    pix[2][3] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[3][3], pix[3][4]), pix[2][3], 0);
+    pix[2][3] = _MM256_TRANSFER_EPI16(pix[3][1], pix[2][3], 1);
+    pix[2][3] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[2][5], pix[2][6]), pix[2][3], 2);
+    _mm256_storeu_si256((__m256i *)ptrd, pix[2][3]);
+    
+    for (x = 16; x < mod16_w; x += 16) {
+        pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 3));
+        pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 2));
+        pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 1));
+        pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x));
+        pix[0][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x + 1));
+        pix[0][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x + 2));
+        pix[0][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x + 3));
+        pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 3));
+        pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+        pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+        pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+        pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 1));
+        pix[1][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 2));
+        pix[1][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 3));
+        pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 3));
+        pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+        pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+        pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+        pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 1));
+        pix[2][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 2));
+        pix[2][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 3));
+        pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 3));
+        pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+        pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+        pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+        pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 1));
+        pix[3][5] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 2));
+        pix[3][6] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 3));
+        pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 3));
+        pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+        pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+        pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+        pix[4][4] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 1));
+        pix[4][5] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 2));
+        pix[4][6] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x + 3));
+        _MM256_SORT35_EPU16(
+            pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6]
+        );
+        _mm256_storeu_si256((__m256i *)(ptrd + x), pix[2][3]);
+    }
+    
+    x = src_w - 16;
+    pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 3));
+    pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 2));
+    pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 1));
+    pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x));
+    pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 3));
+    pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+    pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+    pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+    pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 3));
+    pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+    pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+    pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+    pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 3));
+    pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+    pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+    pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+    pix[4][0] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 3));
+    pix[4][1] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 2));
+    pix[4][2] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x - 1));
+    pix[4][3] = _mm256_loadu_si256((const __m256i *)(ptrs + stride + x));
+    pix[0][4] = _mm256_reassignment_epi16(pix[0][3], right_idx);
+    pix[0][5] = _mm256_reassignment_epi16(pix[0][4], right_idx);
+    pix[0][6] = _mm256_reassignment_epi16(pix[0][5], right_idx);
+    pix[1][4] = _mm256_reassignment_epi16(pix[1][3], right_idx);
+    pix[1][5] = _mm256_reassignment_epi16(pix[1][4], right_idx);
+    pix[1][6] = _mm256_reassignment_epi16(pix[1][5], right_idx);
+    pix[2][4] = _mm256_reassignment_epi16(pix[2][3], right_idx);
+    pix[2][5] = _mm256_reassignment_epi16(pix[2][4], right_idx);
+    pix[2][6] = _mm256_reassignment_epi16(pix[2][5], right_idx);
+    pix[3][4] = _mm256_reassignment_epi16(pix[3][3], right_idx);
+    pix[3][5] = _mm256_reassignment_epi16(pix[3][4], right_idx);
+    pix[3][6] = _mm256_reassignment_epi16(pix[3][5], right_idx);
+    pix[4][4] = _mm256_reassignment_epi16(pix[4][3], right_idx);
+    pix[4][5] = _mm256_reassignment_epi16(pix[4][4], right_idx);
+    pix[4][6] = _mm256_reassignment_epi16(pix[4][5], right_idx);
+    _MM256_SORT35_EPU16(
+        pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6]
+    );
+    pix[2][3] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[3][3], pix[3][4]), pix[2][3], 15);
+    pix[2][3] = _MM256_TRANSFER_EPI16(pix[3][1], pix[2][3], 14);
+    pix[2][3] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[2][5], pix[2][6]), pix[2][3], 13);
+    _mm256_storeu_si256((__m256i *)(ptrd + x), pix[2][3]);
+    
+    ptrs += stride;
+    ptrd += stride;
+    
+    pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3));
+    pix[0][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + 1));
+    pix[0][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + 2));
+    pix[0][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + 3));
+    pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2));
+    pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 1));
+    pix[1][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 2));
+    pix[1][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + 3));
+    pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride));
+    pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 1));
+    pix[2][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 2));
+    pix[2][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + 3));
+    pix[3][3] = _mm256_loadu_si256((const __m256i *)ptrs);
+    pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + 1));
+    pix[3][5] = _mm256_loadu_si256((const __m256i *)(ptrs + 2));
+    pix[3][6] = _mm256_loadu_si256((const __m256i *)(ptrs + 3));
+    pix[0][2] = _mm256_reassignment_epi16(pix[0][3], left_idx);
+    pix[0][1] = _mm256_reassignment_epi16(pix[0][2], left_idx);
+    pix[0][0] = _mm256_reassignment_epi16(pix[0][1], left_idx);
+    pix[1][2] = _mm256_reassignment_epi16(pix[1][3], left_idx);
+    pix[1][1] = _mm256_reassignment_epi16(pix[1][2], left_idx);
+    pix[1][0] = _mm256_reassignment_epi16(pix[1][1], left_idx);
+    pix[2][2] = _mm256_reassignment_epi16(pix[2][3], left_idx);
+    pix[2][1] = _mm256_reassignment_epi16(pix[2][2], left_idx);
+    pix[2][0] = _mm256_reassignment_epi16(pix[2][1], left_idx);
+    pix[3][2] = _mm256_reassignment_epi16(pix[3][3], left_idx);
+    pix[3][1] = _mm256_reassignment_epi16(pix[3][2], left_idx);
+    pix[3][0] = _mm256_reassignment_epi16(pix[3][1], left_idx);
+    _MM256_SORT28_EPU16(
+        pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6]
+    );
+    pix[1][6] = _mm256_avg_epu16(pix[1][6], pix[2][0]);
+    pix[1][6] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[2][5], pix[2][6]), pix[1][6], 0);
+    pix[1][6] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[2][3], pix[2][4]), pix[1][6], 1);
+    pix[1][6] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[2][1], pix[2][2]), pix[1][6], 2);
+    _mm256_storeu_si256((__m256i *)ptrd, pix[1][6]);
+    
+    for (x = 16; x < mod16_w; x += 16) {
+        pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 3));
+        pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 2));
+        pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 1));
+        pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x));
+        pix[0][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x + 1));
+        pix[0][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x + 2));
+        pix[0][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x + 3));
+        pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 3));
+        pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+        pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+        pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+        pix[1][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 1));
+        pix[1][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 2));
+        pix[1][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x + 3));
+        pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 3));
+        pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+        pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+        pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+        pix[2][4] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 1));
+        pix[2][5] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 2));
+        pix[2][6] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x + 3));
+        pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 3));
+        pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+        pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+        pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+        pix[3][4] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 1));
+        pix[3][5] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 2));
+        pix[3][6] = _mm256_loadu_si256((const __m256i *)(ptrs + x + 3));
+        _MM256_SORT28_EPU16(
+            pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6]
+        );
+        pix[1][6] = _mm256_avg_epu16(pix[1][6], pix[2][0]);
+        _mm256_storeu_si256((__m256i *)(ptrd + x), pix[1][6]);
+    }
+    
+    x = src_w - 16;
+    pix[0][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 3));
+    pix[0][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 2));
+    pix[0][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x - 1));
+    pix[0][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 3 + x));
+    pix[1][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 3));
+    pix[1][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 2));
+    pix[1][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x - 1));
+    pix[1][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride * 2 + x));
+    pix[2][0] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 3));
+    pix[2][1] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 2));
+    pix[2][2] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x - 1));
+    pix[2][3] = _mm256_loadu_si256((const __m256i *)(ptrs - stride + x));
+    pix[3][0] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 3));
+    pix[3][1] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 2));
+    pix[3][2] = _mm256_loadu_si256((const __m256i *)(ptrs + x - 1));
+    pix[3][3] = _mm256_loadu_si256((const __m256i *)(ptrs + x));
+    pix[0][4] = _mm256_reassignment_epi16(pix[0][3], right_idx);
+    pix[0][5] = _mm256_reassignment_epi16(pix[0][4], right_idx);
+    pix[0][6] = _mm256_reassignment_epi16(pix[0][5], right_idx);
+    pix[1][4] = _mm256_reassignment_epi16(pix[1][3], right_idx);
+    pix[1][5] = _mm256_reassignment_epi16(pix[1][4], right_idx);
+    pix[1][6] = _mm256_reassignment_epi16(pix[1][5], right_idx);
+    pix[2][4] = _mm256_reassignment_epi16(pix[2][3], right_idx);
+    pix[2][5] = _mm256_reassignment_epi16(pix[2][4], right_idx);
+    pix[2][6] = _mm256_reassignment_epi16(pix[2][5], right_idx);
+    pix[3][4] = _mm256_reassignment_epi16(pix[3][3], right_idx);
+    pix[3][5] = _mm256_reassignment_epi16(pix[3][4], right_idx);
+    pix[3][6] = _mm256_reassignment_epi16(pix[3][5], right_idx);
+    _MM256_SORT28_EPU16(
+        pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6]
+    );
+    pix[1][6] = _mm256_avg_epu16(pix[1][6], pix[2][0]);
+    pix[1][6] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[2][5], pix[2][6]), pix[1][6], 15);
+    pix[1][6] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[2][3], pix[2][4]), pix[1][6], 14);
+    pix[1][6] = _MM256_TRANSFER_EPI16(_mm256_avg_epu16(pix[2][1], pix[2][2]), pix[1][6], 13);
+    _mm256_storeu_si256((__m256i *)(ptrd + x), pix[1][6]);
+}
+
+static void get_median_blur_radius3_32(
+    const void *restrict srcp, void *restrict dstp, int src_w, int src_h, ptrdiff_t stride, int radius UNUSED
+) {
+    const float *restrict ptrs = srcp;
+    float *restrict ptrd = dstp;
+    int tail = src_w % 8;
+    if (!tail) tail = 8;
+    int mod8_w = src_w - tail;
+    int x = 0;
+    
+    __m256i left_idx = _mm256_setr_epi32(-1, 0, 1, 2, 3, 4, 5, 6);
+    __m256i right_idx = _mm256_setr_epi32(1, 2, 3, 4, 5, 6, 7, -1);
+    
+    __m256 pix[7][7];
+    
+    pix[3][3] = _mm256_loadu_ps(ptrs);
+    pix[3][4] = _mm256_loadu_ps(ptrs + 1);
+    pix[3][5] = _mm256_loadu_ps(ptrs + 2);
+    pix[3][6] = _mm256_loadu_ps(ptrs + 3);
+    pix[4][3] = _mm256_loadu_ps(ptrs + stride);
+    pix[4][4] = _mm256_loadu_ps(ptrs + stride + 1);
+    pix[4][5] = _mm256_loadu_ps(ptrs + stride + 2);
+    pix[4][6] = _mm256_loadu_ps(ptrs + stride + 3);
+    pix[5][3] = _mm256_loadu_ps(ptrs + stride * 2);
+    pix[5][4] = _mm256_loadu_ps(ptrs + stride * 2 + 1);
+    pix[5][5] = _mm256_loadu_ps(ptrs + stride * 2 + 2);
+    pix[5][6] = _mm256_loadu_ps(ptrs + stride * 2 + 3);
+    pix[6][3] = _mm256_loadu_ps(ptrs + stride * 3);
+    pix[6][4] = _mm256_loadu_ps(ptrs + stride * 3 + 1);
+    pix[6][5] = _mm256_loadu_ps(ptrs + stride * 3 + 2);
+    pix[6][6] = _mm256_loadu_ps(ptrs + stride * 3 + 3);
+    pix[3][2] = _mm256_reassignment_ps(pix[3][3], left_idx);
+    pix[3][1] = _mm256_reassignment_ps(pix[3][2], left_idx);
+    pix[3][0] = _mm256_reassignment_ps(pix[3][1], left_idx);
+    pix[4][2] = _mm256_reassignment_ps(pix[4][3], left_idx);
+    pix[4][1] = _mm256_reassignment_ps(pix[4][2], left_idx);
+    pix[4][0] = _mm256_reassignment_ps(pix[4][1], left_idx);
+    pix[5][2] = _mm256_reassignment_ps(pix[5][3], left_idx);
+    pix[5][1] = _mm256_reassignment_ps(pix[5][2], left_idx);
+    pix[5][0] = _mm256_reassignment_ps(pix[5][1], left_idx);
+    pix[6][2] = _mm256_reassignment_ps(pix[6][3], left_idx);
+    pix[6][1] = _mm256_reassignment_ps(pix[6][2], left_idx);
+    pix[6][0] = _mm256_reassignment_ps(pix[6][1], left_idx);
+    _MM256_SORT28_PS(
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+        pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+        pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+    );
+    pix[4][6] = _mm256_avg_ps(pix[4][6], pix[5][0]);
+    pix[4][6] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[5][5], pix[5][6]), pix[4][6], 0);
+    pix[4][6] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[5][3], pix[5][4]), pix[4][6], 1);
+    pix[4][6] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[5][1], pix[5][2]), pix[4][6], 2);
+    _mm256_storeu_ps(ptrd, pix[4][6]);
+    
+    for (x = 8; x < mod8_w; x += 8) {
+        pix[3][0] = _mm256_loadu_ps(ptrs + x - 3);
+        pix[3][1] = _mm256_loadu_ps(ptrs + x - 2);
+        pix[3][2] = _mm256_loadu_ps(ptrs + x - 1);
+        pix[3][3] = _mm256_loadu_ps(ptrs + x);
+        pix[3][4] = _mm256_loadu_ps(ptrs + x + 1);
+        pix[3][5] = _mm256_loadu_ps(ptrs + x + 2);
+        pix[3][6] = _mm256_loadu_ps(ptrs + x + 3);
+        pix[4][0] = _mm256_loadu_ps(ptrs + stride + x - 3);
+        pix[4][1] = _mm256_loadu_ps(ptrs + stride + x - 2);
+        pix[4][2] = _mm256_loadu_ps(ptrs + stride + x - 1);
+        pix[4][3] = _mm256_loadu_ps(ptrs + stride + x);
+        pix[4][4] = _mm256_loadu_ps(ptrs + stride + x + 1);
+        pix[4][5] = _mm256_loadu_ps(ptrs + stride + x + 2);
+        pix[4][6] = _mm256_loadu_ps(ptrs + stride + x + 3);
+        pix[5][0] = _mm256_loadu_ps(ptrs + stride * 2 + x - 3);
+        pix[5][1] = _mm256_loadu_ps(ptrs + stride * 2 + x - 2);
+        pix[5][2] = _mm256_loadu_ps(ptrs + stride * 2 + x - 1);
+        pix[5][3] = _mm256_loadu_ps(ptrs + stride * 2 + x);
+        pix[5][4] = _mm256_loadu_ps(ptrs + stride * 2 + x + 1);
+        pix[5][5] = _mm256_loadu_ps(ptrs + stride * 2 + x + 2);
+        pix[5][6] = _mm256_loadu_ps(ptrs + stride * 2 + x + 3);
+        pix[6][0] = _mm256_loadu_ps(ptrs + stride * 3 + x - 3);
+        pix[6][1] = _mm256_loadu_ps(ptrs + stride * 3 + x - 2);
+        pix[6][2] = _mm256_loadu_ps(ptrs + stride * 3 + x - 1);
+        pix[6][3] = _mm256_loadu_ps(ptrs + stride * 3 + x);
+        pix[6][4] = _mm256_loadu_ps(ptrs + stride * 3 + x + 1);
+        pix[6][5] = _mm256_loadu_ps(ptrs + stride * 3 + x + 2);
+        pix[6][6] = _mm256_loadu_ps(ptrs + stride * 3 + x + 3);
+        _MM256_SORT28_PS(
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+            pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+            pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+        );
+        pix[4][6] = _mm256_avg_ps(pix[4][6], pix[5][0]);
+        _mm256_storeu_ps(ptrd + x, pix[4][6]);
+    }
+    
+    x = src_w - 8;
+    pix[3][0] = _mm256_loadu_ps(ptrs + x - 3);
+    pix[3][1] = _mm256_loadu_ps(ptrs + x - 2);
+    pix[3][2] = _mm256_loadu_ps(ptrs + x - 1);
+    pix[3][3] = _mm256_loadu_ps(ptrs + x);
+    pix[4][0] = _mm256_loadu_ps(ptrs + stride + x - 3);
+    pix[4][1] = _mm256_loadu_ps(ptrs + stride + x - 2);
+    pix[4][2] = _mm256_loadu_ps(ptrs + stride + x - 1);
+    pix[4][3] = _mm256_loadu_ps(ptrs + stride + x);
+    pix[5][0] = _mm256_loadu_ps(ptrs + stride * 2 + x - 3);
+    pix[5][1] = _mm256_loadu_ps(ptrs + stride * 2 + x - 2);
+    pix[5][2] = _mm256_loadu_ps(ptrs + stride * 2 + x - 1);
+    pix[5][3] = _mm256_loadu_ps(ptrs + stride * 2 + x);
+    pix[6][0] = _mm256_loadu_ps(ptrs + stride * 3 + x - 3);
+    pix[6][1] = _mm256_loadu_ps(ptrs + stride * 3 + x - 2);
+    pix[6][2] = _mm256_loadu_ps(ptrs + stride * 3 + x - 1);
+    pix[6][3] = _mm256_loadu_ps(ptrs + stride * 3 + x);
+    pix[3][4] = _mm256_reassignment_ps(pix[3][3], right_idx);
+    pix[3][5] = _mm256_reassignment_ps(pix[3][4], right_idx);
+    pix[3][6] = _mm256_reassignment_ps(pix[3][5], right_idx);
+    pix[4][4] = _mm256_reassignment_ps(pix[4][3], right_idx);
+    pix[4][5] = _mm256_reassignment_ps(pix[4][4], right_idx);
+    pix[4][6] = _mm256_reassignment_ps(pix[4][5], right_idx);
+    pix[5][4] = _mm256_reassignment_ps(pix[5][3], right_idx);
+    pix[5][5] = _mm256_reassignment_ps(pix[5][4], right_idx);
+    pix[5][6] = _mm256_reassignment_ps(pix[5][5], right_idx);
+    pix[6][4] = _mm256_reassignment_ps(pix[6][3], right_idx);
+    pix[6][5] = _mm256_reassignment_ps(pix[6][4], right_idx);
+    pix[6][6] = _mm256_reassignment_ps(pix[6][5], right_idx);
+    _MM256_SORT28_PS(
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+        pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+        pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+    );
+    pix[4][6] = _mm256_avg_ps(pix[4][6], pix[5][0]);
+    pix[4][6] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[5][5], pix[5][6]), pix[4][6], 7);
+    pix[4][6] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[5][3], pix[5][4]), pix[4][6], 6);
+    pix[4][6] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[5][1], pix[5][2]), pix[4][6], 5);
+    _mm256_storeu_ps(ptrd + x, pix[4][6]);
+    
+    ptrs += stride;
+    ptrd += stride;
+    
+    pix[2][3] = _mm256_loadu_ps(ptrs - stride);
+    pix[2][4] = _mm256_loadu_ps(ptrs - stride + 1);
+    pix[2][5] = _mm256_loadu_ps(ptrs - stride + 2);
+    pix[2][6] = _mm256_loadu_ps(ptrs - stride + 3);
+    pix[3][3] = _mm256_loadu_ps(ptrs);
+    pix[3][4] = _mm256_loadu_ps(ptrs + 1);
+    pix[3][5] = _mm256_loadu_ps(ptrs + 2);
+    pix[3][6] = _mm256_loadu_ps(ptrs + 3);
+    pix[4][3] = _mm256_loadu_ps(ptrs + stride);
+    pix[4][4] = _mm256_loadu_ps(ptrs + stride + 1);
+    pix[4][5] = _mm256_loadu_ps(ptrs + stride + 2);
+    pix[4][6] = _mm256_loadu_ps(ptrs + stride + 3);
+    pix[5][3] = _mm256_loadu_ps(ptrs + stride * 2);
+    pix[5][4] = _mm256_loadu_ps(ptrs + stride * 2 + 1);
+    pix[5][5] = _mm256_loadu_ps(ptrs + stride * 2 + 2);
+    pix[5][6] = _mm256_loadu_ps(ptrs + stride * 2 + 3);
+    pix[6][3] = _mm256_loadu_ps(ptrs + stride * 3);
+    pix[6][4] = _mm256_loadu_ps(ptrs + stride * 3 + 1);
+    pix[6][5] = _mm256_loadu_ps(ptrs + stride * 3 + 2);
+    pix[6][6] = _mm256_loadu_ps(ptrs + stride * 3 + 3);
+    pix[2][2] = _mm256_reassignment_ps(pix[2][3], left_idx);
+    pix[2][1] = _mm256_reassignment_ps(pix[2][2], left_idx);
+    pix[2][0] = _mm256_reassignment_ps(pix[2][1], left_idx);
+    pix[3][2] = _mm256_reassignment_ps(pix[3][3], left_idx);
+    pix[3][1] = _mm256_reassignment_ps(pix[3][2], left_idx);
+    pix[3][0] = _mm256_reassignment_ps(pix[3][1], left_idx);
+    pix[4][2] = _mm256_reassignment_ps(pix[4][3], left_idx);
+    pix[4][1] = _mm256_reassignment_ps(pix[4][2], left_idx);
+    pix[4][0] = _mm256_reassignment_ps(pix[4][1], left_idx);
+    pix[5][2] = _mm256_reassignment_ps(pix[5][3], left_idx);
+    pix[5][1] = _mm256_reassignment_ps(pix[5][2], left_idx);
+    pix[5][0] = _mm256_reassignment_ps(pix[5][1], left_idx);
+    pix[6][2] = _mm256_reassignment_ps(pix[6][3], left_idx);
+    pix[6][1] = _mm256_reassignment_ps(pix[6][2], left_idx);
+    pix[6][0] = _mm256_reassignment_ps(pix[6][1], left_idx);
+    _MM256_SORT35_PS(
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+        pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+        pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+    );
+    pix[4][3] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[5][3], pix[5][4]), pix[4][3], 0);
+    pix[4][3] = _MM256_TRANSFER_PS(pix[5][1], pix[4][3], 1);
+    pix[4][3] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[4][5], pix[4][6]), pix[4][3], 2);
+    _mm256_storeu_ps(ptrd, pix[4][3]);
+    
+    for (x = 8; x < mod8_w; x += 8) {
+        pix[2][0] = _mm256_loadu_ps(ptrs - stride + x - 3);
+        pix[2][1] = _mm256_loadu_ps(ptrs - stride + x - 2);
+        pix[2][2] = _mm256_loadu_ps(ptrs - stride + x - 1);
+        pix[2][3] = _mm256_loadu_ps(ptrs - stride + x);
+        pix[2][4] = _mm256_loadu_ps(ptrs - stride + x + 1);
+        pix[2][5] = _mm256_loadu_ps(ptrs - stride + x + 2);
+        pix[2][6] = _mm256_loadu_ps(ptrs - stride + x + 3);
+        pix[3][0] = _mm256_loadu_ps(ptrs + x - 3);
+        pix[3][1] = _mm256_loadu_ps(ptrs + x - 2);
+        pix[3][2] = _mm256_loadu_ps(ptrs + x - 1);
+        pix[3][3] = _mm256_loadu_ps(ptrs + x);
+        pix[3][4] = _mm256_loadu_ps(ptrs + x + 1);
+        pix[3][5] = _mm256_loadu_ps(ptrs + x + 2);
+        pix[3][6] = _mm256_loadu_ps(ptrs + x + 3);
+        pix[4][0] = _mm256_loadu_ps(ptrs + stride + x - 3);
+        pix[4][1] = _mm256_loadu_ps(ptrs + stride + x - 2);
+        pix[4][2] = _mm256_loadu_ps(ptrs + stride + x - 1);
+        pix[4][3] = _mm256_loadu_ps(ptrs + stride + x);
+        pix[4][4] = _mm256_loadu_ps(ptrs + stride + x + 1);
+        pix[4][5] = _mm256_loadu_ps(ptrs + stride + x + 2);
+        pix[4][6] = _mm256_loadu_ps(ptrs + stride + x + 3);
+        pix[5][0] = _mm256_loadu_ps(ptrs + stride * 2 + x - 3);
+        pix[5][1] = _mm256_loadu_ps(ptrs + stride * 2 + x - 2);
+        pix[5][2] = _mm256_loadu_ps(ptrs + stride * 2 + x - 1);
+        pix[5][3] = _mm256_loadu_ps(ptrs + stride * 2 + x);
+        pix[5][4] = _mm256_loadu_ps(ptrs + stride * 2 + x + 1);
+        pix[5][5] = _mm256_loadu_ps(ptrs + stride * 2 + x + 2);
+        pix[5][6] = _mm256_loadu_ps(ptrs + stride * 2 + x + 3);
+        pix[6][0] = _mm256_loadu_ps(ptrs + stride * 3 + x - 3);
+        pix[6][1] = _mm256_loadu_ps(ptrs + stride * 3 + x - 2);
+        pix[6][2] = _mm256_loadu_ps(ptrs + stride * 3 + x - 1);
+        pix[6][3] = _mm256_loadu_ps(ptrs + stride * 3 + x);
+        pix[6][4] = _mm256_loadu_ps(ptrs + stride * 3 + x + 1);
+        pix[6][5] = _mm256_loadu_ps(ptrs + stride * 3 + x + 2);
+        pix[6][6] = _mm256_loadu_ps(ptrs + stride * 3 + x + 3);
+        _MM256_SORT35_PS(
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+            pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+            pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+        );
+        _mm256_storeu_ps(ptrd + x, pix[4][3]);
+    }
+    
+    x = src_w - 8;
+    pix[2][0] = _mm256_loadu_ps(ptrs - stride + x - 3);
+    pix[2][1] = _mm256_loadu_ps(ptrs - stride + x - 2);
+    pix[2][2] = _mm256_loadu_ps(ptrs - stride + x - 1);
+    pix[2][3] = _mm256_loadu_ps(ptrs - stride + x);
+    pix[3][0] = _mm256_loadu_ps(ptrs + x - 3);
+    pix[3][1] = _mm256_loadu_ps(ptrs + x - 2);
+    pix[3][2] = _mm256_loadu_ps(ptrs + x - 1);
+    pix[3][3] = _mm256_loadu_ps(ptrs + x);
+    pix[4][0] = _mm256_loadu_ps(ptrs + stride + x - 3);
+    pix[4][1] = _mm256_loadu_ps(ptrs + stride + x - 2);
+    pix[4][2] = _mm256_loadu_ps(ptrs + stride + x - 1);
+    pix[4][3] = _mm256_loadu_ps(ptrs + stride + x);
+    pix[5][0] = _mm256_loadu_ps(ptrs + stride * 2 + x - 3);
+    pix[5][1] = _mm256_loadu_ps(ptrs + stride * 2 + x - 2);
+    pix[5][2] = _mm256_loadu_ps(ptrs + stride * 2 + x - 1);
+    pix[5][3] = _mm256_loadu_ps(ptrs + stride * 2 + x);
+    pix[6][0] = _mm256_loadu_ps(ptrs + stride * 3 + x - 3);
+    pix[6][1] = _mm256_loadu_ps(ptrs + stride * 3 + x - 2);
+    pix[6][2] = _mm256_loadu_ps(ptrs + stride * 3 + x - 1);
+    pix[6][3] = _mm256_loadu_ps(ptrs + stride * 3 + x);
+    pix[2][4] = _mm256_reassignment_ps(pix[2][3], right_idx);
+    pix[2][5] = _mm256_reassignment_ps(pix[2][4], right_idx);
+    pix[2][6] = _mm256_reassignment_ps(pix[2][5], right_idx);
+    pix[3][4] = _mm256_reassignment_ps(pix[3][3], right_idx);
+    pix[3][5] = _mm256_reassignment_ps(pix[3][4], right_idx);
+    pix[3][6] = _mm256_reassignment_ps(pix[3][5], right_idx);
+    pix[4][4] = _mm256_reassignment_ps(pix[4][3], right_idx);
+    pix[4][5] = _mm256_reassignment_ps(pix[4][4], right_idx);
+    pix[4][6] = _mm256_reassignment_ps(pix[4][5], right_idx);
+    pix[5][4] = _mm256_reassignment_ps(pix[5][3], right_idx);
+    pix[5][5] = _mm256_reassignment_ps(pix[5][4], right_idx);
+    pix[5][6] = _mm256_reassignment_ps(pix[5][5], right_idx);
+    pix[6][4] = _mm256_reassignment_ps(pix[6][3], right_idx);
+    pix[6][5] = _mm256_reassignment_ps(pix[6][4], right_idx);
+    pix[6][6] = _mm256_reassignment_ps(pix[6][5], right_idx);
+    _MM256_SORT35_PS(
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+        pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+        pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+    );
+    pix[4][3] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[5][3], pix[5][4]), pix[4][3], 7);
+    pix[4][3] = _MM256_TRANSFER_PS(pix[5][1], pix[4][3], 6);
+    pix[4][3] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[4][5], pix[4][6]), pix[4][3], 5);
+    _mm256_storeu_ps(ptrd + x, pix[4][3]);
+    
+    ptrs += stride;
+    ptrd += stride;
+    
+    pix[1][3] = _mm256_loadu_ps(ptrs - stride * 2);
+    pix[1][4] = _mm256_loadu_ps(ptrs - stride * 2 + 1);
+    pix[1][5] = _mm256_loadu_ps(ptrs - stride * 2 + 2);
+    pix[1][6] = _mm256_loadu_ps(ptrs - stride * 2 + 3);
+    pix[2][3] = _mm256_loadu_ps(ptrs - stride);
+    pix[2][4] = _mm256_loadu_ps(ptrs - stride + 1);
+    pix[2][5] = _mm256_loadu_ps(ptrs - stride + 2);
+    pix[2][6] = _mm256_loadu_ps(ptrs - stride + 3);
+    pix[3][3] = _mm256_loadu_ps(ptrs);
+    pix[3][4] = _mm256_loadu_ps(ptrs + 1);
+    pix[3][5] = _mm256_loadu_ps(ptrs + 2);
+    pix[3][6] = _mm256_loadu_ps(ptrs + 3);
+    pix[4][3] = _mm256_loadu_ps(ptrs + stride);
+    pix[4][4] = _mm256_loadu_ps(ptrs + stride + 1);
+    pix[4][5] = _mm256_loadu_ps(ptrs + stride + 2);
+    pix[4][6] = _mm256_loadu_ps(ptrs + stride + 3);
+    pix[5][3] = _mm256_loadu_ps(ptrs + stride * 2);
+    pix[5][4] = _mm256_loadu_ps(ptrs + stride * 2 + 1);
+    pix[5][5] = _mm256_loadu_ps(ptrs + stride * 2 + 2);
+    pix[5][6] = _mm256_loadu_ps(ptrs + stride * 2 + 3);
+    pix[6][3] = _mm256_loadu_ps(ptrs + stride * 3);
+    pix[6][4] = _mm256_loadu_ps(ptrs + stride * 3 + 1);
+    pix[6][5] = _mm256_loadu_ps(ptrs + stride * 3 + 2);
+    pix[6][6] = _mm256_loadu_ps(ptrs + stride * 3 + 3);
+    pix[1][2] = _mm256_reassignment_ps(pix[1][3], left_idx);
+    pix[1][1] = _mm256_reassignment_ps(pix[1][2], left_idx);
+    pix[1][0] = _mm256_reassignment_ps(pix[1][1], left_idx);
+    pix[2][2] = _mm256_reassignment_ps(pix[2][3], left_idx);
+    pix[2][1] = _mm256_reassignment_ps(pix[2][2], left_idx);
+    pix[2][0] = _mm256_reassignment_ps(pix[2][1], left_idx);
+    pix[3][2] = _mm256_reassignment_ps(pix[3][3], left_idx);
+    pix[3][1] = _mm256_reassignment_ps(pix[3][2], left_idx);
+    pix[3][0] = _mm256_reassignment_ps(pix[3][1], left_idx);
+    pix[4][2] = _mm256_reassignment_ps(pix[4][3], left_idx);
+    pix[4][1] = _mm256_reassignment_ps(pix[4][2], left_idx);
+    pix[4][0] = _mm256_reassignment_ps(pix[4][1], left_idx);
+    pix[5][2] = _mm256_reassignment_ps(pix[5][3], left_idx);
+    pix[5][1] = _mm256_reassignment_ps(pix[5][2], left_idx);
+    pix[5][0] = _mm256_reassignment_ps(pix[5][1], left_idx);
+    pix[6][2] = _mm256_reassignment_ps(pix[6][3], left_idx);
+    pix[6][1] = _mm256_reassignment_ps(pix[6][2], left_idx);
+    pix[6][0] = _mm256_reassignment_ps(pix[6][1], left_idx);
+    _MM256_SORT42_PS(
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+        pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+        pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+    );
+    pix[3][6] = _mm256_avg_ps(pix[3][6], pix[4][0]);
+    pix[3][6] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[5][1], pix[5][2]), pix[3][6], 0);
+    pix[3][6] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[4][5], pix[4][6]), pix[3][6], 1);
+    pix[3][6] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[4][2], pix[4][3]), pix[3][6], 2);
+    _mm256_storeu_ps(ptrd, pix[3][6]);
+    
+    for (x = 8; x < mod8_w; x += 8) {
+        pix[1][0] = _mm256_loadu_ps(ptrs - stride * 2 + x - 3);
+        pix[1][1] = _mm256_loadu_ps(ptrs - stride * 2 + x - 2);
+        pix[1][2] = _mm256_loadu_ps(ptrs - stride * 2 + x - 1);
+        pix[1][3] = _mm256_loadu_ps(ptrs - stride * 2 + x);
+        pix[1][4] = _mm256_loadu_ps(ptrs - stride * 2 + x + 1);
+        pix[1][5] = _mm256_loadu_ps(ptrs - stride * 2 + x + 2);
+        pix[1][6] = _mm256_loadu_ps(ptrs - stride * 2 + x + 3);
+        pix[2][0] = _mm256_loadu_ps(ptrs - stride + x - 3);
+        pix[2][1] = _mm256_loadu_ps(ptrs - stride + x - 2);
+        pix[2][2] = _mm256_loadu_ps(ptrs - stride + x - 1);
+        pix[2][3] = _mm256_loadu_ps(ptrs - stride + x);
+        pix[2][4] = _mm256_loadu_ps(ptrs - stride + x + 1);
+        pix[2][5] = _mm256_loadu_ps(ptrs - stride + x + 2);
+        pix[2][6] = _mm256_loadu_ps(ptrs - stride + x + 3);
+        pix[3][0] = _mm256_loadu_ps(ptrs + x - 3);
+        pix[3][1] = _mm256_loadu_ps(ptrs + x - 2);
+        pix[3][2] = _mm256_loadu_ps(ptrs + x - 1);
+        pix[3][3] = _mm256_loadu_ps(ptrs + x);
+        pix[3][4] = _mm256_loadu_ps(ptrs + x + 1);
+        pix[3][5] = _mm256_loadu_ps(ptrs + x + 2);
+        pix[3][6] = _mm256_loadu_ps(ptrs + x + 3);
+        pix[4][0] = _mm256_loadu_ps(ptrs + stride + x - 3);
+        pix[4][1] = _mm256_loadu_ps(ptrs + stride + x - 2);
+        pix[4][2] = _mm256_loadu_ps(ptrs + stride + x - 1);
+        pix[4][3] = _mm256_loadu_ps(ptrs + stride + x);
+        pix[4][4] = _mm256_loadu_ps(ptrs + stride + x + 1);
+        pix[4][5] = _mm256_loadu_ps(ptrs + stride + x + 2);
+        pix[4][6] = _mm256_loadu_ps(ptrs + stride + x + 3);
+        pix[5][0] = _mm256_loadu_ps(ptrs + stride * 2 + x - 3);
+        pix[5][1] = _mm256_loadu_ps(ptrs + stride * 2 + x - 2);
+        pix[5][2] = _mm256_loadu_ps(ptrs + stride * 2 + x - 1);
+        pix[5][3] = _mm256_loadu_ps(ptrs + stride * 2 + x);
+        pix[5][4] = _mm256_loadu_ps(ptrs + stride * 2 + x + 1);
+        pix[5][5] = _mm256_loadu_ps(ptrs + stride * 2 + x + 2);
+        pix[5][6] = _mm256_loadu_ps(ptrs + stride * 2 + x + 3);
+        pix[6][0] = _mm256_loadu_ps(ptrs + stride * 3 + x - 3);
+        pix[6][1] = _mm256_loadu_ps(ptrs + stride * 3 + x - 2);
+        pix[6][2] = _mm256_loadu_ps(ptrs + stride * 3 + x - 1);
+        pix[6][3] = _mm256_loadu_ps(ptrs + stride * 3 + x);
+        pix[6][4] = _mm256_loadu_ps(ptrs + stride * 3 + x + 1);
+        pix[6][5] = _mm256_loadu_ps(ptrs + stride * 3 + x + 2);
+        pix[6][6] = _mm256_loadu_ps(ptrs + stride * 3 + x + 3);
+        _MM256_SORT42_PS(
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+            pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+            pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+        );
+        pix[3][6] = _mm256_avg_ps(pix[3][6], pix[4][0]);
+        _mm256_storeu_ps(ptrd + x, pix[3][6]);
+    }
+    
+    x = src_w - 8;
+    pix[1][0] = _mm256_loadu_ps(ptrs - stride * 2 + x - 3);
+    pix[1][1] = _mm256_loadu_ps(ptrs - stride * 2 + x - 2);
+    pix[1][2] = _mm256_loadu_ps(ptrs - stride * 2 + x - 1);
+    pix[1][3] = _mm256_loadu_ps(ptrs - stride * 2 + x);
+    pix[2][0] = _mm256_loadu_ps(ptrs - stride + x - 3);
+    pix[2][1] = _mm256_loadu_ps(ptrs - stride + x - 2);
+    pix[2][2] = _mm256_loadu_ps(ptrs - stride + x - 1);
+    pix[2][3] = _mm256_loadu_ps(ptrs - stride + x);
+    pix[3][0] = _mm256_loadu_ps(ptrs + x - 3);
+    pix[3][1] = _mm256_loadu_ps(ptrs + x - 2);
+    pix[3][2] = _mm256_loadu_ps(ptrs + x - 1);
+    pix[3][3] = _mm256_loadu_ps(ptrs + x);
+    pix[4][0] = _mm256_loadu_ps(ptrs + stride + x - 3);
+    pix[4][1] = _mm256_loadu_ps(ptrs + stride + x - 2);
+    pix[4][2] = _mm256_loadu_ps(ptrs + stride + x - 1);
+    pix[4][3] = _mm256_loadu_ps(ptrs + stride + x);
+    pix[5][0] = _mm256_loadu_ps(ptrs + stride * 2 + x - 3);
+    pix[5][1] = _mm256_loadu_ps(ptrs + stride * 2 + x - 2);
+    pix[5][2] = _mm256_loadu_ps(ptrs + stride * 2 + x - 1);
+    pix[5][3] = _mm256_loadu_ps(ptrs + stride * 2 + x);
+    pix[6][0] = _mm256_loadu_ps(ptrs + stride * 3 + x - 3);
+    pix[6][1] = _mm256_loadu_ps(ptrs + stride * 3 + x - 2);
+    pix[6][2] = _mm256_loadu_ps(ptrs + stride * 3 + x - 1);
+    pix[6][3] = _mm256_loadu_ps(ptrs + stride * 3 + x);
+    pix[1][4] = _mm256_reassignment_ps(pix[1][3], right_idx);
+    pix[1][5] = _mm256_reassignment_ps(pix[1][4], right_idx);
+    pix[1][6] = _mm256_reassignment_ps(pix[1][5], right_idx);
+    pix[2][4] = _mm256_reassignment_ps(pix[2][3], right_idx);
+    pix[2][5] = _mm256_reassignment_ps(pix[2][4], right_idx);
+    pix[2][6] = _mm256_reassignment_ps(pix[2][5], right_idx);
+    pix[3][4] = _mm256_reassignment_ps(pix[3][3], right_idx);
+    pix[3][5] = _mm256_reassignment_ps(pix[3][4], right_idx);
+    pix[3][6] = _mm256_reassignment_ps(pix[3][5], right_idx);
+    pix[4][4] = _mm256_reassignment_ps(pix[4][3], right_idx);
+    pix[4][5] = _mm256_reassignment_ps(pix[4][4], right_idx);
+    pix[4][6] = _mm256_reassignment_ps(pix[4][5], right_idx);
+    pix[5][4] = _mm256_reassignment_ps(pix[5][3], right_idx);
+    pix[5][5] = _mm256_reassignment_ps(pix[5][4], right_idx);
+    pix[5][6] = _mm256_reassignment_ps(pix[5][5], right_idx);
+    pix[6][4] = _mm256_reassignment_ps(pix[6][3], right_idx);
+    pix[6][5] = _mm256_reassignment_ps(pix[6][4], right_idx);
+    pix[6][6] = _mm256_reassignment_ps(pix[6][5], right_idx);
+    _MM256_SORT42_PS(
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+        pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+        pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+    );
+    pix[3][6] = _mm256_avg_ps(pix[3][6], pix[4][0]);
+    pix[3][6] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[5][1], pix[5][2]), pix[3][6], 7);
+    pix[3][6] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[4][5], pix[4][6]), pix[3][6], 6);
+    pix[3][6] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[4][2], pix[4][3]), pix[3][6], 5);
+    _mm256_storeu_ps(ptrd + x, pix[3][6]);
+    
+    ptrs += stride;
+    ptrd += stride;
+    
+    for (int y = 3; y < src_h - 3; y++) {
+        pix[0][3] = _mm256_loadu_ps(ptrs - stride * 3);
+        pix[0][4] = _mm256_loadu_ps(ptrs - stride * 3 + 1);
+        pix[0][5] = _mm256_loadu_ps(ptrs - stride * 3 + 2);
+        pix[0][6] = _mm256_loadu_ps(ptrs - stride * 3 + 3);
+        pix[1][3] = _mm256_loadu_ps(ptrs - stride * 2);
+        pix[1][4] = _mm256_loadu_ps(ptrs - stride * 2 + 1);
+        pix[1][5] = _mm256_loadu_ps(ptrs - stride * 2 + 2);
+        pix[1][6] = _mm256_loadu_ps(ptrs - stride * 2 + 3);
+        pix[2][3] = _mm256_loadu_ps(ptrs - stride);
+        pix[2][4] = _mm256_loadu_ps(ptrs - stride + 1);
+        pix[2][5] = _mm256_loadu_ps(ptrs - stride + 2);
+        pix[2][6] = _mm256_loadu_ps(ptrs - stride + 3);
+        pix[3][3] = _mm256_loadu_ps(ptrs);
+        pix[3][4] = _mm256_loadu_ps(ptrs + 1);
+        pix[3][5] = _mm256_loadu_ps(ptrs + 2);
+        pix[3][6] = _mm256_loadu_ps(ptrs + 3);
+        pix[4][3] = _mm256_loadu_ps(ptrs + stride);
+        pix[4][4] = _mm256_loadu_ps(ptrs + stride + 1);
+        pix[4][5] = _mm256_loadu_ps(ptrs + stride + 2);
+        pix[4][6] = _mm256_loadu_ps(ptrs + stride + 3);
+        pix[5][3] = _mm256_loadu_ps(ptrs + stride * 2);
+        pix[5][4] = _mm256_loadu_ps(ptrs + stride * 2 + 1);
+        pix[5][5] = _mm256_loadu_ps(ptrs + stride * 2 + 2);
+        pix[5][6] = _mm256_loadu_ps(ptrs + stride * 2 + 3);
+        pix[6][3] = _mm256_loadu_ps(ptrs + stride * 3);
+        pix[6][4] = _mm256_loadu_ps(ptrs + stride * 3 + 1);
+        pix[6][5] = _mm256_loadu_ps(ptrs + stride * 3 + 2);
+        pix[6][6] = _mm256_loadu_ps(ptrs + stride * 3 + 3);
+        pix[0][2] = _mm256_reassignment_ps(pix[0][3], left_idx);
+        pix[0][1] = _mm256_reassignment_ps(pix[0][2], left_idx);
+        pix[0][0] = _mm256_reassignment_ps(pix[0][1], left_idx);
+        pix[1][2] = _mm256_reassignment_ps(pix[1][3], left_idx);
+        pix[1][1] = _mm256_reassignment_ps(pix[1][2], left_idx);
+        pix[1][0] = _mm256_reassignment_ps(pix[1][1], left_idx);
+        pix[2][2] = _mm256_reassignment_ps(pix[2][3], left_idx);
+        pix[2][1] = _mm256_reassignment_ps(pix[2][2], left_idx);
+        pix[2][0] = _mm256_reassignment_ps(pix[2][1], left_idx);
+        pix[3][2] = _mm256_reassignment_ps(pix[3][3], left_idx);
+        pix[3][1] = _mm256_reassignment_ps(pix[3][2], left_idx);
+        pix[3][0] = _mm256_reassignment_ps(pix[3][1], left_idx);
+        pix[4][2] = _mm256_reassignment_ps(pix[4][3], left_idx);
+        pix[4][1] = _mm256_reassignment_ps(pix[4][2], left_idx);
+        pix[4][0] = _mm256_reassignment_ps(pix[4][1], left_idx);
+        pix[5][2] = _mm256_reassignment_ps(pix[5][3], left_idx);
+        pix[5][1] = _mm256_reassignment_ps(pix[5][2], left_idx);
+        pix[5][0] = _mm256_reassignment_ps(pix[5][1], left_idx);
+        pix[6][2] = _mm256_reassignment_ps(pix[6][3], left_idx);
+        pix[6][1] = _mm256_reassignment_ps(pix[6][2], left_idx);
+        pix[6][0] = _mm256_reassignment_ps(pix[6][1], left_idx);
+        _MM256_SORT49_PS(
+            pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+            pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+            pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+        );
+        pix[3][3] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[4][6], pix[5][0]), pix[3][3], 0);
+        pix[3][3] = _MM256_TRANSFER_PS(pix[4][3], pix[3][3], 1);
+        pix[3][3] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[3][6], pix[4][0]), pix[3][3], 2);
+        _mm256_storeu_ps(ptrd, pix[3][3]);
+        
+        for (x = 8; x < mod8_w; x += 8) {
+            pix[0][0] = _mm256_loadu_ps(ptrs - stride * 3 + x - 3);
+            pix[0][1] = _mm256_loadu_ps(ptrs - stride * 3 + x - 2);
+            pix[0][2] = _mm256_loadu_ps(ptrs - stride * 3 + x - 1);
+            pix[0][3] = _mm256_loadu_ps(ptrs - stride * 3 + x);
+            pix[0][4] = _mm256_loadu_ps(ptrs - stride * 3 + x + 1);
+            pix[0][5] = _mm256_loadu_ps(ptrs - stride * 3 + x + 2);
+            pix[0][6] = _mm256_loadu_ps(ptrs - stride * 3 + x + 3);
+            pix[1][0] = _mm256_loadu_ps(ptrs - stride * 2 + x - 3);
+            pix[1][1] = _mm256_loadu_ps(ptrs - stride * 2 + x - 2);
+            pix[1][2] = _mm256_loadu_ps(ptrs - stride * 2 + x - 1);
+            pix[1][3] = _mm256_loadu_ps(ptrs - stride * 2 + x);
+            pix[1][4] = _mm256_loadu_ps(ptrs - stride * 2 + x + 1);
+            pix[1][5] = _mm256_loadu_ps(ptrs - stride * 2 + x + 2);
+            pix[1][6] = _mm256_loadu_ps(ptrs - stride * 2 + x + 3);
+            pix[2][0] = _mm256_loadu_ps(ptrs - stride + x - 3);
+            pix[2][1] = _mm256_loadu_ps(ptrs - stride + x - 2);
+            pix[2][2] = _mm256_loadu_ps(ptrs - stride + x - 1);
+            pix[2][3] = _mm256_loadu_ps(ptrs - stride + x);
+            pix[2][4] = _mm256_loadu_ps(ptrs - stride + x + 1);
+            pix[2][5] = _mm256_loadu_ps(ptrs - stride + x + 2);
+            pix[2][6] = _mm256_loadu_ps(ptrs - stride + x + 3);
+            pix[3][0] = _mm256_loadu_ps(ptrs + x - 3);
+            pix[3][1] = _mm256_loadu_ps(ptrs + x - 2);
+            pix[3][2] = _mm256_loadu_ps(ptrs + x - 1);
+            pix[3][3] = _mm256_loadu_ps(ptrs + x);
+            pix[3][4] = _mm256_loadu_ps(ptrs + x + 1);
+            pix[3][5] = _mm256_loadu_ps(ptrs + x + 2);
+            pix[3][6] = _mm256_loadu_ps(ptrs + x + 3);
+            pix[4][0] = _mm256_loadu_ps(ptrs + stride + x - 3);
+            pix[4][1] = _mm256_loadu_ps(ptrs + stride + x - 2);
+            pix[4][2] = _mm256_loadu_ps(ptrs + stride + x - 1);
+            pix[4][3] = _mm256_loadu_ps(ptrs + stride + x);
+            pix[4][4] = _mm256_loadu_ps(ptrs + stride + x + 1);
+            pix[4][5] = _mm256_loadu_ps(ptrs + stride + x + 2);
+            pix[4][6] = _mm256_loadu_ps(ptrs + stride + x + 3);
+            pix[5][0] = _mm256_loadu_ps(ptrs + stride * 2 + x - 3);
+            pix[5][1] = _mm256_loadu_ps(ptrs + stride * 2 + x - 2);
+            pix[5][2] = _mm256_loadu_ps(ptrs + stride * 2 + x - 1);
+            pix[5][3] = _mm256_loadu_ps(ptrs + stride * 2 + x);
+            pix[5][4] = _mm256_loadu_ps(ptrs + stride * 2 + x + 1);
+            pix[5][5] = _mm256_loadu_ps(ptrs + stride * 2 + x + 2);
+            pix[5][6] = _mm256_loadu_ps(ptrs + stride * 2 + x + 3);
+            pix[6][0] = _mm256_loadu_ps(ptrs + stride * 3 + x - 3);
+            pix[6][1] = _mm256_loadu_ps(ptrs + stride * 3 + x - 2);
+            pix[6][2] = _mm256_loadu_ps(ptrs + stride * 3 + x - 1);
+            pix[6][3] = _mm256_loadu_ps(ptrs + stride * 3 + x);
+            pix[6][4] = _mm256_loadu_ps(ptrs + stride * 3 + x + 1);
+            pix[6][5] = _mm256_loadu_ps(ptrs + stride * 3 + x + 2);
+            pix[6][6] = _mm256_loadu_ps(ptrs + stride * 3 + x + 3);
+            _MM256_SORT49_PS(
+                pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+                pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+                pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+                pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+                pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+                pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+                pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+            );
+            _mm256_storeu_ps(ptrd + x, pix[3][3]);
+        }
+        
+        x = src_w - 8;
+        pix[0][0] = _mm256_loadu_ps(ptrs - stride * 3 + x - 3);
+        pix[0][1] = _mm256_loadu_ps(ptrs - stride * 3 + x - 2);
+        pix[0][2] = _mm256_loadu_ps(ptrs - stride * 3 + x - 1);
+        pix[0][3] = _mm256_loadu_ps(ptrs - stride * 3 + x);
+        pix[1][0] = _mm256_loadu_ps(ptrs - stride * 2 + x - 3);
+        pix[1][1] = _mm256_loadu_ps(ptrs - stride * 2 + x - 2);
+        pix[1][2] = _mm256_loadu_ps(ptrs - stride * 2 + x - 1);
+        pix[1][3] = _mm256_loadu_ps(ptrs - stride * 2 + x);
+        pix[2][0] = _mm256_loadu_ps(ptrs - stride + x - 3);
+        pix[2][1] = _mm256_loadu_ps(ptrs - stride + x - 2);
+        pix[2][2] = _mm256_loadu_ps(ptrs - stride + x - 1);
+        pix[2][3] = _mm256_loadu_ps(ptrs - stride + x);
+        pix[3][0] = _mm256_loadu_ps(ptrs + x - 3);
+        pix[3][1] = _mm256_loadu_ps(ptrs + x - 2);
+        pix[3][2] = _mm256_loadu_ps(ptrs + x - 1);
+        pix[3][3] = _mm256_loadu_ps(ptrs + x);
+        pix[4][0] = _mm256_loadu_ps(ptrs + stride + x - 3);
+        pix[4][1] = _mm256_loadu_ps(ptrs + stride + x - 2);
+        pix[4][2] = _mm256_loadu_ps(ptrs + stride + x - 1);
+        pix[4][3] = _mm256_loadu_ps(ptrs + stride + x);
+        pix[5][0] = _mm256_loadu_ps(ptrs + stride * 2 + x - 3);
+        pix[5][1] = _mm256_loadu_ps(ptrs + stride * 2 + x - 2);
+        pix[5][2] = _mm256_loadu_ps(ptrs + stride * 2 + x - 1);
+        pix[5][3] = _mm256_loadu_ps(ptrs + stride * 2 + x);
+        pix[6][0] = _mm256_loadu_ps(ptrs + stride * 3 + x - 3);
+        pix[6][1] = _mm256_loadu_ps(ptrs + stride * 3 + x - 2);
+        pix[6][2] = _mm256_loadu_ps(ptrs + stride * 3 + x - 1);
+        pix[6][3] = _mm256_loadu_ps(ptrs + stride * 3 + x);
+        pix[0][4] = _mm256_reassignment_ps(pix[0][3], right_idx);
+        pix[0][5] = _mm256_reassignment_ps(pix[0][4], right_idx);
+        pix[0][6] = _mm256_reassignment_ps(pix[0][5], right_idx);
+        pix[1][4] = _mm256_reassignment_ps(pix[1][3], right_idx);
+        pix[1][5] = _mm256_reassignment_ps(pix[1][4], right_idx);
+        pix[1][6] = _mm256_reassignment_ps(pix[1][5], right_idx);
+        pix[2][4] = _mm256_reassignment_ps(pix[2][3], right_idx);
+        pix[2][5] = _mm256_reassignment_ps(pix[2][4], right_idx);
+        pix[2][6] = _mm256_reassignment_ps(pix[2][5], right_idx);
+        pix[3][4] = _mm256_reassignment_ps(pix[3][3], right_idx);
+        pix[3][5] = _mm256_reassignment_ps(pix[3][4], right_idx);
+        pix[3][6] = _mm256_reassignment_ps(pix[3][5], right_idx);
+        pix[4][4] = _mm256_reassignment_ps(pix[4][3], right_idx);
+        pix[4][5] = _mm256_reassignment_ps(pix[4][4], right_idx);
+        pix[4][6] = _mm256_reassignment_ps(pix[4][5], right_idx);
+        pix[5][4] = _mm256_reassignment_ps(pix[5][3], right_idx);
+        pix[5][5] = _mm256_reassignment_ps(pix[5][4], right_idx);
+        pix[5][6] = _mm256_reassignment_ps(pix[5][5], right_idx);
+        pix[6][4] = _mm256_reassignment_ps(pix[6][3], right_idx);
+        pix[6][5] = _mm256_reassignment_ps(pix[6][4], right_idx);
+        pix[6][6] = _mm256_reassignment_ps(pix[6][5], right_idx);
+        _MM256_SORT49_PS(
+            pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+            pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6],
+            pix[6][0], pix[6][1], pix[6][2], pix[6][3], pix[6][4], pix[6][5], pix[6][6]
+        );
+        pix[3][3] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[4][6], pix[5][0]), pix[3][3], 7);
+        pix[3][3] = _MM256_TRANSFER_PS(pix[4][3], pix[3][3], 6);
+        pix[3][3] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[3][6], pix[4][0]), pix[3][3], 5);
+        _mm256_storeu_ps(ptrd + x, pix[3][3]);
+        
+        ptrs += stride;
+        ptrd += stride;
+    }
+    
+    pix[0][3] = _mm256_loadu_ps(ptrs - stride * 3);
+    pix[0][4] = _mm256_loadu_ps(ptrs - stride * 3 + 1);
+    pix[0][5] = _mm256_loadu_ps(ptrs - stride * 3 + 2);
+    pix[0][6] = _mm256_loadu_ps(ptrs - stride * 3 + 3);
+    pix[1][3] = _mm256_loadu_ps(ptrs - stride * 2);
+    pix[1][4] = _mm256_loadu_ps(ptrs - stride * 2 + 1);
+    pix[1][5] = _mm256_loadu_ps(ptrs - stride * 2 + 2);
+    pix[1][6] = _mm256_loadu_ps(ptrs - stride * 2 + 3);
+    pix[2][3] = _mm256_loadu_ps(ptrs - stride);
+    pix[2][4] = _mm256_loadu_ps(ptrs - stride + 1);
+    pix[2][5] = _mm256_loadu_ps(ptrs - stride + 2);
+    pix[2][6] = _mm256_loadu_ps(ptrs - stride + 3);
+    pix[3][3] = _mm256_loadu_ps(ptrs);
+    pix[3][4] = _mm256_loadu_ps(ptrs + 1);
+    pix[3][5] = _mm256_loadu_ps(ptrs + 2);
+    pix[3][6] = _mm256_loadu_ps(ptrs + 3);
+    pix[4][3] = _mm256_loadu_ps(ptrs + stride);
+    pix[4][4] = _mm256_loadu_ps(ptrs + stride + 1);
+    pix[4][5] = _mm256_loadu_ps(ptrs + stride + 2);
+    pix[4][6] = _mm256_loadu_ps(ptrs + stride + 3);
+    pix[5][3] = _mm256_loadu_ps(ptrs + stride * 2);
+    pix[5][4] = _mm256_loadu_ps(ptrs + stride * 2 + 1);
+    pix[5][5] = _mm256_loadu_ps(ptrs + stride * 2 + 2);
+    pix[5][6] = _mm256_loadu_ps(ptrs + stride * 2 + 3);
+    pix[0][2] = _mm256_reassignment_ps(pix[0][3], left_idx);
+    pix[0][1] = _mm256_reassignment_ps(pix[0][2], left_idx);
+    pix[0][0] = _mm256_reassignment_ps(pix[0][1], left_idx);
+    pix[1][2] = _mm256_reassignment_ps(pix[1][3], left_idx);
+    pix[1][1] = _mm256_reassignment_ps(pix[1][2], left_idx);
+    pix[1][0] = _mm256_reassignment_ps(pix[1][1], left_idx);
+    pix[2][2] = _mm256_reassignment_ps(pix[2][3], left_idx);
+    pix[2][1] = _mm256_reassignment_ps(pix[2][2], left_idx);
+    pix[2][0] = _mm256_reassignment_ps(pix[2][1], left_idx);
+    pix[3][2] = _mm256_reassignment_ps(pix[3][3], left_idx);
+    pix[3][1] = _mm256_reassignment_ps(pix[3][2], left_idx);
+    pix[3][0] = _mm256_reassignment_ps(pix[3][1], left_idx);
+    pix[4][2] = _mm256_reassignment_ps(pix[4][3], left_idx);
+    pix[4][1] = _mm256_reassignment_ps(pix[4][2], left_idx);
+    pix[4][0] = _mm256_reassignment_ps(pix[4][1], left_idx);
+    pix[5][2] = _mm256_reassignment_ps(pix[5][3], left_idx);
+    pix[5][1] = _mm256_reassignment_ps(pix[5][2], left_idx);
+    pix[5][0] = _mm256_reassignment_ps(pix[5][1], left_idx);
+    _MM256_SORT42_PS(
+        pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+        pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6]
+    );
+    pix[2][6] = _mm256_avg_ps(pix[2][6], pix[3][0]);
+    pix[2][6] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[4][1], pix[4][2]), pix[2][6], 0);
+    pix[2][6] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[3][5], pix[3][6]), pix[2][6], 1);
+    pix[2][6] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[3][2], pix[3][3]), pix[2][6], 2);
+    _mm256_storeu_ps(ptrd, pix[2][6]);
+    
+    for (x = 8; x < mod8_w; x += 8) {
+        pix[0][0] = _mm256_loadu_ps(ptrs - stride * 3 + x - 3);
+        pix[0][1] = _mm256_loadu_ps(ptrs - stride * 3 + x - 2);
+        pix[0][2] = _mm256_loadu_ps(ptrs - stride * 3 + x - 1);
+        pix[0][3] = _mm256_loadu_ps(ptrs - stride * 3 + x);
+        pix[0][4] = _mm256_loadu_ps(ptrs - stride * 3 + x + 1);
+        pix[0][5] = _mm256_loadu_ps(ptrs - stride * 3 + x + 2);
+        pix[0][6] = _mm256_loadu_ps(ptrs - stride * 3 + x + 3);
+        pix[1][0] = _mm256_loadu_ps(ptrs - stride * 2 + x - 3);
+        pix[1][1] = _mm256_loadu_ps(ptrs - stride * 2 + x - 2);
+        pix[1][2] = _mm256_loadu_ps(ptrs - stride * 2 + x - 1);
+        pix[1][3] = _mm256_loadu_ps(ptrs - stride * 2 + x);
+        pix[1][4] = _mm256_loadu_ps(ptrs - stride * 2 + x + 1);
+        pix[1][5] = _mm256_loadu_ps(ptrs - stride * 2 + x + 2);
+        pix[1][6] = _mm256_loadu_ps(ptrs - stride * 2 + x + 3);
+        pix[2][0] = _mm256_loadu_ps(ptrs - stride + x - 3);
+        pix[2][1] = _mm256_loadu_ps(ptrs - stride + x - 2);
+        pix[2][2] = _mm256_loadu_ps(ptrs - stride + x - 1);
+        pix[2][3] = _mm256_loadu_ps(ptrs - stride + x);
+        pix[2][4] = _mm256_loadu_ps(ptrs - stride + x + 1);
+        pix[2][5] = _mm256_loadu_ps(ptrs - stride + x + 2);
+        pix[2][6] = _mm256_loadu_ps(ptrs - stride + x + 3);
+        pix[3][0] = _mm256_loadu_ps(ptrs + x - 3);
+        pix[3][1] = _mm256_loadu_ps(ptrs + x - 2);
+        pix[3][2] = _mm256_loadu_ps(ptrs + x - 1);
+        pix[3][3] = _mm256_loadu_ps(ptrs + x);
+        pix[3][4] = _mm256_loadu_ps(ptrs + x + 1);
+        pix[3][5] = _mm256_loadu_ps(ptrs + x + 2);
+        pix[3][6] = _mm256_loadu_ps(ptrs + x + 3);
+        pix[4][0] = _mm256_loadu_ps(ptrs + stride + x - 3);
+        pix[4][1] = _mm256_loadu_ps(ptrs + stride + x - 2);
+        pix[4][2] = _mm256_loadu_ps(ptrs + stride + x - 1);
+        pix[4][3] = _mm256_loadu_ps(ptrs + stride + x);
+        pix[4][4] = _mm256_loadu_ps(ptrs + stride + x + 1);
+        pix[4][5] = _mm256_loadu_ps(ptrs + stride + x + 2);
+        pix[4][6] = _mm256_loadu_ps(ptrs + stride + x + 3);
+        pix[5][0] = _mm256_loadu_ps(ptrs + stride * 2 + x - 3);
+        pix[5][1] = _mm256_loadu_ps(ptrs + stride * 2 + x - 2);
+        pix[5][2] = _mm256_loadu_ps(ptrs + stride * 2 + x - 1);
+        pix[5][3] = _mm256_loadu_ps(ptrs + stride * 2 + x);
+        pix[5][4] = _mm256_loadu_ps(ptrs + stride * 2 + x + 1);
+        pix[5][5] = _mm256_loadu_ps(ptrs + stride * 2 + x + 2);
+        pix[5][6] = _mm256_loadu_ps(ptrs + stride * 2 + x + 3);
+        _MM256_SORT42_PS(
+            pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+            pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6]
+        );
+        pix[2][6] = _mm256_avg_ps(pix[2][6], pix[3][0]);
+        _mm256_storeu_ps(ptrd + x, pix[2][6]);
+    }
+    
+    x = src_w - 8;
+    pix[0][0] = _mm256_loadu_ps(ptrs - stride * 3 + x - 3);
+    pix[0][1] = _mm256_loadu_ps(ptrs - stride * 3 + x - 2);
+    pix[0][2] = _mm256_loadu_ps(ptrs - stride * 3 + x - 1);
+    pix[0][3] = _mm256_loadu_ps(ptrs - stride * 3 + x);
+    pix[1][0] = _mm256_loadu_ps(ptrs - stride * 2 + x - 3);
+    pix[1][1] = _mm256_loadu_ps(ptrs - stride * 2 + x - 2);
+    pix[1][2] = _mm256_loadu_ps(ptrs - stride * 2 + x - 1);
+    pix[1][3] = _mm256_loadu_ps(ptrs - stride * 2 + x);
+    pix[2][0] = _mm256_loadu_ps(ptrs - stride + x - 3);
+    pix[2][1] = _mm256_loadu_ps(ptrs - stride + x - 2);
+    pix[2][2] = _mm256_loadu_ps(ptrs - stride + x - 1);
+    pix[2][3] = _mm256_loadu_ps(ptrs - stride + x);
+    pix[3][0] = _mm256_loadu_ps(ptrs + x - 3);
+    pix[3][1] = _mm256_loadu_ps(ptrs + x - 2);
+    pix[3][2] = _mm256_loadu_ps(ptrs + x - 1);
+    pix[3][3] = _mm256_loadu_ps(ptrs + x);
+    pix[4][0] = _mm256_loadu_ps(ptrs + stride + x - 3);
+    pix[4][1] = _mm256_loadu_ps(ptrs + stride + x - 2);
+    pix[4][2] = _mm256_loadu_ps(ptrs + stride + x - 1);
+    pix[4][3] = _mm256_loadu_ps(ptrs + stride + x);
+    pix[5][0] = _mm256_loadu_ps(ptrs + stride * 2 + x - 3);
+    pix[5][1] = _mm256_loadu_ps(ptrs + stride * 2 + x - 2);
+    pix[5][2] = _mm256_loadu_ps(ptrs + stride * 2 + x - 1);
+    pix[5][3] = _mm256_loadu_ps(ptrs + stride * 2 + x);
+    pix[0][4] = _mm256_reassignment_ps(pix[0][3], right_idx);
+    pix[0][5] = _mm256_reassignment_ps(pix[0][4], right_idx);
+    pix[0][6] = _mm256_reassignment_ps(pix[0][5], right_idx);
+    pix[1][4] = _mm256_reassignment_ps(pix[1][3], right_idx);
+    pix[1][5] = _mm256_reassignment_ps(pix[1][4], right_idx);
+    pix[1][6] = _mm256_reassignment_ps(pix[1][5], right_idx);
+    pix[2][4] = _mm256_reassignment_ps(pix[2][3], right_idx);
+    pix[2][5] = _mm256_reassignment_ps(pix[2][4], right_idx);
+    pix[2][6] = _mm256_reassignment_ps(pix[2][5], right_idx);
+    pix[3][4] = _mm256_reassignment_ps(pix[3][3], right_idx);
+    pix[3][5] = _mm256_reassignment_ps(pix[3][4], right_idx);
+    pix[3][6] = _mm256_reassignment_ps(pix[3][5], right_idx);
+    pix[4][4] = _mm256_reassignment_ps(pix[4][3], right_idx);
+    pix[4][5] = _mm256_reassignment_ps(pix[4][4], right_idx);
+    pix[4][6] = _mm256_reassignment_ps(pix[4][5], right_idx);
+    pix[5][4] = _mm256_reassignment_ps(pix[5][3], right_idx);
+    pix[5][5] = _mm256_reassignment_ps(pix[5][4], right_idx);
+    pix[5][6] = _mm256_reassignment_ps(pix[5][5], right_idx);
+    _MM256_SORT42_PS(
+        pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6],
+        pix[5][0], pix[5][1], pix[5][2], pix[5][3], pix[5][4], pix[5][5], pix[5][6]
+    );
+    pix[2][6] = _mm256_avg_ps(pix[2][6], pix[3][0]);
+    pix[2][6] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[4][1], pix[4][2]), pix[2][6], 7);
+    pix[2][6] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[3][5], pix[3][6]), pix[2][6], 6);
+    pix[2][6] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[3][2], pix[3][3]), pix[2][6], 5);
+    _mm256_storeu_ps(ptrd + x, pix[2][6]);
+    
+    ptrs += stride;
+    ptrd += stride;
+    
+    pix[0][3] = _mm256_loadu_ps(ptrs - stride * 3);
+    pix[0][4] = _mm256_loadu_ps(ptrs - stride * 3 + 1);
+    pix[0][5] = _mm256_loadu_ps(ptrs - stride * 3 + 2);
+    pix[0][6] = _mm256_loadu_ps(ptrs - stride * 3 + 3);
+    pix[1][3] = _mm256_loadu_ps(ptrs - stride * 2);
+    pix[1][4] = _mm256_loadu_ps(ptrs - stride * 2 + 1);
+    pix[1][5] = _mm256_loadu_ps(ptrs - stride * 2 + 2);
+    pix[1][6] = _mm256_loadu_ps(ptrs - stride * 2 + 3);
+    pix[2][3] = _mm256_loadu_ps(ptrs - stride);
+    pix[2][4] = _mm256_loadu_ps(ptrs - stride + 1);
+    pix[2][5] = _mm256_loadu_ps(ptrs - stride + 2);
+    pix[2][6] = _mm256_loadu_ps(ptrs - stride + 3);
+    pix[3][3] = _mm256_loadu_ps(ptrs);
+    pix[3][4] = _mm256_loadu_ps(ptrs + 1);
+    pix[3][5] = _mm256_loadu_ps(ptrs + 2);
+    pix[3][6] = _mm256_loadu_ps(ptrs + 3);
+    pix[4][3] = _mm256_loadu_ps(ptrs + stride);
+    pix[4][4] = _mm256_loadu_ps(ptrs + stride + 1);
+    pix[4][5] = _mm256_loadu_ps(ptrs + stride + 2);
+    pix[4][6] = _mm256_loadu_ps(ptrs + stride + 3);
+    pix[0][2] = _mm256_reassignment_ps(pix[0][3], left_idx);
+    pix[0][1] = _mm256_reassignment_ps(pix[0][2], left_idx);
+    pix[0][0] = _mm256_reassignment_ps(pix[0][1], left_idx);
+    pix[1][2] = _mm256_reassignment_ps(pix[1][3], left_idx);
+    pix[1][1] = _mm256_reassignment_ps(pix[1][2], left_idx);
+    pix[1][0] = _mm256_reassignment_ps(pix[1][1], left_idx);
+    pix[2][2] = _mm256_reassignment_ps(pix[2][3], left_idx);
+    pix[2][1] = _mm256_reassignment_ps(pix[2][2], left_idx);
+    pix[2][0] = _mm256_reassignment_ps(pix[2][1], left_idx);
+    pix[3][2] = _mm256_reassignment_ps(pix[3][3], left_idx);
+    pix[3][1] = _mm256_reassignment_ps(pix[3][2], left_idx);
+    pix[3][0] = _mm256_reassignment_ps(pix[3][1], left_idx);
+    pix[4][2] = _mm256_reassignment_ps(pix[4][3], left_idx);
+    pix[4][1] = _mm256_reassignment_ps(pix[4][2], left_idx);
+    pix[4][0] = _mm256_reassignment_ps(pix[4][1], left_idx);
+    _MM256_SORT35_PS(
+        pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6]
+    );
+    pix[2][3] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[3][3], pix[3][4]), pix[2][3], 0);
+    pix[2][3] = _MM256_TRANSFER_PS(pix[3][1], pix[2][3], 1);
+    pix[2][3] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[2][5], pix[2][6]), pix[2][3], 2);
+    _mm256_storeu_ps(ptrd, pix[2][3]);
+    
+    for (x = 8; x < mod8_w; x += 8) {
+        pix[0][0] = _mm256_loadu_ps(ptrs - stride * 3 + x - 3);
+        pix[0][1] = _mm256_loadu_ps(ptrs - stride * 3 + x - 2);
+        pix[0][2] = _mm256_loadu_ps(ptrs - stride * 3 + x - 1);
+        pix[0][3] = _mm256_loadu_ps(ptrs - stride * 3 + x);
+        pix[0][4] = _mm256_loadu_ps(ptrs - stride * 3 + x + 1);
+        pix[0][5] = _mm256_loadu_ps(ptrs - stride * 3 + x + 2);
+        pix[0][6] = _mm256_loadu_ps(ptrs - stride * 3 + x + 3);
+        pix[1][0] = _mm256_loadu_ps(ptrs - stride * 2 + x - 3);
+        pix[1][1] = _mm256_loadu_ps(ptrs - stride * 2 + x - 2);
+        pix[1][2] = _mm256_loadu_ps(ptrs - stride * 2 + x - 1);
+        pix[1][3] = _mm256_loadu_ps(ptrs - stride * 2 + x);
+        pix[1][4] = _mm256_loadu_ps(ptrs - stride * 2 + x + 1);
+        pix[1][5] = _mm256_loadu_ps(ptrs - stride * 2 + x + 2);
+        pix[1][6] = _mm256_loadu_ps(ptrs - stride * 2 + x + 3);
+        pix[2][0] = _mm256_loadu_ps(ptrs - stride + x - 3);
+        pix[2][1] = _mm256_loadu_ps(ptrs - stride + x - 2);
+        pix[2][2] = _mm256_loadu_ps(ptrs - stride + x - 1);
+        pix[2][3] = _mm256_loadu_ps(ptrs - stride + x);
+        pix[2][4] = _mm256_loadu_ps(ptrs - stride + x + 1);
+        pix[2][5] = _mm256_loadu_ps(ptrs - stride + x + 2);
+        pix[2][6] = _mm256_loadu_ps(ptrs - stride + x + 3);
+        pix[3][0] = _mm256_loadu_ps(ptrs + x - 3);
+        pix[3][1] = _mm256_loadu_ps(ptrs + x - 2);
+        pix[3][2] = _mm256_loadu_ps(ptrs + x - 1);
+        pix[3][3] = _mm256_loadu_ps(ptrs + x);
+        pix[3][4] = _mm256_loadu_ps(ptrs + x + 1);
+        pix[3][5] = _mm256_loadu_ps(ptrs + x + 2);
+        pix[3][6] = _mm256_loadu_ps(ptrs + x + 3);
+        pix[4][0] = _mm256_loadu_ps(ptrs + stride + x - 3);
+        pix[4][1] = _mm256_loadu_ps(ptrs + stride + x - 2);
+        pix[4][2] = _mm256_loadu_ps(ptrs + stride + x - 1);
+        pix[4][3] = _mm256_loadu_ps(ptrs + stride + x);
+        pix[4][4] = _mm256_loadu_ps(ptrs + stride + x + 1);
+        pix[4][5] = _mm256_loadu_ps(ptrs + stride + x + 2);
+        pix[4][6] = _mm256_loadu_ps(ptrs + stride + x + 3);
+        _MM256_SORT35_PS(
+            pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+            pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6]
+        );
+        _mm256_storeu_ps(ptrd + x, pix[2][3]);
+    }
+    
+    x = src_w - 8;
+    pix[0][0] = _mm256_loadu_ps(ptrs - stride * 3 + x - 3);
+    pix[0][1] = _mm256_loadu_ps(ptrs - stride * 3 + x - 2);
+    pix[0][2] = _mm256_loadu_ps(ptrs - stride * 3 + x - 1);
+    pix[0][3] = _mm256_loadu_ps(ptrs - stride * 3 + x);
+    pix[1][0] = _mm256_loadu_ps(ptrs - stride * 2 + x - 3);
+    pix[1][1] = _mm256_loadu_ps(ptrs - stride * 2 + x - 2);
+    pix[1][2] = _mm256_loadu_ps(ptrs - stride * 2 + x - 1);
+    pix[1][3] = _mm256_loadu_ps(ptrs - stride * 2 + x);
+    pix[2][0] = _mm256_loadu_ps(ptrs - stride + x - 3);
+    pix[2][1] = _mm256_loadu_ps(ptrs - stride + x - 2);
+    pix[2][2] = _mm256_loadu_ps(ptrs - stride + x - 1);
+    pix[2][3] = _mm256_loadu_ps(ptrs - stride + x);
+    pix[3][0] = _mm256_loadu_ps(ptrs + x - 3);
+    pix[3][1] = _mm256_loadu_ps(ptrs + x - 2);
+    pix[3][2] = _mm256_loadu_ps(ptrs + x - 1);
+    pix[3][3] = _mm256_loadu_ps(ptrs + x);
+    pix[4][0] = _mm256_loadu_ps(ptrs + stride + x - 3);
+    pix[4][1] = _mm256_loadu_ps(ptrs + stride + x - 2);
+    pix[4][2] = _mm256_loadu_ps(ptrs + stride + x - 1);
+    pix[4][3] = _mm256_loadu_ps(ptrs + stride + x);
+    pix[0][4] = _mm256_reassignment_ps(pix[0][3], right_idx);
+    pix[0][5] = _mm256_reassignment_ps(pix[0][4], right_idx);
+    pix[0][6] = _mm256_reassignment_ps(pix[0][5], right_idx);
+    pix[1][4] = _mm256_reassignment_ps(pix[1][3], right_idx);
+    pix[1][5] = _mm256_reassignment_ps(pix[1][4], right_idx);
+    pix[1][6] = _mm256_reassignment_ps(pix[1][5], right_idx);
+    pix[2][4] = _mm256_reassignment_ps(pix[2][3], right_idx);
+    pix[2][5] = _mm256_reassignment_ps(pix[2][4], right_idx);
+    pix[2][6] = _mm256_reassignment_ps(pix[2][5], right_idx);
+    pix[3][4] = _mm256_reassignment_ps(pix[3][3], right_idx);
+    pix[3][5] = _mm256_reassignment_ps(pix[3][4], right_idx);
+    pix[3][6] = _mm256_reassignment_ps(pix[3][5], right_idx);
+    pix[4][4] = _mm256_reassignment_ps(pix[4][3], right_idx);
+    pix[4][5] = _mm256_reassignment_ps(pix[4][4], right_idx);
+    pix[4][6] = _mm256_reassignment_ps(pix[4][5], right_idx);
+    _MM256_SORT35_PS(
+        pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6],
+        pix[4][0], pix[4][1], pix[4][2], pix[4][3], pix[4][4], pix[4][5], pix[4][6]
+    );
+    pix[2][3] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[3][3], pix[3][4]), pix[2][3], 7);
+    pix[2][3] = _MM256_TRANSFER_PS(pix[3][1], pix[2][3], 6);
+    pix[2][3] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[2][5], pix[2][6]), pix[2][3], 5);
+    _mm256_storeu_ps(ptrd + x, pix[2][3]);
+    
+    ptrs += stride;
+    ptrd += stride;
+    
+    pix[0][3] = _mm256_loadu_ps(ptrs - stride * 3);
+    pix[0][4] = _mm256_loadu_ps(ptrs - stride * 3 + 1);
+    pix[0][5] = _mm256_loadu_ps(ptrs - stride * 3 + 2);
+    pix[0][6] = _mm256_loadu_ps(ptrs - stride * 3 + 3);
+    pix[1][3] = _mm256_loadu_ps(ptrs - stride * 2);
+    pix[1][4] = _mm256_loadu_ps(ptrs - stride * 2 + 1);
+    pix[1][5] = _mm256_loadu_ps(ptrs - stride * 2 + 2);
+    pix[1][6] = _mm256_loadu_ps(ptrs - stride * 2 + 3);
+    pix[2][3] = _mm256_loadu_ps(ptrs - stride);
+    pix[2][4] = _mm256_loadu_ps(ptrs - stride + 1);
+    pix[2][5] = _mm256_loadu_ps(ptrs - stride + 2);
+    pix[2][6] = _mm256_loadu_ps(ptrs - stride + 3);
+    pix[3][3] = _mm256_loadu_ps(ptrs);
+    pix[3][4] = _mm256_loadu_ps(ptrs + 1);
+    pix[3][5] = _mm256_loadu_ps(ptrs + 2);
+    pix[3][6] = _mm256_loadu_ps(ptrs + 3);
+    pix[0][2] = _mm256_reassignment_ps(pix[0][3], left_idx);
+    pix[0][1] = _mm256_reassignment_ps(pix[0][2], left_idx);
+    pix[0][0] = _mm256_reassignment_ps(pix[0][1], left_idx);
+    pix[1][2] = _mm256_reassignment_ps(pix[1][3], left_idx);
+    pix[1][1] = _mm256_reassignment_ps(pix[1][2], left_idx);
+    pix[1][0] = _mm256_reassignment_ps(pix[1][1], left_idx);
+    pix[2][2] = _mm256_reassignment_ps(pix[2][3], left_idx);
+    pix[2][1] = _mm256_reassignment_ps(pix[2][2], left_idx);
+    pix[2][0] = _mm256_reassignment_ps(pix[2][1], left_idx);
+    pix[3][2] = _mm256_reassignment_ps(pix[3][3], left_idx);
+    pix[3][1] = _mm256_reassignment_ps(pix[3][2], left_idx);
+    pix[3][0] = _mm256_reassignment_ps(pix[3][1], left_idx);
+    _MM256_SORT28_PS(
+        pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6]
+    );
+    pix[1][6] = _mm256_avg_ps(pix[1][6], pix[2][0]);
+    pix[1][6] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[2][5], pix[2][6]), pix[1][6], 0);
+    pix[1][6] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[2][3], pix[2][4]), pix[1][6], 1);
+    pix[1][6] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[2][1], pix[2][2]), pix[1][6], 2);
+    _mm256_storeu_ps(ptrd, pix[1][6]);
+    
+    for (x = 8; x < mod8_w; x += 8) {
+        pix[0][0] = _mm256_loadu_ps(ptrs - stride * 3 + x - 3);
+        pix[0][1] = _mm256_loadu_ps(ptrs - stride * 3 + x - 2);
+        pix[0][2] = _mm256_loadu_ps(ptrs - stride * 3 + x - 1);
+        pix[0][3] = _mm256_loadu_ps(ptrs - stride * 3 + x);
+        pix[0][4] = _mm256_loadu_ps(ptrs - stride * 3 + x + 1);
+        pix[0][5] = _mm256_loadu_ps(ptrs - stride * 3 + x + 2);
+        pix[0][6] = _mm256_loadu_ps(ptrs - stride * 3 + x + 3);
+        pix[1][0] = _mm256_loadu_ps(ptrs - stride * 2 + x - 3);
+        pix[1][1] = _mm256_loadu_ps(ptrs - stride * 2 + x - 2);
+        pix[1][2] = _mm256_loadu_ps(ptrs - stride * 2 + x - 1);
+        pix[1][3] = _mm256_loadu_ps(ptrs - stride * 2 + x);
+        pix[1][4] = _mm256_loadu_ps(ptrs - stride * 2 + x + 1);
+        pix[1][5] = _mm256_loadu_ps(ptrs - stride * 2 + x + 2);
+        pix[1][6] = _mm256_loadu_ps(ptrs - stride * 2 + x + 3);
+        pix[2][0] = _mm256_loadu_ps(ptrs - stride + x - 3);
+        pix[2][1] = _mm256_loadu_ps(ptrs - stride + x - 2);
+        pix[2][2] = _mm256_loadu_ps(ptrs - stride + x - 1);
+        pix[2][3] = _mm256_loadu_ps(ptrs - stride + x);
+        pix[2][4] = _mm256_loadu_ps(ptrs - stride + x + 1);
+        pix[2][5] = _mm256_loadu_ps(ptrs - stride + x + 2);
+        pix[2][6] = _mm256_loadu_ps(ptrs - stride + x + 3);
+        pix[3][0] = _mm256_loadu_ps(ptrs + x - 3);
+        pix[3][1] = _mm256_loadu_ps(ptrs + x - 2);
+        pix[3][2] = _mm256_loadu_ps(ptrs + x - 1);
+        pix[3][3] = _mm256_loadu_ps(ptrs + x);
+        pix[3][4] = _mm256_loadu_ps(ptrs + x + 1);
+        pix[3][5] = _mm256_loadu_ps(ptrs + x + 2);
+        pix[3][6] = _mm256_loadu_ps(ptrs + x + 3);
+        _MM256_SORT28_PS(
+            pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+            pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+            pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+            pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6]
+        );
+        pix[1][6] = _mm256_avg_ps(pix[1][6], pix[2][0]);
+        _mm256_storeu_ps(ptrd + x, pix[1][6]);
+    }
+    
+    x = src_w - 8;
+    pix[0][0] = _mm256_loadu_ps(ptrs - stride * 3 + x - 3);
+    pix[0][1] = _mm256_loadu_ps(ptrs - stride * 3 + x - 2);
+    pix[0][2] = _mm256_loadu_ps(ptrs - stride * 3 + x - 1);
+    pix[0][3] = _mm256_loadu_ps(ptrs - stride * 3 + x);
+    pix[1][0] = _mm256_loadu_ps(ptrs - stride * 2 + x - 3);
+    pix[1][1] = _mm256_loadu_ps(ptrs - stride * 2 + x - 2);
+    pix[1][2] = _mm256_loadu_ps(ptrs - stride * 2 + x - 1);
+    pix[1][3] = _mm256_loadu_ps(ptrs - stride * 2 + x);
+    pix[2][0] = _mm256_loadu_ps(ptrs - stride + x - 3);
+    pix[2][1] = _mm256_loadu_ps(ptrs - stride + x - 2);
+    pix[2][2] = _mm256_loadu_ps(ptrs - stride + x - 1);
+    pix[2][3] = _mm256_loadu_ps(ptrs - stride + x);
+    pix[3][0] = _mm256_loadu_ps(ptrs + x - 3);
+    pix[3][1] = _mm256_loadu_ps(ptrs + x - 2);
+    pix[3][2] = _mm256_loadu_ps(ptrs + x - 1);
+    pix[3][3] = _mm256_loadu_ps(ptrs + x);
+    pix[0][4] = _mm256_reassignment_ps(pix[0][3], right_idx);
+    pix[0][5] = _mm256_reassignment_ps(pix[0][4], right_idx);
+    pix[0][6] = _mm256_reassignment_ps(pix[0][5], right_idx);
+    pix[1][4] = _mm256_reassignment_ps(pix[1][3], right_idx);
+    pix[1][5] = _mm256_reassignment_ps(pix[1][4], right_idx);
+    pix[1][6] = _mm256_reassignment_ps(pix[1][5], right_idx);
+    pix[2][4] = _mm256_reassignment_ps(pix[2][3], right_idx);
+    pix[2][5] = _mm256_reassignment_ps(pix[2][4], right_idx);
+    pix[2][6] = _mm256_reassignment_ps(pix[2][5], right_idx);
+    pix[3][4] = _mm256_reassignment_ps(pix[3][3], right_idx);
+    pix[3][5] = _mm256_reassignment_ps(pix[3][4], right_idx);
+    pix[3][6] = _mm256_reassignment_ps(pix[3][5], right_idx);
+    _MM256_SORT28_PS(
+        pix[0][0], pix[0][1], pix[0][2], pix[0][3], pix[0][4], pix[0][5], pix[0][6],
+        pix[1][0], pix[1][1], pix[1][2], pix[1][3], pix[1][4], pix[1][5], pix[1][6],
+        pix[2][0], pix[2][1], pix[2][2], pix[2][3], pix[2][4], pix[2][5], pix[2][6],
+        pix[3][0], pix[3][1], pix[3][2], pix[3][3], pix[3][4], pix[3][5], pix[3][6]
+    );
+    pix[1][6] = _mm256_avg_ps(pix[1][6], pix[2][0]);
+    pix[1][6] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[2][5], pix[2][6]), pix[1][6], 7);
+    pix[1][6] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[2][3], pix[2][4]), pix[1][6], 6);
+    pix[1][6] = _MM256_TRANSFER_PS(_mm256_avg_ps(pix[2][1], pix[2][2]), pix[1][6], 5);
+    _mm256_storeu_ps(ptrd + x, pix[1][6]);
+}
+
+static uint8_t get_median_from_hist_8(uint16_t *restrict hist, int size) {
+    uint16_t median_pos = (size + 1) >> 1, count = 0, median_val = 0;
+    for (uint16_t i = 0; i < 256; i++) {
+        count += hist[i];
+        if (count >= median_pos) {
+            median_val = i;
+            break;
+        }
+    }
+    if (!(size & 1) && count == median_pos) {
+        uint16_t median_next = median_val;
+        while (!hist[++median_next]);
+        return (median_val + median_next + 1) >> 1;
+    }
+    return median_val;
+}
+
+static void get_median_blur_radiusx_8(
+    const void *restrict srcp, void *restrict dstp, int src_w, int src_h, ptrdiff_t stride, int radius
+) {
+    const uint8_t *restrict ptrs = srcp;
+    uint8_t *restrict ptrd = dstp;
+    int border_w = src_w - 1;
+    int border_h = src_h - 1;
+    uint16_t *restrict hist = (uint16_t *)calloc(256, sizeof(uint16_t));
+    
+    for (int y = 0; y < src_h; y++) {
+        int size = 0;
+        int row0 = y - radius;
+        int row1 = y + radius;
+        if (row0 < 0) row0 = 0;
+        if (row1 > border_h) row1 = border_h;
+        for (int i = row0; i <= row1; i++) {
+            for (int j = 0; j <= radius; j++) {
+                hist[ptrs[i * stride + j]]++;
+                size++;
+            }
+        }
+        ptrd[0] = get_median_from_hist_8(hist, size);
+        for (int x = 1; x < src_w; x++) {
+            int col0 = x - radius - 1;
+            int col1 = x + radius;
+            for (int i = row0; i <= row1; i++) {
+                if (col0 >= 0) {
+                    hist[ptrs[i * stride + col0]]--;
+                    size--;
+                }
+                if (col1 <= border_w) {
+                    hist[ptrs[i * stride + col1]]++;
+                    size++;
+                }
+            }
+            ptrd[x] = get_median_from_hist_8(hist, size);
+        }
+        memset(hist, 0, sizeof(uint16_t) * 256);
+        ptrd += stride;
+    }
+    free(hist);
+}
+
+static void fenwick_incr_16(uint16_t *restrict tree, int k) {
+    k++;
+    for (; k <= 65536; k += k & -k) tree[k]++;
+}
+
+static void fenwick_decr_16(uint16_t *restrict tree, int k) {
+    k++;
+    for (; k <= 65536; k += k & -k) tree[k]--;
+}
+
+static int fenwick_get_kth_16(uint16_t *restrict tree, int n) {
+    int k = 0;
+    for (int l = 16; l >= 0; l--) {
+        if (k + (1 << l) <= 65536 && tree[k + (1 << l)] < n) {
+            k += (1 << l);
+            n -= tree[k];
+        }
+    }
+    return k;
+}
+
+static uint16_t get_median_from_fenwick_16(uint16_t *restrict tree, int size) {
+    int median_pos = (size + 1) >> 1;
+    int median_val = fenwick_get_kth_16(tree, median_pos);
+    if (!(size & 1)) {
+        int median_next = fenwick_get_kth_16(tree, median_pos + 1);
+        return (median_val + median_next + 1) >> 1;
+    }
+    return median_val;
+}
+
+static void get_median_blur_radiusx_16(
+    const void *restrict srcp, void *restrict dstp, int src_w, int src_h, ptrdiff_t stride, int radius
+) {
+    const uint16_t *restrict ptrs = srcp;
+    uint16_t *restrict ptrd = dstp;
+    int border_w = src_w - 1;
+    int border_h = src_h - 1;
+    uint16_t *restrict tree = (uint16_t *)calloc(65537, sizeof(uint16_t));
+    
+    for (int y = 0; y < src_h; y++) {
+        int size = 0;
+        int row0 = y - radius;
+        int row1 = y + radius;
+        if (row0 < 0) row0 = 0;
+        if (row1 > border_h) row1 = border_h;
+        for (int i = row0; i <= row1; i++) {
+            for (int j = 0; j <= radius; j++) {
+                fenwick_incr_16(tree, ptrs[i * stride + j]);
+                size++;
+            }
+        }
+        ptrd[0] = get_median_from_fenwick_16(tree, size);
+        for (int x = 1; x < src_w; x++) {
+            int col0 = x - radius - 1;
+            int col1 = x + radius;
+            for (int i = row0; i <= row1; i++) {
+                if (col0 >= 0) {
+                    fenwick_decr_16(tree, ptrs[i * stride + col0]);
+                    size--;
+                }
+                if (col1 <= border_w) {
+                    fenwick_incr_16(tree, ptrs[i * stride + col1]);
+                    size++;
+                }
+            }
+            ptrd[x] = get_median_from_fenwick_16(tree, size);
+        }
+        memset(tree, 0, sizeof(uint16_t) * 65537);
+        ptrd += stride;
+    }
+    free(tree);
+}
+
+typedef struct TreapNode {
+    uint32_t key, priority;
+    int count, size;
+    struct TreapNode *left, *right;
+} TreapNode;
+
+static void treap_update_size_32(TreapNode *node) {
+    if (!node) return;
+    node->size = node->count;
+    if (node->left) node->size += node->left->size;
+    if (node->right) node->size += node->right->size;
+}
+
+static TreapNode *treap_rotate_right_32(TreapNode *p) {
+    TreapNode *q = p->left;
+    p->left = q->right;
+    q->right = p;
+    treap_update_size_32(p);
+    treap_update_size_32(q);
+    return q;
+}
+
+static TreapNode *treap_rotate_left_32(TreapNode *p) {
+    TreapNode *q = p->right;
+    p->right = q->left;
+    q->left = p;
+    treap_update_size_32(p);
+    treap_update_size_32(q);
+    return q;
+}
+
+static inline uint32_t rdrand32(void) {
+    unsigned int ret;
+    while (!_rdrand32_step(&ret));
+    return ret;
+}
+
+static TreapNode *treap_insert_32(TreapNode *node, uint32_t key) {
+    if (!node) {
+        TreapNode *new_node = (TreapNode *)malloc(sizeof(TreapNode));
+        new_node->key = key;
+        new_node->priority = rdrand32();
+        new_node->count = 1;
+        new_node->size = 1;
+        new_node->left = new_node->right = NULL;
+        return new_node;
+    }
+    if (key == node->key) {
+        node->count++;
+        treap_update_size_32(node);
+        return node;
+    }
+    if (key < node->key) {
+        node->left = treap_insert_32(node->left, key);
+        if (node->left->priority > node->priority) node = treap_rotate_right_32(node);
+    } else {
+        node->right = treap_insert_32(node->right, key);
+        if (node->right->priority > node->priority) node = treap_rotate_left_32(node);
+    }
+    treap_update_size_32(node);
+    return node;
+}
+
+static TreapNode *treap_erase_one_32(TreapNode *node, uint32_t key) {
+    if (!node) return NULL;
+    if (key == node->key) {
+        if (node->count > 1) {
+            node->count--;
+            treap_update_size_32(node);
+            return node;
+        }
+        if (!node->left || !node->right) {
+            TreapNode *child = node->left ? node->left : node->right;
+            free(node);
+            return child;
+        }
+        if (node->left->priority > node->right->priority) {
+            node = treap_rotate_right_32(node);
+            node->right = treap_erase_one_32(node->right, key);
+        } else {
+            node = treap_rotate_left_32(node);
+            node->left = treap_erase_one_32(node->left, key);
+        }
+    } else if (key < node->key) {
+        node->left = treap_erase_one_32(node->left, key);
+    } else {
+        node->right = treap_erase_one_32(node->right, key);
+    }
+    treap_update_size_32(node);
+    return node;
+}
+
+static void treap_free_32(TreapNode *node) {
+    if (!node) return;
+    treap_free_32(node->left);
+    treap_free_32(node->right);
+    free(node);
+}
+
+static uint32_t treap_get_kth_32(TreapNode *node, int n) {
+    int left_size = node->left ? node->left->size : 0;
+    if (n < left_size) {
+        return treap_get_kth_32(node->left, n);
+    }
+    if (n < left_size + node->count) {
+        return node->key;
+    }
+    return treap_get_kth_32(node->right, n - left_size - node->count);
+}
+
+static float get_median_from_treap_32(TreapNode *root, int size) {
+    int median_pos = (size - 1) >> 1;
+    float median_val = castuf32(treap_get_kth_32(root, median_pos));
+    if (!(size & 1)) {
+        float median_next = castuf32(treap_get_kth_32(root, median_pos + 1));
+        return (median_val + median_next) / 2.0F;
+    }
+    return median_val;
+}
+
+static void get_median_blur_radiusx_32(
+    const void *restrict srcp, void *restrict dstp, int src_w, int src_h, ptrdiff_t stride, int radius
+) {
+    const uint32_t *restrict ptrs = srcp;
+    float *restrict ptrd = dstp;
+    int border_w = src_w - 1;
+    int border_h = src_h - 1;
+    TreapNode *root = NULL;
+    
+    for (int y = 0; y < src_h; y++) {
+        int size = 0;
+        int row0 = y - radius;
+        int row1 = y + radius;
+        if (row0 < 0) row0 = 0;
+        if (row1 > border_h) row1 = border_h;
+        for (int i = row0; i <= row1; i++) {
+            for (int j = 0; j <= radius; j++) {
+                uint32_t idx = ptrs[i * stride + j];
+                idx = (idx & 0x80000000) ? ~idx : (idx | 0x80000000);
+                root = treap_insert_32(root, idx);
+                size++;
+            }
+        }
+        ptrd[0] = get_median_from_treap_32(root, size);
+        for (int x = 1; x < src_w; x++) {
+            int col0 = x - radius - 1;
+            int col1 = x + radius;
+            for (int i = row0; i <= row1; i++) {
+                if (col0 >= 0) {
+                    uint32_t idx = ptrs[i * stride + col0];
+                    idx = (idx & 0x80000000) ? ~idx : (idx | 0x80000000);
+                    root = treap_erase_one_32(root, idx);
+                    size--;
+                }
+                if (col1 <= border_w) {
+                    uint32_t idx = ptrs[i * stride + col1];
+                    idx = (idx & 0x80000000) ? ~idx : (idx | 0x80000000);
+                    root = treap_insert_32(root, idx);
+                    size++;
+                }
+            }
+            ptrd[x] = get_median_from_treap_32(root, size);
+        }
+        treap_free_32(root);
+        root = NULL;
+        ptrd += stride;
+    }
+}
+
+static const VSFrame *VS_CC MedianBlurGetFrame(
+    int n, int activationReason, void *instanceData, void **frameData UNUSED,
+    VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi
+) {
+    MedianBlurData *d = (MedianBlurData *)instanceData;
+    
+    if (activationReason == arInitial) {
+        vsapi->requestFrameFilter(n, d->node, frameCtx);
+    } else if (activationReason == arAllFramesReady) {
+        const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
+        const VSVideoFormat *fi = vsapi->getVideoFrameFormat(src);
+        VSFrame *dst = vsapi->newVideoFrame(fi, d->vi->width, d->vi->height, src, core);
+        
+        for (int plane = 0; plane < fi->numPlanes; plane++) {
+            const void *restrict srcp = (const void *)vsapi->getReadPtr(src, plane);
+            ptrdiff_t src_stride = vsapi->getStride(src, plane) / fi->bytesPerSample;
+            void *restrict dstp = (void *)vsapi->getWritePtr(dst, plane);
+            int src_w = vsapi->getFrameWidth(src, plane);
+            int src_h = vsapi->getFrameHeight(src, plane);
+            if (d->process[plane]) {
+                d->blur(srcp, dstp, src_w, src_h, src_stride, d->radius);
+            } else {
+                vector_plane_copy(srcp, dstp, (size_t)fi->bytesPerSample * src_stride * src_h);
+            }
+        }
+        
+        vsapi->freeFrame(src);
+        return dst;
+    }
+    return NULL;
+}
+
+static void VS_CC MedianBlurFree(void *instanceData, VSCore *core UNUSED, const VSAPI *vsapi) {
+    MedianBlurData *d = (MedianBlurData *)instanceData;
+    vsapi->freeNode(d->node);
+    free(d);
+}
+
+static void VS_CC MedianBlurCreate(
+    const VSMap *in, VSMap *out, void *userData UNUSED, VSCore *core, const VSAPI *vsapi
+) {
+    MedianBlurData d;
+    d.node = vsapi->mapGetNode(in, "clip", 0, NULL);
+    d.vi = vsapi->getVideoInfo(d.node);
+    
+    if (
+        !vsh_isConstantVideoFormat(d.vi) ||
+        (d.vi->format.sampleType == stInteger && (d.vi->format.bitsPerSample < 8 || d.vi->format.bitsPerSample > 16)) ||
+        (d.vi->format.sampleType == stFloat && d.vi->format.bitsPerSample != 32)
+    ) {
+        vsapi->mapSetError(out, "MedianBlur: only constant format 8-16bit integer or 32bit float input supported");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    int err;
+    d.radius = vsapi->mapGetIntSaturated(in, "radius", 0, &err);
+    if (err) {
+        d.radius = 2;
+    }
+    if (d.radius < 1 || d.radius > 127) {
+        vsapi->mapSetError(out, "MedianBlur: \"radius\" must be between 1 and 127");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    if ((d.vi->width >> d.vi->format.subSamplingW) < (32 / d.vi->format.bytesPerSample + d.radius)) {
+        vsapi->mapSetError(out, "MedianBlur: \"width\" any of the planes must be greater than or equal to (32/bytesPerSample+radius)");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    if ((d.vi->height >> d.vi->format.subSamplingH) < (d.radius * 2 + 1)) {
+        vsapi->mapSetError(out, "MedianBlur: \"height\" any of the planes must be greater than or equal to (radius*2+1)");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    if (d.radius > (VSMIN(d.vi->width, d.vi->height) - 1) / 2) {
+        vsapi->mapSetError(out, "MedianBlur: \"radius\" must be less than or equal to (min(width,height)-1)/2");
+        vsapi->freeNode(d.node);
+        return;
+    }
+    
+    const int m = vsapi->mapNumElements(in, "planes");
+    
+    for (int i = 0; i < 3; i++) {
+        d.process[i] = (m <= 0);
+    }
+    
+    for (int i = 0; i < m; i++) {
+        const int n = vsapi->mapGetIntSaturated(in, "planes", i, NULL);
+        
+        if (n < 0 || n >= d.vi->format.numPlanes) {
+            vsapi->mapSetError(out, "MedianBlur: plane index is out of range");
+            vsapi->freeNode(d.node);
+            return;
+        }
+        
+        if (d.process[n]) {
+            vsapi->mapSetError(out, "MedianBlur: plane specified twice");
+            vsapi->freeNode(d.node);
+            return;
+        }
+         
+        d.process[n] = true;
+    }
+    
+    if (d.vi->format.bytesPerSample == 1) {
+        switch (d.radius) {
+            case 1: d.blur = get_median_blur_radius1_8; break;
+            case 2: d.blur = get_median_blur_radius2_8; break;
+            case 3: d.blur = get_median_blur_radius3_8; break;
+            default: d.blur = get_median_blur_radiusx_8; break;
+        }
+    } else if (d.vi->format.bytesPerSample == 2) {
+        switch (d.radius) {
+            case 1: d.blur = get_median_blur_radius1_16; break;
+            case 2: d.blur = get_median_blur_radius2_16; break;
+            case 3: d.blur = get_median_blur_radius3_16; break;
+            default: d.blur = get_median_blur_radiusx_16; break;
+        }
+    } else {
+        switch (d.radius) {
+            case 1: d.blur = get_median_blur_radius1_32; break;
+            case 2: d.blur = get_median_blur_radius2_32; break;
+            case 3: d.blur = get_median_blur_radius3_32; break;
+            default: d.blur = get_median_blur_radiusx_32; break;
+        }
+    }
+    
+    MedianBlurData *data = (MedianBlurData *)malloc(sizeof d);
+    *data = d;
+    
+    VSFilterDependency deps[] = {{d.node, rpStrictSpatial}};
+    vsapi->createVideoFilter(out, "MedianBlur", d.vi, MedianBlurGetFrame, MedianBlurFree, fmParallel, deps, 1, data, core);
+}
+
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
-    vspapi->configPlugin("com.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(20, 5), VAPOURSYNTH_API_VERSION, 0, plugin);
+    vspapi->configPlugin("com.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(21, 0), VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction(
         "BitDepth",
         "clip:vnode;"
@@ -10094,6 +19895,16 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
         "planes:int[]:opt;",
         "clip:vnode;",
         UnsharpMaskCreate,
+        NULL,
+        plugin
+    );
+    vspapi->registerFunction(
+        "MedianBlur",
+        "clip:vnode;"
+        "radius:int:opt;"
+        "planes:int[]:opt;",
+        "clip:vnode;",
+        MedianBlurCreate,
         NULL,
         plugin
     );

@@ -10,6 +10,7 @@
                 "-O2",
                 "-mavx2",
                 "-mfma",
+                "-mrdrnd",
                 "-ffast-math",
                 "-flto",
                 "-fuse-ld=lld",

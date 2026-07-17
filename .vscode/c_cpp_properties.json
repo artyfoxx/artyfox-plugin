@@ -18,6 +18,7 @@
             "compilerArgs": [
                 "-mavx2",
                 "-mfma",
+                "-mrdrnd",
                 "-ffast-math"
             ]
         }
