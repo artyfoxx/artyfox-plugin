@@ -11,8 +11,8 @@
                 "UNICODE",
                 "_UNICODE"
             ],
-            "cStandard": "c17",
-            "cppStandard": "c++17",
+            "cStandard": "c23",
+            "cppStandard": "c++23",
             "intelliSenseMode": "windows-clang-x64",
             "compilerPath": "C:/msys64/ucrt64/bin/clang.exe",
             "compilerArgs": [

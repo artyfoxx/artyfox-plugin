@@ -16,7 +16,7 @@
                 "-fuse-ld=lld",
                 "-Wall",
                 "-Wextra",
-                "-std=c17",
+                "-std=c23",
                 "-I\"C:\\Python314\\Lib\\site-packages\\vapoursynth\\include\"",
                 "${file}",
                 "-o",
