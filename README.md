@@ -17,6 +17,13 @@ The library is written using AVX2 and FMA3 intrinsics, so processors older than 
 * [**RemoveGrain**](#removegrain)
 * [**Repair**](#repair)
 * [**Convolution**](#convolution)
+* [**Expand**](#expand)
+* [**Inpand**](#inpand)
+* [**Inflate**](#inflate)
+* [**Deflate**](#deflate)
+* [**Clamp**](#clamp)
+* [**MakeDiff**](#makediff)
+* [**MergeDiff**](#mergediff)
 
 ## BitDepth
 `artyfox.BitDepth(clip clip, int bits[, bool range="_Range" frame property])`
@@ -61,8 +68,8 @@ Implementation of multiple resize functions using double-precision convolution m
 * `clip`: Source clip to resize. Must be RGB, YUV or GRAY. 8-16-bit integer or 32-bit float sample type.
 * `width`: Target width. Must be integer and match the source clip's subsampling.
 * `height`: Target height. Must be integer and match the source clip's subsampling.
-* `src_left`: The `x` coordinate of the point where the region to be resized starts. Defaults to 0.0
-* `src_top`: The `y` coordinate of the point where the region to be resized starts. Defaults to 0.0
+* `src_left`: The `x` coordinate of the point where the region to be resized starts. Defaults to `0.0`
+* `src_top`: The `y` coordinate of the point where the region to be resized starts. Defaults to `0.0`
 * `src_width`: The width of the region to be resized relative to `src_left`. Defaults to the width of the source clip.
 * `src_height`: The height of the region to be resized relative to `src_top`. Defaults to the height of the source clip.
 * `kernel`: Selecting a kernel for convolution. Possible values:
@@ -84,9 +91,9 @@ Implementation of multiple resize functions using double-precision convolution m
   * `spline64`: Cubic spline with 8 sample points.
   * `spline100`: Cubic spline with 10 sample points.
   * `spline144`: Cubic spline with 12 sample points.
-* `b`: The `b` parameter in the `bicubic` kernel. Defaults to 1/3.
-* `c`: The `c` parameter in the `bicubic` kernel. Defaults to 1/3.
-* `taps`: Window radius value for `blackman`, `box`, `gauss`, `kaiser`, `lanczos` and `nuttall` kernels, it must be between 1 and 128, the default value is 3.0 (except for `gauss`).
+* `b`: The `b` parameter in the `bicubic` kernel. Defaults to `1/3`.
+* `c`: The `c` parameter in the `bicubic` kernel. Defaults to `1/3`.
+* `taps`: Window radius value for `blackman`, `box`, `gauss`, `kaiser`, `lanczos` and `nuttall` kernels, it must be between 1 and 128, the default value is `3.0` (except for `gauss`).
 * `confine`: A method for representing pixels that are outside the frame. Possible values:
   * `zero`: Pixels outside the frame are considered zero.
   * `inf`: Pixels outside the frame are replaced with the nearest pixels within the frame, used by default.
@@ -109,8 +116,8 @@ Descaling via Tikhonov regularization and Cholesky decomposition (U.T @ U) using
 * `clip`: Source clip to descale. Must be RGB, YUV or GRAY. 32-bit float sample type only.
 * `width`: Target width. Must be integer and match the source clip's subsampling.
 * `height`: Target height. Must be integer and match the source clip's subsampling.
-* `src_left`: The `x` coordinate of the point where the destination region after descaling starts. Defaults to 0.0
-* `src_top`: The `y` coordinate of the point where the destination region after descaling starts. Defaults to 0.0
+* `src_left`: The `x` coordinate of the point where the destination region after descaling starts. Defaults to `0.0`
+* `src_top`: The `y` coordinate of the point where the destination region after descaling starts. Defaults to `0.0`
 * `src_width`: The width of the destination region after descaling relative to `src_left`. Defaults to `width`.
 * `src_height`: The height of the destination region after descaling relative to `src_top`. Defaults to `height`.
 * `kernel`: Selecting a kernel for deconvolution. Possible values:
@@ -132,14 +139,14 @@ Descaling via Tikhonov regularization and Cholesky decomposition (U.T @ U) using
   * `spline64`: Cubic spline with 8 sample points.
   * `spline100`: Cubic spline with 10 sample points.
   * `spline144`: Cubic spline with 12 sample points.
-* `b`: The `b` parameter in the `bicubic` kernel. Defaults to 1/3.
-* `c`: The `c` parameter in the `bicubic` kernel. Defaults to 1/3.
-* `taps`: Window radius value for `blackman`, `box`, `gauss`, `kaiser`, `lanczos` and `nuttall` kernels, it must be between 1 and 128, the default value is 3.0 (except for `gauss`).
+* `b`: The `b` parameter in the `bicubic` kernel. Defaults to `1/3`.
+* `c`: The `c` parameter in the `bicubic` kernel. Defaults to `1/3`.
+* `taps`: Window radius value for `blackman`, `box`, `gauss`, `kaiser`, `lanczos` and `nuttall` kernels, it must be between 1 and 128, the default value is `3.0` (except for `gauss`).
 * `confine`: A method for representing pixels that are outside the frame. Possible values:
   * `zero`: Pixels outside the frame are considered zero.
   * `inf`: Pixels outside the frame are replaced with the nearest pixels within the frame, used by default.
   * `mirror`: Pixels outside the frame are considered mirror images of pixels inside the frame.
-* `reg`: Regularization parameter. Ensures positive definiteness and stability of the solution to the system of equations. Small values ​​can lead to increased noise, quantization artifacts, and ringing. Excessively large values ​​produce a smooth image, suppressing fine details. Default is 1e-8. Valid range: 1e-16 <= `reg` < 1.
+* `reg`: Regularization parameter. Ensures positive definiteness and stability of the solution to the system of equations. Small values ​​can lead to increased noise, quantization artifacts, and ringing. Excessively large values ​​produce a smooth image, suppressing fine details. Default is `1e-8`. Valid range: 1e-16 <= `reg` < 1.
 
 ## Mean
 `artyfox.Mean(clip clip[, str mode='am', int plane=0, bool norm=True])`
@@ -159,13 +166,13 @@ Calculates the `minimum`, `maximum` and the set mean value for the specified pla
   * `simsad`: Modified sum of absolute differences between the mutual stable (`6 points`) interpolation of the frame fields and the true values ​​of the corresponding pixels; the `minimum` and `maximum` correspond to the minimum and maximum absolute difference between the interpolated and true values ​​of the frame (`stable_interp_msad`).
   * `tbmsad`: Modified sum of absolute differences between the even and odd lines of the frame; the `minimum` and `maximum` values ​​correspond to the minimum and maximum absolute difference between even and odd lines of the frame (`top_bottom_msad`).
   * `adtbm`: The absolute difference between the arithmetic means of the top and bottom fields of the frame; the `minimum` and `maximum` are the absolute difference between the minimums and maximums of both fields (`abs_diff_top_bottom_means`).
-* `plane`: Plane for analysis. Default is 0.
-* `norm`: Normalizes the mean to the 0:1 range (only for integer sample types). Default is true.
+* `plane`: Plane for analysis. Default is `0`.
+* `norm`: Normalizes the mean to the 0:1 range (only for integer sample types). Default is `True`.
 
 ## Metric
 `artyfox.Metric(clip clip0, clip clip1[, str mode='relative', float thr=0.0])`
 
-Compares two video clips and calculates the specified difference metric. The metric is stored as a frame property. The input range is always clamped to 0:1.
+Compares two video clips and calculates the specified difference metric. The metric is stored as a frame property. The input range is always clamped to 0.0...1.0.
 * `clip0`: Original clip. Must be GRAY. 32-bit float sample type only.
 * `clip1`: Restored clip. Must be GRAY. 32-bit float sample type only. The width, height and number of frames must match the original clip.
 * `mode`: Algorithm for finding the difference between two clips. Can take and return the following values:
@@ -175,7 +182,7 @@ Compares two video clips and calculates the specified difference metric. The met
   * `msad`: Modified sum of absolute differences (`MSAD`).
   * `pcc`: Pearson correlation coefficient (`PCC`).
   * `ssim`: Structural similarity index measure (`SSIM`).
-* `thr`: The absolute difference threshold above which the difference is considered significant; everything else is set to zero. This allows noise to be filtered out. Doesn't work for `pcc` and `ssim`. The default is 0.
+* `thr`: The absolute difference threshold above which the difference is considered significant; everything else is set to zero. This allows noise to be filtered out. Doesn't work for `pcc` and `ssim`. The default is `0`.
 
 ## FixBorder
 `artyfox.FixBorder(clip clip, str[] fix)`
@@ -185,32 +192,32 @@ Function for correcting brightness artifacts at frame borders.
 * `fix`: A list containing strings with instructions for correction. The string has the following format: "`plane` `axis` `target` `donor` `limit` `shift` `clamp`". The first four values are mandatory.
   * `plane`: The target plane.
   * `axis`: The axis along which the correction is performed. 'x' - columns, 'y' - rows.
-  * `target`: The target column/row that needs correction. Counted from the upper left corner of the frame. Can be an integer or several comma-separated numbers (no more than 256). Can be negative, in which case it is counted from the lower right corner.
-  * `donor`: The donor column/row on which the correction is based. Counted from the upper left corner of the frame. Can be an integer or several comma-separated numbers (no more than 256). Can be negative, in which case it is counted from the lower right corner.
-  * `limit`: Limit on the maximum brightness change. If the value is positive, the brightness cannot rise above or fall, if negative, it cannot fall below the specified value or rise. Specified in 8-bit notation. Default is 0 (no limit). The allowed range of values ​​is from -255 to 255.
-  * `shift`: Shift the zero point of the correction curve relative to the beginning of the range. For YUV, it applies to luma only. Specified in 8-bit notation. Default is 0.0. The allowed range of values ​​is from -19.0 to 279.0.
-  * `clamp`: Clamps the brightness of the corrected target column/row between the maximum and minimum of the donor column/row. Defaults to `True`.
+  * `target`: The target column/row that needs correction. Counted from the upper left corner of the frame. Can be an integer or several comma-separated numbers. Can be negative, in which case it is counted from the lower right corner.
+  * `donor`: The donor column/row on which the correction is based. Counted from the upper left corner of the frame. Can be an integer or several comma-separated numbers. Can be negative, in which case it is counted from the lower right corner.
+  * `limit`: Limit on the maximum brightness change. If the value is positive, the brightness cannot rise above or fall, if negative, it cannot fall below the specified value or rise. Specified in 8-bit notation. Default is `0` (no limit). The allowed range of values ​​is from -255 to 255.
+  * `shift`: Shift the zero point of the correction curve relative to the beginning of the range. For YUV, it applies to luma only. Specified in 8-bit notation. Default is `0.0`. The allowed range of values ​​is from -19.0 to 279.0.
+  * `clamp`: Clamps the brightness of the corrected target column/row between the maximum and minimum of the donor column/row. Default is `1` (true).
 
 ## AverageFields
 `artyfox.AverageFields(clip clip[, float weight=0.5, float shift=0.0])`
 
 A function for correcting interlaced fades. It works by averaging the fields of a frame based on their average brightness ratio.
 * `clip`: The clip that needs correction. Must be RGB, YUV or GRAY. 8-16-bit integer or 32-bit float sample type.
-* `weight`: The ratio of the contribution of fields to the resulting clip. 0.0 means the top field remains unchanged, and the bottom field is adjusted based on the top field. 1.0 means the bottom field remains unchanged, and the top field is adjusted based on the bottom field. Anything in between means the fields are mutually adjusted based on the set ratio. Default is 0.5. The allowed range of values ​​is from 0.0 to 1.0.
-* `shift`: Shift the zero point of the correction curve relative to the beginning of the range. For YUV, it applies to luma only. Specified in 8-bit notation. Default is 0.0. The allowed range of values ​​is from -19.0 to 279.0.
+* `weight`: The ratio of the contribution of fields to the resulting clip. 0.0 means the top field remains unchanged, and the bottom field is adjusted based on the top field. 1.0 means the bottom field remains unchanged, and the top field is adjusted based on the bottom field. Anything in between means the fields are mutually adjusted based on the set ratio. Default is `0.5`. The allowed range of values ​​is from 0.0 to 1.0.
+* `shift`: Shift the zero point of the correction curve relative to the beginning of the range. For YUV, it applies to luma only. Specified in 8-bit notation. Default is `0.0`. The allowed range of values ​​is from -19.0 to 279.0.
 
 ## UnsharpMask
 `artyfox.UnsharpMask(clip clip[, int strength=64, int radius=3, int threshold=8, str mode='box', int passes=1, bool rounding=False, int[] planes=[0, 1, 2] if clip.format.color_family == vs.RGB else 0])`
 
 A port of `UnsharpMask` from `AviSynth` with a few additions. By default, it completely replicates the original filter's algorithm.
 * `clip`: Target clip to receive the unsharp mask. Must be RGB, YUV or GRAY. 8-16-bit integer or 32-bit float sample type.
-* `strength`: Adjusts the amount of enhancement and attenuation of the unsharp mask effect. Valid range: 1 to 512. Default is 64.
-* `radius`: The blur radius used to create the unsharp mask. Valid range: 1 to 127. Default is 3.
-* `threshold`: A threshold for the absolute difference between the original and blurred clips, above which the difference is considered significant. Anything less than or equal to this value is passed unchanged. This allows for noise filtering. Specified in 8-bit notation. Valid range: 0 to 255. Default is 8.
+* `strength`: Adjusts the amount of enhancement and attenuation of the unsharp mask effect. Valid range: 1 to 512. Default is `64`.
+* `radius`: The blur radius used to create the unsharp mask. Valid range: 1 to 127. Default is `3`.
+* `threshold`: A threshold for the absolute difference between the original and blurred clips, above which the difference is considered significant. Anything less than or equal to this value is passed unchanged. This allows for noise filtering. Specified in 8-bit notation. Valid range: 0 to 255. Default is `8`.
 * `mode`: Blur mode:
   * `box`: Box blur, used by default.
   * `stack`: Stack blur (triangular core).
-* `passes`: The number of blur passes. This allows to emulate a Gaussian kernel with the desired degree of approximation thanks to the central limit theorem. `passes=2, mode='box'` is equivalent to `passes=1, mode='stack'`, taking into account the difference in internal rounding. Valid range: 1 to 16. Default is 1.
+* `passes`: The number of blur passes. This allows to emulate a Gaussian kernel with the desired degree of approximation thanks to the central limit theorem. `passes=2, mode='box'` is equivalent to `passes=1, mode='stack'`, taking into account the difference in internal rounding. Valid range: 1 to 16. Default is `1`.
 * `rounding`: Rounding mode. `False` - round down (floor), `True` - round half up. Default is `False`.
 * `planes`: List of planes for the unsharp mask. Defaults to `[0, 1, 2]` for RGB and `0` for other color families.
 
@@ -219,7 +226,7 @@ A port of `UnsharpMask` from `AviSynth` with a few additions. By default, it com
 
 Median blur with mathematically correct edge processing.
 * `clip`: The clip to which the median blur should be applied. Must be RGB, YUV or GRAY. 8-16-bit integer or 32-bit float sample type.
-* `radius`: Blur radius. Radii 1-3 are implemented as separate vector functions. The rest are done through universal scalar functions using Huang's algorithm (for 8 bits the histogram is built directly, for 16 bits the Fenwick tree is used, for 32 bits the Treap is used). Valid range: 1 to 127. Default is 2.
+* `radius`: Blur radius. Radii 1-3 are implemented as separate SIMD functions. The rest are done through universal scalar functions using Huang's algorithm (for 8 bits the histogram is built directly, for 16 bits the Fenwick tree is used, for 32 bits the Treap is used). Valid range: 1 to 127. Default is `2`.
 * `planes`: List of planes to be median blurred. By default, all planes are processed.
 
 ## RemoveGrain
@@ -263,11 +270,11 @@ Purely spatial denoising function that includes 30 different modes. Mode 13 thro
 For the float sample type, no preliminary preparation of the input data, such as aligning the chroma range with the luma or trimming the range to values ​​acceptable by the standard, is performed.
 
 ## Repair
-`artyfox.Repair(clip clip0, clip clip1[, int[] mode=[2, 2, 2]])`
+`artyfox.Repair(clip clip, clip repairclip[, int[] mode=[2, 2, 2]])`
 
 Repairs unwanted artifacts from (but not limited to) RemoveGrain.
-* `clip0`: Input clip to be repaired; usually the processed clip. Must be RGB, YUV or GRAY. 8-16-bit integer or 32-bit float sample type.
-* `clip1`: Input clip; known as the reference clip and it's usually the original unprocessed clip. The width, height, format and number of frames must match the original clip.
+* `clip`: Input clip; known as the reference clip and it's usually the original unprocessed clip. Must be RGB, YUV or GRAY. 8-16-bit integer or 32-bit float sample type.
+* `repairclip`: Input clip to be repaired; usually the processed clip. The width, height, format and number of frames must match the original clip.
 * `mode`: These modes are similar to the RemoveGrain modes but include the center pixel of the reference clip for min/max calculation. Supported modes:
   * `0`: The plane is copied without changes.
   * `1`: Clips the source pixel with the Nth minimum and maximum found on the 3×3-pixel square from the reference clip.
@@ -306,26 +313,106 @@ For the float sample type, no preliminary preparation of the input data, such as
 
 Spatial convolution with additional modes. Unlike standard convolution: there is no bias, the weights in the matrix are only integer, infinity borders are like in `mt_convolution`, the values of the weights and the size of the matrix are limited only by common sense.
 * `clip`: The clip to which spatial convolution will be applied. Must be RGB, YUV or GRAY. 8-16-bit integer or 32-bit float sample type.
-* `matrix`: The weight matrix for convolution. The number of weights must be odd. For a square matrix, the size of the square's side must also be odd.
+* `matrix`: The weight matrix for convolution. The number of weights must be odd. For a square matrix, the size of the square's side must also be odd. By default, a 3x3 box blur is used.
 * `mode`: Convolution operating mode. Can take the following values:
-  * `square`: The matrix is ​​interpreted as square. A 3x3 matrix is processed by a specialized vector function, while matrices of larger dimensions are processed by a universal scalar function.
-  * `vertical`: The matrix is ​​interpreted as vertical. Processed by a universal vector function.
-  * `horizontal`: Матрица интерпретируется как горизонтальная. Processed by a universal vector function.
+  * `square`: The matrix is ​​interpreted as square. A 3x3 matrix is processed by a specialized SIMD function, while matrices of larger dimensions are processed by a universal scalar function, used by default.
+  * `vertical`: The matrix is ​​interpreted as vertical. Processed by a universal SIMD function.
+  * `horizontal`: Матрица интерпретируется как горизонтальная. Processed by a universal SIMD function.
   * `both`: The matrix is ​​interpreted first as vertical, then as horizontal.
-  * `sobel`: The `sobel` operator from `mt_edge`. Just a preset for `square`.
-  * `roberts`: The `roberts` operator from `mt_edge`. Just a preset for `square`.
-  * `laplace`: The `laplace` operator from `mt_edge`. Just a preset for `square`.
-  * `cartoon`: The `cartoon` operator from `mt_edge`. Just a preset for `square`.
-  * `min/max`: The `min/max` operator from `mt_edge`. Processed by a specialized vector function.
-  * `hprewitt`: The `hprewitt` operator from `mt_edge`. Processed by a specialized vector function.
-  * `prewitt`: The `prewitt` operator from `mt_edge`. Processed by a specialized vector function.
-  * `kirsch4`: The four-way `kirsch` operator. Processed by a specialized vector function.
-  * `kirsch8`: The eight-way `kirsch` operator. Processed by a specialized vector function.
+  * `sobel`: The `sobel` operator from `mt_edge`. Just a preset for `square`. `matrix`, `divisor`, and `saturate` are ignored.
+  * `roberts`: The `roberts` operator from `mt_edge`. Just a preset for `square`. `matrix`, `divisor`, and `saturate` are ignored.
+  * `laplace`: The `laplace` operator from `mt_edge`. Just a preset for `square`. `matrix`, `divisor`, and `saturate` are ignored.
+  * `cartoon`: The `cartoon` operator from `mt_edge`. Just a preset for `square`. `matrix`, `divisor`, and `saturate` are ignored.
+  * `min/max`: The `min/max` operator from `mt_edge`. Processed by a specialized SIMD function. `matrix`, `divisor`, and `saturate` are ignored.
+  * `hprewitt`: The `hprewitt` operator from `mt_edge`. Processed by a specialized SIMD function. `matrix`, `divisor`, and `saturate` are ignored.
+  * `prewitt`: The `prewitt` operator from `mt_edge`. Processed by a specialized SIMD function. `matrix`, `divisor`, and `saturate` are ignored.
+  * `kirsch4`: The four-way `kirsch` operator. Processed by a specialized SIMD function. `matrix`, `divisor`, and `saturate` are ignored.
+  * `kirsch8`: The eight-way `kirsch` operator. Processed by a specialized SIMD function. `matrix`, `divisor`, and `saturate` are ignored.
 * `divisor`: Divisor for the convolution result. All divisions are performed in `float`, rounding to integers is done using banker's method. By default, it is equal to the sum of the matrix weights or `1.0` if the sum is zero.
-* `saturate`: Saturates the division result to within the acceptable format limits. `True` - saturation of the result, `False` - saturation of the absolute value of the result. For the float sample type, saturation is not performed, only the absolute value is taken.
+* `saturate`: Saturates the division result to within the acceptable format limits. `True` - saturation of the result (used by default), `False` - saturation of the absolute value of the result. For the float sample type, saturation is not performed, only the absolute value is taken.
 * `planes`: List of planes to be convolved. By default, all planes are processed.
 
 For the float sample type, no preliminary preparation of the input data, such as aligning the chroma range with the luma or trimming the range to values ​​acceptable by the standard, is performed.
+
+## Expand
+`artyfox.Expand(clip clip[, int thr=255, str mode='square', int[] planes=[0, 1, 2]])`
+
+Analogue of `mt_expand` from `MaskTools`. Replaces a pixel with a local maximum of pixels in a neighborhood of unit radius.
+* `clip`: The clip to which the filter is applied. Must be RGB, YUV or GRAY. 8-16-bit integer or 32-bit float sample type.
+* `thr`: Limits the brightness increase of pixels to the specified threshold. Specified in 8-bit notation. Valid range: 1 to 255. Default is `255`.
+* `mode`: Specifies the neighbor selection mode for local maximum search. It can take the following values:
+  * `square`: 3x3 square neighbourhood, used by default.
+  * `horizontal`: 3x1 horizontal neighbourhood.
+  * `vertical`: 1x3 vertical neighbourhood.
+  * `both`: A 3-long cross (`horizontal` + `vertical`) neighbourhood.
+  * `0 -1 -1 0 0 0 1 0 0 1`: Custom mode, in this case analogous to `both`. Pixels are specified as relative coordinates along the `x` and `y` axes. Pixels outside the frame are replaced with the nearest pixels within the frame.
+* `planes`: List of planes to be filtered. By default, all planes are processed.
+
+## Inpand
+`artyfox.Inpand(clip clip[, int thr=255, str mode='square', int[] planes=[0, 1, 2]])`
+
+Analogue of `mt_inpand` from `MaskTools`. Replaces a pixel with a local minimum of pixels in a neighborhood of unit radius.
+* `clip`: The clip to which the filter is applied. Must be RGB, YUV or GRAY. 8-16-bit integer or 32-bit float sample type.
+* `thr`: Limits the brightness decrease of pixels to the specified threshold. Specified in 8-bit notation. Valid range: 1 to 255. Default is `255`.
+* `mode`: Specifies the neighbor selection mode for local minimum search. It can take the following values:
+  * `square`: 3x3 square neighbourhood, used by default.
+  * `horizontal`: 3x1 horizontal neighbourhood.
+  * `vertical`: 1x3 vertical neighbourhood.
+  * `both`: A 3-long cross (`horizontal` + `vertical`) neighbourhood.
+  * `0 -1 -1 0 0 0 1 0 0 1`: Custom mode, in this case analogous to `both`. Pixels are specified as relative coordinates along the `x` and `y` axes. Pixels outside the frame are replaced with the nearest pixels within the frame.
+* `planes`: List of planes to be filtered. By default, all planes are processed.
+
+## Inflate
+`artyfox.Inflate(clip clip[, int thr=255, int[] planes=[0, 1, 2]])`
+
+Analogue of `mt_inflate` from `MaskTools`. Calculates the local average value, taking into account only neighbors whose value is higher than the pixel value.
+* `clip`: The clip to which the filter is applied. Must be RGB, YUV or GRAY. 8-16-bit integer or 32-bit float sample type.
+* `thr`: Limits the brightness increase of pixels to the specified threshold. Specified in 8-bit notation. Valid range: 1 to 255. Default is `255`.
+* `planes`: List of planes to be filtered. By default, all planes are processed.
+
+## Deflate
+`artyfox.Deflate(clip clip[, int thr=255, int[] planes=[0, 1, 2]])`
+
+Analogue of `mt_deflate` from `MaskTools`. Calculates the local average value, taking into account only neighbors whose value is lower than the pixel value.
+* `clip`: The clip to which the filter is applied. Must be RGB, YUV or GRAY. 8-16-bit integer or 32-bit float sample type.
+* `thr`: Limits the brightness decrease of pixels to the specified threshold. Specified in 8-bit notation. Valid range: 1 to 255. Default is `255`.
+* `planes`: List of planes to be filtered. By default, all planes are processed.
+
+## Clamp
+`artyfox.Clamp(clip clip, clip bright_limit, clip dark_limit[, int overshoot=0, int undershoot=0, int[] planes=[0, 1, 2]])`
+
+Analogue of `mt_clamp` from `MaskTools`. Forces the value of the `clip` to be between `bright_limit + overshoot` and `dark_limit - undershoot`. Gives unwanted results if `bright_limit + overshoot` < `dark_limit - undershoot`.
+* `clip`: The clip to which the clamp is applied. Must be RGB, YUV or GRAY. 8-16-bit integer or 32-bit float sample type.
+* `bright_limit`: A clip that serves as a source of upper threshold for the clamp. The width, height, format and number of frames must match the original clip.
+* `dark_limit`: A clip that serves as a source of lower threshold for the clamp. The width, height, format and number of frames must match the original clip.
+* `overshoot`: A value that increases the upper clamp threshold by adding it to `bright_limit`. Specified in 8-bit notation. Valid range: 0 to 255. Default is `0`.
+* `undershoot`: A value that decreases the lower clamp threshold by subtracting it from `dark_limit`. Specified in 8-bit notation. Valid range: 0 to 255. Default is `0`.
+* `planes`: List of planes to be clamped. By default, all planes are processed.
+
+## MakeDiff
+`artyfox.MakeDiff(clip clip0, clip clip1[, int[] planes=[0, 1, 2]])`
+
+Analogue of `mt_makediff` from `MaskTools`. On integer sample types, it behaves exactly like the standard one; on float sample types, it clamps the input and output ranges to the standard limits and aligns the brightness.
+* `clip0`: The clip from which `clip1` is subtracted. Must be RGB, YUV or GRAY. 8-16-bit integer or 32-bit float sample type.
+* `clip1`: The clip to subtract from `clip0`. The width, height, format and number of frames must match the `clip0`.
+* `planes`: List of planes to be filtered. By default, all planes are processed.
+
+## MergeDiff
+`artyfox.MergeDiff(clip clip0, clip clip1[, int[] planes=[0, 1, 2]])`
+
+Analogue of `mt_adddiff` from `MaskTools`. On integer sample types, it behaves exactly like the standard one; on float sample types, it clamps the input and output ranges to the standard limits and aligns the brightness.
+* `clip0`: The clip to which `clip1` is added. Must be RGB, YUV or GRAY. 8-16-bit integer or 32-bit float sample type.
+* `clip1`: The clip to add to `clip0`. The width, height, format and number of frames must match the `clip0`.
+* `planes`: List of planes to be filtered. By default, all planes are processed.
+
+## Binarize
+`artyfox.Binarize(clip clip[, int thr=128, str mode='lower', int[] planes=[0, 1, 2]])`
+
+Analogue of `mt_binarize` from `MaskTools`. It transforms soft masks into hard masks. Masks for float sample type are always in the range 0.0...1.0, regardless of plane and color family.
+* `clip`: Clip for binarization. Must be RGB, YUV or GRAY. 8-16-bit integer or 32-bit float sample type.
+* `thr`: The threshold above which binarization occurs upwards, otherwise downwards. Specified in 8-bit notation. Valid range: 0 to 255. Default is `128`.
+* `mode`: The filter's operating mode is determined by the upper and lower binarization thresholds. It works like `std.Expr('x t > a b ?')` , where `t` is the threshold and `a b` is the mode. Possible values: `255 0` (`lower`), `0 255` (`upper`), `0 x`, `x 0`, `0 t`, `t 0`, `t x`, `x t`, `255 x`, `x 255`, `255 t` and `t 255`. Default is `lower`.
+* `planes`: List of planes to be binarized. By default, all planes are processed.
 
 ## License
 This project is licensed under the MIT License - see the LICENSE file for details.

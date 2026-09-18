@@ -2,8 +2,8 @@
     "tasks": [
         {
             "type": "cppbuild",
-            "label": "C/C++: clang.exe сборка активного файла",
-            "command": "C:/msys64/ucrt64/bin/clang.exe",
+            "label": "C/C++: clang++.exe сборка активного файла",
+            "command": "C:/msys64/ucrt64/bin/clang++.exe",
             "args": [
                 "-shared",
                 "-static",
@@ -16,7 +16,7 @@
                 "-fuse-ld=lld",
                 "-Wall",
                 "-Wextra",
-                "-std=c23",
+                "-std=c++26",
                 "-I\"C:\\Python314\\Lib\\site-packages\\vapoursynth\\include\"",
                 "${file}",
                 "-o",
