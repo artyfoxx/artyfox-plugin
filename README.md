@@ -24,6 +24,7 @@ The library is written using AVX2 and FMA3 intrinsics, so processors older than 
 * [**Clamp**](#clamp)
 * [**MakeDiff**](#makediff)
 * [**MergeDiff**](#mergediff)
+* [**Binarize**](#binarize)
 
 ## BitDepth
 `artyfox.BitDepth(clip clip, int bits[, bool range="_Range" frame property])`
