@@ -113,7 +113,7 @@ Chroma alignment in YUV with subsampling is performed based on the `"_ChromaLoca
 ## Descale
 `artyfox.Descale(clip clip, int width, int height[, float src_left=0.0, float src_top=0.0, float src_width=width, float src_height=height, str kernel='bilinear', float b=1/3, float c=1/3, float taps=3.0, str confine='inf', float reg=1e-8])`
 
-Descaling via Tikhonov regularization and Cholesky decomposition (U.T @ U) using double-precision convolution method.
+Descaling via Tikhonov regularization and Cholesky decomposition (L @ L.T) using double-precision deconvolution method.
 * `clip`: Source clip to descale. Must be RGB, YUV or GRAY. 32-bit float sample type only.
 * `width`: Target width. Must be integer and match the source clip's subsampling.
 * `height`: Target height. Must be integer and match the source clip's subsampling.

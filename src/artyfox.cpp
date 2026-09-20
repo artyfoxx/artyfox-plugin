@@ -3131,7 +3131,7 @@ static void VS_CC ResizeCreate(const VSMap* in, VSMap* out, void* userData UNUSE
 }
 
 struct banded_t {
-    int col_n, ku;
+    int row_n, kd;
     std::unique_ptr<double[]> values;
 };
 
@@ -3174,7 +3174,7 @@ static csr_t csr_transpose(const csr_t& csr) {
 }
 
 static banded_t banded_gramian_from_csr(const csr_t& csr, double reg) {
-    int ku = 0;
+    int kd = 0;
     
     for (int i = 0; i < csr.row_n; i++) {
         int p0 = csr.row_ptr[i];
@@ -3182,10 +3182,10 @@ static banded_t banded_gramian_from_csr(const csr_t& csr, double reg) {
         int c_min = csr.col_idx[p0];
         int c_max = csr.col_idx[p1 - 1];
         int w = c_max - c_min;
-        if (w > ku) ku = w;
+        if (w > kd) kd = w;
     }
     
-    int kf = ku + 1;
+    int kf = kd + 1;
     auto banded = std::make_unique<double[]>(csr.col_n * kf);
     
     for (int i = 0; i < csr.row_n; i++) {
@@ -3199,106 +3199,104 @@ static banded_t banded_gramian_from_csr(const csr_t& csr, double reg) {
             for (int k = j; k < p1; k++) {
                 int ck = csr.col_idx[k];
                 double vk = csr.values[k];
-                int col = ku + cj - ck;
-                banded[col * csr.col_n + ck] += vj * vk;
+                banded[cj * kf + (ck - cj)] += vj * vk;
             }
         }
     }
     
-    for (int i = csr.col_n * ku; i < csr.col_n * kf; i++) {
-        banded[i] += reg;
+    for (int i = 0; i < csr.col_n; i++) {
+        banded[i * kf] += reg;
     }
     
-    return banded_t{csr.col_n, ku, std::move(banded)};
+    return banded_t{csr.col_n, kd, std::move(banded)};
 }
 
 static void banded_cholesky_from_gramian(const banded_t& banded) noexcept {
-    for (int i = 0; i < banded.col_n; i++) {
-        int j_start = std::max(i - banded.ku, 0);
+    int kf = banded.kd + 1;
+    
+    for (int i = 0; i < banded.row_n; i++) {
+        double acc = banded.values[i * kf];
+        int j_start = std::max(i - banded.kd, 0);
         for (int j = j_start; j < i; j++) {
-            double acc = 0.0;
-            int k_start = std::max(j - banded.ku, j_start);
-            for (int k = k_start; k < j; k++) {
-                int idx_jk = (banded.ku + k - j) * banded.col_n + j;
-                int idx_ik = (banded.ku + k - i) * banded.col_n + i;
-                acc += banded.values[idx_jk] * banded.values[idx_ik];
+            double vij = banded.values[j * kf + (i - j)];
+            acc -= vij * vij;
+        }
+        double vii = std::sqrt(acc);
+        banded.values[i * kf] = vii;
+        
+        int j_end = std::min(i + banded.kd, banded.row_n - 1);
+        for (int j = j_end; j > i; j--) {
+            acc = banded.values[i * kf + (j - i)];
+            int k_start = std::max(j - banded.kd, 0);
+            for (int k = k_start; k < i; k++) {
+                double vik = banded.values[k * kf + (i - k)];
+                double vjk = banded.values[k * kf + (j - k)];
+                acc -= vik * vjk;
             }
-            int idx_ij = (banded.ku + j - i) * banded.col_n + i;
-            int idx_jj = banded.ku * banded.col_n + j;
-            banded.values[idx_ij] = (banded.values[idx_ij] - acc) / banded.values[idx_jj];
+            banded.values[i * kf + (j - i)] = acc / vii;
         }
-        double acc = 0.0;
+    }
+}
+
+static void banded_solve_cholesky_x4(const banded_t& banded, double* dstp) noexcept {
+    int kf = banded.kd + 1;
+    
+    for (int i = 0; i < banded.row_n; i++) {
+        __m256d v_acc = _mm256_load_pd(dstp + i * 4);
+        int j_start = std::max(i - banded.kd, 0);
         for (int j = j_start; j < i; j++) {
-            int idx_ik = (banded.ku + j - i) * banded.col_n + i;
-            double lik = banded.values[idx_ik];
-            acc += lik * lik;
-        }
-        int idx_ii = banded.ku * banded.col_n + i;
-        banded.values[idx_ii] = std::sqrt(banded.values[idx_ii] - acc);
-    }
-}
-
-static void banded_solve_cholesky_x4(const banded_t& srcp, double* dstp) noexcept {
-    for (int i = 0; i < srcp.col_n; i++) {
-        int start = std::max(0, i - srcp.ku);
-        __m256d v_acc = _mm256_load_pd(dstp + i * 4);
-        for (int j = start; j < i; j++) {
-            int row_in_src = srcp.ku + j - i;
-            if (row_in_src < 0) continue;
             __m256d pix = _mm256_load_pd(dstp + j * 4);
-            __m256d v_weights = _mm256_set1_pd(srcp.values[row_in_src * srcp.col_n + i]);
+            __m256d v_weights = _mm256_set1_pd(banded.values[j * kf + (i - j)]);
             v_acc = _mm256_fnmadd_pd(pix, v_weights, v_acc);
         }
-        __m256d v_div = _mm256_set1_pd(srcp.values[srcp.ku * srcp.col_n + i]);
+        __m256d v_div = _mm256_set1_pd(banded.values[i * kf]);
         _mm256_store_pd(dstp + i * 4, _mm256_div_pd(v_acc, v_div));
     }
-    for (int i = srcp.col_n - 1; i >= 0; i--) {
-        int end = std::min(srcp.col_n - 1, i + srcp.ku);
+    
+    for (int i = banded.row_n - 1; i >= 0; i--) {
         __m256d v_acc = _mm256_load_pd(dstp + i * 4);
-        for (int j = end; j > i; j--) {
-            int row_in_src = srcp.ku + i - j;
-            if (row_in_src < 0) continue;
+        int j_end = std::min(i + banded.kd, banded.row_n - 1);
+        for (int j = j_end; j > i; j--) {
             __m256d pix = _mm256_load_pd(dstp + j * 4);
-            __m256d v_weights = _mm256_set1_pd(srcp.values[row_in_src * srcp.col_n + j]);
+            __m256d v_weights = _mm256_set1_pd(banded.values[i * kf + (j - i)]);
             v_acc = _mm256_fnmadd_pd(pix, v_weights, v_acc);
         }
-        __m256d v_div = _mm256_set1_pd(srcp.values[srcp.ku * srcp.col_n + i]);
+        __m256d v_div = _mm256_set1_pd(banded.values[i * kf]);
         _mm256_store_pd(dstp + i * 4, _mm256_div_pd(v_acc, v_div));
     }
 }
 
-static void banded_solve_cholesky_x8(const banded_t& srcp, double* dstp) noexcept {
-    for (int i = 0; i < srcp.col_n; i++) {
-        int start = std::max(0, i - srcp.ku);
+static void banded_solve_cholesky_x8(const banded_t& banded, double* dstp) noexcept {
+    int kf = banded.kd + 1;
+    
+    for (int i = 0; i < banded.row_n; i++) {
         __m256d v_acc_0 = _mm256_load_pd(dstp + i * 8 + 0);
         __m256d v_acc_1 = _mm256_load_pd(dstp + i * 8 + 4);
-        for (int j = start; j < i; j++) {
-            int row_in_src = srcp.ku + j - i;
-            if (row_in_src < 0) continue;
+        int j_start = std::max(i - banded.kd, 0);
+        for (int j = j_start; j < i; j++) {
             __m256d pix_0 = _mm256_load_pd(dstp + j * 8 + 0);
             __m256d pix_1 = _mm256_load_pd(dstp + j * 8 + 4);
-            __m256d v_weights = _mm256_set1_pd(srcp.values[row_in_src * srcp.col_n + i]);
+            __m256d v_weights = _mm256_set1_pd(banded.values[j * kf + (i - j)]);
             v_acc_0 = _mm256_fnmadd_pd(pix_0, v_weights, v_acc_0);
             v_acc_1 = _mm256_fnmadd_pd(pix_1, v_weights, v_acc_1);
         }
-        __m256d v_div = _mm256_set1_pd(srcp.values[srcp.ku * srcp.col_n + i]);
+        __m256d v_div = _mm256_set1_pd(banded.values[i * kf]);
         _mm256_store_pd(dstp + i * 8 + 0, _mm256_div_pd(v_acc_0, v_div));
         _mm256_store_pd(dstp + i * 8 + 4, _mm256_div_pd(v_acc_1, v_div));
     }
-    for (int i = srcp.col_n - 1; i >= 0; i--) {
-        int end = std::min(srcp.col_n - 1, i + srcp.ku);
+    
+    for (int i = banded.row_n - 1; i >= 0; i--) {
         __m256d v_acc_0 = _mm256_load_pd(dstp + i * 8 + 0);
         __m256d v_acc_1 = _mm256_load_pd(dstp + i * 8 + 4);
-        for (int j = end; j > i; j--) {
-            int row_in_src = srcp.ku + i - j;
-            if (row_in_src < 0) continue;
+        int j_end = std::min(i + banded.kd, banded.row_n - 1);
+        for (int j = j_end; j > i; j--) {
             __m256d pix_0 = _mm256_load_pd(dstp + j * 8 + 0);
             __m256d pix_1 = _mm256_load_pd(dstp + j * 8 + 4);
-            __m256d v_weights = _mm256_set1_pd(srcp.values[row_in_src * srcp.col_n + j]);
+            __m256d v_weights = _mm256_set1_pd(banded.values[i * kf + (j - i)]);
             v_acc_0 = _mm256_fnmadd_pd(pix_0, v_weights, v_acc_0);
             v_acc_1 = _mm256_fnmadd_pd(pix_1, v_weights, v_acc_1);
         }
-        __m256d v_div = _mm256_set1_pd(srcp.values[srcp.ku * srcp.col_n + i]);
+        __m256d v_div = _mm256_set1_pd(banded.values[i * kf]);
         _mm256_store_pd(dstp + i * 8 + 0, _mm256_div_pd(v_acc_0, v_div));
         _mm256_store_pd(dstp + i * 8 + 4, _mm256_div_pd(v_acc_1, v_div));
     }
@@ -38623,7 +38621,7 @@ static void VS_CC BinarizeCreate(
 }
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI* vspapi) {
-    vspapi->configPlugin("com.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(23, 0), VAPOURSYNTH_API_VERSION, 0, plugin);
+    vspapi->configPlugin("com.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(23, 1), VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction(
         "BitDepth",
         "clip:vnode;"
