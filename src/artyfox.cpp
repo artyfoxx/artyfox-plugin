@@ -139,11 +139,11 @@ static void bitdepth_uint8_to_float(
     
     __m256 v_low, v_high;
     if (range) {
-        v_low = _mm256_set1_ps(chroma ? 128.0F : 16.0F);
-        v_high = _mm256_set1_ps(chroma ? 224.0F : 219.0F);
-    } else {
         v_low = _mm256_set1_ps(chroma ? 128.0F : 0.0F);
         v_high = _mm256_set1_ps(chroma ? 256.0F : 255.0F);
+    } else {
+        v_low = _mm256_set1_ps(chroma ? 128.0F : 16.0F);
+        v_high = _mm256_set1_ps(chroma ? 224.0F : 219.0F);
     }
     
     for (int y = 0; y < src_h; y++) {
@@ -232,11 +232,11 @@ static void bitdepth_uint16_to_float(
     
     __m256 v_low, v_high;
     if (range) {
-        v_low = _mm256_set1_ps((chroma ? 128 : 16) << (src_bits - 8));
-        v_high = _mm256_set1_ps((chroma ? 224 : 219) << (src_bits - 8));
-    } else {
         v_low = _mm256_set1_ps(chroma ? (128 << (src_bits - 8)) : 0);
         v_high = _mm256_set1_ps((chroma ? 256 : 255) << (src_bits - 8));
+    } else {
+        v_low = _mm256_set1_ps((chroma ? 128 : 16) << (src_bits - 8));
+        v_high = _mm256_set1_ps((chroma ? 224 : 219) << (src_bits - 8));
     }
     
     for (int y = 0; y < src_h; y++) {
@@ -266,11 +266,11 @@ static void bitdepth_float_to_uint8(
     
     __m256 v_low, v_high;
     if (range) {
-        v_low = _mm256_set1_ps(chroma ? 128.0F : 16.0F);
-        v_high = _mm256_set1_ps(chroma ? 224.0F : 219.0F);
-    } else {
         v_low = _mm256_set1_ps(chroma ? 128.0F : 0.0F);
         v_high = _mm256_set1_ps(chroma ? 256.0F : 255.0F);
+    } else {
+        v_low = _mm256_set1_ps(chroma ? 128.0F : 16.0F);
+        v_high = _mm256_set1_ps(chroma ? 224.0F : 219.0F);
     }
     
     for (int y = 0; y < src_h; y++) {
@@ -307,11 +307,11 @@ static void bitdepth_float_to_uint16(
     __m256i v_max = _mm256_set1_epi32((1 << dst_bits) - 1);
     __m256 v_low, v_high;
     if (range) {
-        v_low = _mm256_set1_ps((chroma ? 128 : 16) << (dst_bits - 8));
-        v_high = _mm256_set1_ps((chroma ? 224 : 219) << (dst_bits - 8));
-    } else {
         v_low = _mm256_set1_ps(chroma ? (128 << (dst_bits - 8)) : 0);
         v_high = _mm256_set1_ps((chroma ? 256 : 255) << (dst_bits - 8));
+    } else {
+        v_low = _mm256_set1_ps((chroma ? 128 : 16) << (dst_bits - 8));
+        v_high = _mm256_set1_ps((chroma ? 224 : 219) << (dst_bits - 8));
     }
     
     for (int y = 0; y < src_h; y++) {
@@ -373,7 +373,7 @@ static const VSFrame* VS_CC BitDepthGetFrame(
             int src_h = vsapi->getFrameHeight(src, plane);
             bool chroma = plane && (fi->colorFamily == cfYUV);
             
-            d->bitdepth(srcp, dstp, src_stride, dst_stride, src_w, src_h, fi->bitsPerSample, d->vi.format.bitsPerSample, !range, chroma);
+            d->bitdepth(srcp, dstp, src_stride, dst_stride, src_w, src_h, fi->bitsPerSample, d->vi.format.bitsPerSample, range, chroma);
         }
         vsapi->freeFrame(src);
         return dst;
@@ -2010,11 +2010,11 @@ static void resize_width_single_8(
     
     __m256 v_low, v_high;
     if (range) {
-        v_low = _mm256_set1_ps(chroma ? 128.0F : 16.0F);
-        v_high = _mm256_set1_ps(chroma ? 224.0F : 219.0F);
-    } else {
         v_low = _mm256_set1_ps(chroma ? 128.0F : 0.0F);
         v_high = _mm256_set1_ps(chroma ? 256.0F : 255.0F);
+    } else {
+        v_low = _mm256_set1_ps(chroma ? 128.0F : 16.0F);
+        v_high = _mm256_set1_ps(chroma ? 224.0F : 219.0F);
     }
     
     for (int y = 0; y < mod4_h; y += 4) {
@@ -2072,11 +2072,11 @@ static void resize_width_half_8(
     
     __m256 v_low, v_high;
     if (range) {
-        v_low = _mm256_set1_ps(chroma ? 128.0F : 16.0F);
-        v_high = _mm256_set1_ps(chroma ? 224.0F : 219.0F);
-    } else {
         v_low = _mm256_set1_ps(chroma ? 128.0F : 0.0F);
         v_high = _mm256_set1_ps(chroma ? 256.0F : 255.0F);
+    } else {
+        v_low = _mm256_set1_ps(chroma ? 128.0F : 16.0F);
+        v_high = _mm256_set1_ps(chroma ? 224.0F : 219.0F);
     }
     
     for (int y = 0; y < mod4_h; y += 4) {
@@ -2138,11 +2138,11 @@ static void resize_width_single_16(
     __m256i v_max = _mm256_set1_epi32((1 << bits) - 1);
     __m256 v_low, v_high;
     if (range) {
-        v_low = _mm256_set1_ps((chroma ? 128 : 16) << (bits - 8));
-        v_high = _mm256_set1_ps((chroma ? 224 : 219) << (bits - 8));
-    } else {
         v_low = _mm256_set1_ps(chroma ? (128 << (bits - 8)) : 0);
         v_high = _mm256_set1_ps((chroma ? 256 : 255) << (bits - 8));
+    } else {
+        v_low = _mm256_set1_ps((chroma ? 128 : 16) << (bits - 8));
+        v_high = _mm256_set1_ps((chroma ? 224 : 219) << (bits - 8));
     }
     
     for (int y = 0; y < mod4_h; y += 4) {
@@ -2200,11 +2200,11 @@ static void resize_width_half_16(
     
     __m256 v_low, v_high;
     if (range) {
-        v_low = _mm256_set1_ps((chroma ? 128 : 16) << (bits - 8));
-        v_high = _mm256_set1_ps((chroma ? 224 : 219) << (bits - 8));
-    } else {
         v_low = _mm256_set1_ps(chroma ? (128 << (bits - 8)) : 0);
         v_high = _mm256_set1_ps((chroma ? 256 : 255) << (bits - 8));
+    } else {
+        v_low = _mm256_set1_ps((chroma ? 128 : 16) << (bits - 8));
+        v_high = _mm256_set1_ps((chroma ? 224 : 219) << (bits - 8));
     }
     
     for (int y = 0; y < mod4_h; y += 4) {
@@ -2386,11 +2386,11 @@ static void resize_height_single_8(
     
     __m256 v_low, v_high;
     if (range) {
-        v_low = _mm256_set1_ps(chroma ? 128.0F : 16.0F);
-        v_high = _mm256_set1_ps(chroma ? 224.0F : 219.0F);
-    } else {
         v_low = _mm256_set1_ps(chroma ? 128.0F : 0.0F);
         v_high = _mm256_set1_ps(chroma ? 256.0F : 255.0F);
+    } else {
+        v_low = _mm256_set1_ps(chroma ? 128.0F : 16.0F);
+        v_high = _mm256_set1_ps(chroma ? 224.0F : 219.0F);
     }
     
     resize_height_single_pre_8(srcp, bufp, src_stride, buf_stride, src_w, src_h, v_low, v_high, transfer_lo);
@@ -2427,11 +2427,11 @@ static void resize_height_half_8(
     
     __m256 v_low, v_high;
     if (range) {
-        v_low = _mm256_set1_ps(chroma ? 128.0F : 16.0F);
-        v_high = _mm256_set1_ps(chroma ? 224.0F : 219.0F);
-    } else {
         v_low = _mm256_set1_ps(chroma ? 128.0F : 0.0F);
         v_high = _mm256_set1_ps(chroma ? 256.0F : 255.0F);
+    } else {
+        v_low = _mm256_set1_ps(chroma ? 128.0F : 16.0F);
+        v_high = _mm256_set1_ps(chroma ? 224.0F : 219.0F);
     }
     
     for (int y = 0; y < dst_h; y++) {
@@ -2490,11 +2490,11 @@ static void resize_height_single_16(
     __m256i v_max = _mm256_set1_epi32((1 << bits) - 1);
     __m256 v_low, v_high;
     if (range) {
-        v_low = _mm256_set1_ps((chroma ? 128 : 16) << (bits - 8));
-        v_high = _mm256_set1_ps((chroma ? 224 : 219) << (bits - 8));
-    } else {
         v_low = _mm256_set1_ps(chroma ? (128 << (bits - 8)) : 0);
         v_high = _mm256_set1_ps((chroma ? 256 : 255) << (bits - 8));
+    } else {
+        v_low = _mm256_set1_ps((chroma ? 128 : 16) << (bits - 8));
+        v_high = _mm256_set1_ps((chroma ? 224 : 219) << (bits - 8));
     }
     
     resize_height_single_pre_16(srcp, bufp, src_stride, buf_stride, src_w, src_h, v_low, v_high, transfer_lo);
@@ -2532,11 +2532,11 @@ static void resize_height_half_16(
     __m256i v_max = _mm256_set1_epi32((1 << bits) - 1);
     __m256 v_low, v_high;
     if (range) {
-        v_low = _mm256_set1_ps((chroma ? 128 : 16) << (bits - 8));
-        v_high = _mm256_set1_ps((chroma ? 224 : 219) << (bits - 8));
-    } else {
         v_low = _mm256_set1_ps(chroma ? (128 << (bits - 8)) : 0);
         v_high = _mm256_set1_ps((chroma ? 256 : 255) << (bits - 8));
+    } else {
+        v_low = _mm256_set1_ps((chroma ? 128 : 16) << (bits - 8));
+        v_high = _mm256_set1_ps((chroma ? 224 : 219) << (bits - 8));
     }
     
     for (int y = 0; y < dst_h; y++) {
@@ -2805,21 +2805,21 @@ static const VSFrame* VS_CC ResizeGetFrame(
                     ptrdiff_t tmp_stride = vsapi->getStride(tmp, plane) / sizeof(float);
                     d->resize_width(
                         srcp, tmpp, src_stride, tmp_stride, src_w, src_h, dst_w, sub_w ? chroma_w : d->luma_w,
-                        fi->bitsPerSample, !range, chroma, transfer_lo, transfer_hi
+                        fi->bitsPerSample, range, chroma, transfer_lo, transfer_hi
                     );
                     d->resize_height(
                         tmpp, dstp, tmp_stride, dst_stride, dst_w, src_h, dst_h, sub_h ? chroma_h : d->luma_h,
-                        fi->bitsPerSample, !range, chroma, transfer_lo, transfer_hi
+                        fi->bitsPerSample, range, chroma, transfer_lo, transfer_hi
                     );
                 } else if (d->process_w) {
                     d->resize_width(
                         srcp, dstp, src_stride, dst_stride, src_w, src_h, dst_w, sub_w ? chroma_w : d->luma_w,
-                        fi->bitsPerSample, !range, chroma, transfer_lo, transfer_hi
+                        fi->bitsPerSample, range, chroma, transfer_lo, transfer_hi
                     );
                 } else if (d->process_h) {
                     d->resize_height(
                         srcp, dstp, src_stride, dst_stride, dst_w, src_h, dst_h, sub_h ? chroma_h : d->luma_h,
-                        fi->bitsPerSample, !range, chroma, transfer_lo, transfer_hi
+                        fi->bitsPerSample, range, chroma, transfer_lo, transfer_hi
                     );
                 } else {
                     plane_copy(srcp, dstp, (size_t)fi->bytesPerSample * src_stride * src_h);
@@ -6236,7 +6236,7 @@ static void VS_CC MeanCreate(
         return;
     }
     
-    d->norm = !!vsapi->mapGetIntSaturated(in, "norm", 0, &err);
+    d->norm = vsapi->mapGetIntSaturated(in, "norm", 0, &err);
     if (err) {
         d->norm = true;
     }
@@ -10150,7 +10150,7 @@ static void VS_CC UnsharpMaskCreate(
         return;
     }
     
-    d->rounding = !!vsapi->mapGetIntSaturated(in, "rounding", 0, &err);
+    d->rounding = vsapi->mapGetIntSaturated(in, "rounding", 0, &err);
     if (err) {
         d->rounding = false;
     }
@@ -33255,7 +33255,7 @@ static void VS_CC ConvolutionCreate(
         }
         
         int err;
-        d->sat = !!vsapi->mapGetIntSaturated(in, "saturate", 0, &err);
+        d->sat = vsapi->mapGetIntSaturated(in, "saturate", 0, &err);
         if (err) {
             d->sat = true;
         }
