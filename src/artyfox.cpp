@@ -1354,7 +1354,6 @@ struct ResizeData {
     kernel_t kernel_w, kernel_h;
     transfer_func transfer_lo, transfer_hi;
     csr_weights_func csr_weights;
-    bool process_w, process_h;
     csr_t luma_w, luma_h;
     resize_func resize_width, resize_height;
 };
@@ -2020,6 +2019,149 @@ static void transpose_square_from_buf_with_tail_ps(
     }
 }
 
+static void resize_dot_product_x4_ps(
+    const float* VS_RESTRICT srcp, float* VS_RESTRICT dstp, const csr_t& weights
+) noexcept {
+    for (int i = 0; i < weights.row_n; i++) {
+        __m256d v_acc = _mm256_setzero_pd();
+        for (int j = weights.row_ptr[i]; j < weights.row_ptr[i + 1]; j++) {
+            __m256d pix = _mm256_cvtps_pd(_mm_load_ps(srcp + weights.col_idx[j] * 4));
+            __m256d v_weights = _mm256_set1_pd(weights.values[j]);
+            v_acc = _mm256_fmadd_pd(pix, v_weights, v_acc);
+        }
+        _mm_store_ps(dstp + i * 4, _mm256_cvtpd_ps(v_acc));
+    }
+}
+
+static void resize_width_half_8(
+    const void* VS_RESTRICT ptrs, void* VS_RESTRICT ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
+    int src_w, int src_h, int dst_w, const csr_t& weights, int bits UNUSED, bool range, bool chroma,
+    transfer_func transfer_lo, transfer_func transfer_hi UNUSED
+) {
+    const uint8_t* srcp = (const uint8_t*)ptrs;
+    float* dstp = (float*)ptrd;
+    float* VS_RESTRICT src_buf = (float*)_mm_malloc(sizeof(float) * src_stride * 4, 64);
+    float* VS_RESTRICT dst_buf = (float*)_mm_malloc(sizeof(float) * dst_stride * 4, 64);
+    if (!src_buf || !dst_buf) {
+        _mm_free(src_buf);
+        _mm_free(dst_buf);
+        throw std::bad_alloc();
+    }
+    
+    if (chroma) transfer_lo = nullptr;
+    
+    int tail = src_h % 4;
+    int mod4_h = src_h - tail;
+    
+    __m256 v_low, v_high;
+    if (range) {
+        v_low = _mm256_set1_ps(chroma ? 128.0F : 0.0F);
+        v_high = _mm256_set1_ps(chroma ? 256.0F : 255.0F);
+    } else {
+        v_low = _mm256_set1_ps(chroma ? 128.0F : 16.0F);
+        v_high = _mm256_set1_ps(chroma ? 224.0F : 219.0F);
+    }
+    
+    for (int y = 0; y < mod4_h; y += 4) {
+        transpose_block_transfer_into_buf_epu8_ps(srcp, src_buf, src_stride, src_w, v_low, v_high, transfer_lo);
+        resize_dot_product_x4_ps(src_buf, dst_buf, weights);
+        transpose_block_from_buf_ps(dst_buf, dstp, dst_stride, dst_w);
+        srcp += src_stride * 4;
+        dstp += dst_stride * 4;
+    }
+    if (tail) {
+        transpose_block_transfer_into_buf_with_tail_epu8_ps(srcp, src_buf, src_stride, src_w, tail, v_low, v_high, transfer_lo);
+        resize_dot_product_x4_ps(src_buf, dst_buf, weights);
+        transpose_block_from_buf_with_tail_ps(dst_buf, dstp, dst_stride, dst_w, tail);
+    }
+    _mm_sfence();
+    _mm_free(dst_buf);
+    _mm_free(src_buf);
+}
+
+static void resize_width_half_16(
+    const void* VS_RESTRICT ptrs, void* VS_RESTRICT ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
+    int src_w, int src_h, int dst_w, const csr_t& weights, int bits, bool range, bool chroma,
+    transfer_func transfer_lo, transfer_func transfer_hi UNUSED
+) {
+    const uint16_t* srcp = (const uint16_t*)ptrs;
+    float* dstp = (float*)ptrd;
+    float* VS_RESTRICT src_buf = (float*)_mm_malloc(sizeof(float) * src_stride * 4, 64);
+    float* VS_RESTRICT dst_buf = (float*)_mm_malloc(sizeof(float) * dst_stride * 4, 64);
+    if (!src_buf || !dst_buf) {
+        _mm_free(src_buf);
+        _mm_free(dst_buf);
+        throw std::bad_alloc();
+    }
+    
+    if (chroma) transfer_lo = nullptr;
+    
+    int tail = src_h % 4;
+    int mod4_h = src_h - tail;
+    
+    __m256 v_low, v_high;
+    if (range) {
+        v_low = _mm256_set1_ps(chroma ? (128 << (bits - 8)) : 0);
+        v_high = _mm256_set1_ps((chroma ? 256 : 255) << (bits - 8));
+    } else {
+        v_low = _mm256_set1_ps((chroma ? 128 : 16) << (bits - 8));
+        v_high = _mm256_set1_ps((chroma ? 224 : 219) << (bits - 8));
+    }
+    
+    for (int y = 0; y < mod4_h; y += 4) {
+        transpose_block_transfer_into_buf_epu16_ps(srcp, src_buf, src_stride, src_w, v_low, v_high, transfer_lo);
+        resize_dot_product_x4_ps(src_buf, dst_buf, weights);
+        transpose_block_from_buf_ps(dst_buf, dstp, dst_stride, dst_w);
+        srcp += src_stride * 4;
+        dstp += dst_stride * 4;
+    }
+    if (tail) {
+        transpose_block_transfer_into_buf_with_tail_epu16_ps(srcp, src_buf, src_stride, src_w, tail, v_low, v_high, transfer_lo);
+        resize_dot_product_x4_ps(src_buf, dst_buf, weights);
+        transpose_block_from_buf_with_tail_ps(dst_buf, dstp, dst_stride, dst_w, tail);
+    }
+    _mm_sfence();
+    _mm_free(dst_buf);
+    _mm_free(src_buf);
+}
+
+static void resize_width_half_32(
+    const void* VS_RESTRICT ptrs, void* VS_RESTRICT ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
+    int src_w, int src_h, int dst_w, const csr_t& weights, int bits UNUSED, bool range UNUSED, bool chroma,
+    transfer_func transfer_lo, transfer_func transfer_hi UNUSED
+) {
+    const float* srcp = (const float*)ptrs;
+    float* dstp = (float*)ptrd;
+    float* VS_RESTRICT src_buf = (float*)_mm_malloc(sizeof(float) * src_stride * 4, 64);
+    float* VS_RESTRICT dst_buf = (float*)_mm_malloc(sizeof(float) * dst_stride * 4, 64);
+    if (!src_buf || !dst_buf) {
+        _mm_free(src_buf);
+        _mm_free(dst_buf);
+        throw std::bad_alloc();
+    }
+    
+    if (chroma) transfer_lo = nullptr;
+    
+    int tail = src_h % 4;
+    int mod4_h = src_h - tail;
+    
+    for (int y = 0; y < mod4_h; y += 4) {
+        transpose_block_transfer_into_buf_ps(srcp, src_buf, src_stride, src_w, transfer_lo);
+        resize_dot_product_x4_ps(src_buf, dst_buf, weights);
+        transpose_block_from_buf_ps(dst_buf, dstp, dst_stride, dst_w);
+        srcp += src_stride * 4;
+        dstp += dst_stride * 4;
+    }
+    if (tail) {
+        transpose_block_transfer_into_buf_with_tail_ps(srcp, src_buf, src_stride, src_w, tail, transfer_lo);
+        resize_dot_product_x4_ps(src_buf, dst_buf, weights);
+        transpose_block_from_buf_with_tail_ps(dst_buf, dstp, dst_stride, dst_w, tail);
+    }
+    _mm_sfence();
+    _mm_free(dst_buf);
+    _mm_free(src_buf);
+}
+
 static void resize_width_single_8(
     const void* VS_RESTRICT ptrs, void* VS_RESTRICT ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
     int src_w, int src_h, int dst_w, const csr_t& weights, int bits UNUSED, bool range, bool chroma,
@@ -2054,93 +2196,15 @@ static void resize_width_single_8(
     
     for (int y = 0; y < mod4_h; y += 4) {
         transpose_block_transfer_into_buf_epu8_ps(srcp, src_buf, src_stride, src_w, v_low, v_high, transfer_lo);
-        for (int x = 0; x < dst_w; x++) {
-            __m256d v_acc = _mm256_setzero_pd();
-            for (int i = weights.row_ptr[x]; i < weights.row_ptr[x + 1]; i++) {
-                __m128 pix = _mm_load_ps(src_buf + weights.col_idx[i] * 4);
-                __m256d v_weights = _mm256_set1_pd(weights.values[i]);
-                v_acc = _mm256_fmadd_pd(_mm256_cvtps_pd(pix), v_weights, v_acc);
-            }
-            _mm_store_ps(dst_buf + x * 4, _mm256_cvtpd_ps(v_acc));
-        }
+        resize_dot_product_x4_ps(src_buf, dst_buf, weights);
         transpose_block_transfer_from_buf_ps_epu8(dst_buf, dstp, dst_stride, dst_w, v_low, v_high, transfer_hi);
         srcp += src_stride * 4;
         dstp += dst_stride * 4;
     }
     if (tail) {
         transpose_block_transfer_into_buf_with_tail_epu8_ps(srcp, src_buf, src_stride, src_w, tail, v_low, v_high, transfer_lo);
-        for (int x = 0; x < dst_w; x++) {
-            __m256d v_acc = _mm256_setzero_pd();
-            for (int i = weights.row_ptr[x]; i < weights.row_ptr[x + 1]; i++) {
-                __m128 pix = _mm_load_ps(src_buf + weights.col_idx[i] * 4);
-                __m256d v_weights = _mm256_set1_pd(weights.values[i]);
-                v_acc = _mm256_fmadd_pd(_mm256_cvtps_pd(pix), v_weights, v_acc);
-            }
-            _mm_store_ps(dst_buf + x * 4, _mm256_cvtpd_ps(v_acc));
-        }
+        resize_dot_product_x4_ps(src_buf, dst_buf, weights);
         transpose_block_transfer_from_buf_with_tail_ps_epu8(dst_buf, dstp, dst_stride, dst_w, tail, v_low, v_high, transfer_hi);
-    }
-    _mm_sfence();
-    _mm_free(dst_buf);
-    _mm_free(src_buf);
-}
-
-static void resize_width_half_8(
-    const void* VS_RESTRICT ptrs, void* VS_RESTRICT ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, int dst_w, const csr_t& weights, int bits UNUSED, bool range, bool chroma,
-    transfer_func transfer_lo, transfer_func transfer_hi UNUSED
-) {
-    const uint8_t* srcp = (const uint8_t*)ptrs;
-    float* dstp = (float*)ptrd;
-    float* VS_RESTRICT src_buf = (float*)_mm_malloc(sizeof(float) * src_stride * 4, 64);
-    float* VS_RESTRICT dst_buf = (float*)_mm_malloc(sizeof(float) * dst_stride * 4, 64);
-    if (!src_buf || !dst_buf) {
-        _mm_free(src_buf);
-        _mm_free(dst_buf);
-        throw std::bad_alloc();
-    }
-    
-    if (chroma) transfer_lo = nullptr;
-    
-    int tail = src_h % 4;
-    int mod4_h = src_h - tail;
-    
-    __m256 v_low, v_high;
-    if (range) {
-        v_low = _mm256_set1_ps(chroma ? 128.0F : 0.0F);
-        v_high = _mm256_set1_ps(chroma ? 256.0F : 255.0F);
-    } else {
-        v_low = _mm256_set1_ps(chroma ? 128.0F : 16.0F);
-        v_high = _mm256_set1_ps(chroma ? 224.0F : 219.0F);
-    }
-    
-    for (int y = 0; y < mod4_h; y += 4) {
-        transpose_block_transfer_into_buf_epu8_ps(srcp, src_buf, src_stride, src_w, v_low, v_high, transfer_lo);
-        for (int x = 0; x < dst_w; x++) {
-            __m256d v_acc = _mm256_setzero_pd();
-            for (int i = weights.row_ptr[x]; i < weights.row_ptr[x + 1]; i++) {
-                __m128 pix = _mm_load_ps(src_buf + weights.col_idx[i] * 4);
-                __m256d v_weights = _mm256_set1_pd(weights.values[i]);
-                v_acc = _mm256_fmadd_pd(_mm256_cvtps_pd(pix), v_weights, v_acc);
-            }
-            _mm_store_ps(dst_buf + x * 4, _mm256_cvtpd_ps(v_acc));
-        }
-        transpose_block_from_buf_ps(dst_buf, dstp, dst_stride, dst_w);
-        srcp += src_stride * 4;
-        dstp += dst_stride * 4;
-    }
-    if (tail) {
-        transpose_block_transfer_into_buf_with_tail_epu8_ps(srcp, src_buf, src_stride, src_w, tail, v_low, v_high, transfer_lo);
-        for (int x = 0; x < dst_w; x++) {
-            __m256d v_acc = _mm256_setzero_pd();
-            for (int i = weights.row_ptr[x]; i < weights.row_ptr[x + 1]; i++) {
-                __m128 pix = _mm_load_ps(src_buf + weights.col_idx[i] * 4);
-                __m256d v_weights = _mm256_set1_pd(weights.values[i]);
-                v_acc = _mm256_fmadd_pd(_mm256_cvtps_pd(pix), v_weights, v_acc);
-            }
-            _mm_store_ps(dst_buf + x * 4, _mm256_cvtpd_ps(v_acc));
-        }
-        transpose_block_from_buf_with_tail_ps(dst_buf, dstp, dst_stride, dst_w, tail);
     }
     _mm_sfence();
     _mm_free(dst_buf);
@@ -2182,93 +2246,15 @@ static void resize_width_single_16(
     
     for (int y = 0; y < mod4_h; y += 4) {
         transpose_block_transfer_into_buf_epu16_ps(srcp, src_buf, src_stride, src_w, v_low, v_high, transfer_lo);
-        for (int x = 0; x < dst_w; x++) {
-            __m256d v_acc = _mm256_setzero_pd();
-            for (int i = weights.row_ptr[x]; i < weights.row_ptr[x + 1]; i++) {
-                __m128 pix = _mm_load_ps(src_buf + weights.col_idx[i] * 4);
-                __m256d v_weights = _mm256_set1_pd(weights.values[i]);
-                v_acc = _mm256_fmadd_pd(_mm256_cvtps_pd(pix), v_weights, v_acc);
-            }
-            _mm_store_ps(dst_buf + x * 4, _mm256_cvtpd_ps(v_acc));
-        }
+        resize_dot_product_x4_ps(src_buf, dst_buf, weights);
         transpose_block_transfer_from_buf_ps_epu16(dst_buf, dstp, dst_stride, dst_w, v_low, v_high, v_max, transfer_hi);
         srcp += src_stride * 4;
         dstp += dst_stride * 4;
     }
     if (tail) {
         transpose_block_transfer_into_buf_with_tail_epu16_ps(srcp, src_buf, src_stride, src_w, tail, v_low, v_high, transfer_lo);
-        for (int x = 0; x < dst_w; x++) {
-            __m256d v_acc = _mm256_setzero_pd();
-            for (int i = weights.row_ptr[x]; i < weights.row_ptr[x + 1]; i++) {
-                __m128 pix = _mm_load_ps(src_buf + weights.col_idx[i] * 4);
-                __m256d v_weights = _mm256_set1_pd(weights.values[i]);
-                v_acc = _mm256_fmadd_pd(_mm256_cvtps_pd(pix), v_weights, v_acc);
-            }
-            _mm_store_ps(dst_buf + x * 4, _mm256_cvtpd_ps(v_acc));
-        }
+        resize_dot_product_x4_ps(src_buf, dst_buf, weights);
         transpose_block_transfer_from_buf_with_tail_ps_epu16(dst_buf, dstp, dst_stride, dst_w, tail, v_low, v_high, v_max, transfer_hi);
-    }
-    _mm_sfence();
-    _mm_free(dst_buf);
-    _mm_free(src_buf);
-}
-
-static void resize_width_half_16(
-    const void* VS_RESTRICT ptrs, void* VS_RESTRICT ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, int dst_w, const csr_t& weights, int bits, bool range, bool chroma,
-    transfer_func transfer_lo, transfer_func transfer_hi UNUSED
-) {
-    const uint16_t* srcp = (const uint16_t*)ptrs;
-    float* dstp = (float*)ptrd;
-    float* VS_RESTRICT src_buf = (float*)_mm_malloc(sizeof(float) * src_stride * 4, 64);
-    float* VS_RESTRICT dst_buf = (float*)_mm_malloc(sizeof(float) * dst_stride * 4, 64);
-    if (!src_buf || !dst_buf) {
-        _mm_free(src_buf);
-        _mm_free(dst_buf);
-        throw std::bad_alloc();
-    }
-    
-    if (chroma) transfer_lo = nullptr;
-    
-    int tail = src_h % 4;
-    int mod4_h = src_h - tail;
-    
-    __m256 v_low, v_high;
-    if (range) {
-        v_low = _mm256_set1_ps(chroma ? (128 << (bits - 8)) : 0);
-        v_high = _mm256_set1_ps((chroma ? 256 : 255) << (bits - 8));
-    } else {
-        v_low = _mm256_set1_ps((chroma ? 128 : 16) << (bits - 8));
-        v_high = _mm256_set1_ps((chroma ? 224 : 219) << (bits - 8));
-    }
-    
-    for (int y = 0; y < mod4_h; y += 4) {
-        transpose_block_transfer_into_buf_epu16_ps(srcp, src_buf, src_stride, src_w, v_low, v_high, transfer_lo);
-        for (int x = 0; x < dst_w; x++) {
-            __m256d v_acc = _mm256_setzero_pd();
-            for (int i = weights.row_ptr[x]; i < weights.row_ptr[x + 1]; i++) {
-                __m128 pix = _mm_load_ps(src_buf + weights.col_idx[i] * 4);
-                __m256d v_weights = _mm256_set1_pd(weights.values[i]);
-                v_acc = _mm256_fmadd_pd(_mm256_cvtps_pd(pix), v_weights, v_acc);
-            }
-            _mm_store_ps(dst_buf + x * 4, _mm256_cvtpd_ps(v_acc));
-        }
-        transpose_block_from_buf_ps(dst_buf, dstp, dst_stride, dst_w);
-        srcp += src_stride * 4;
-        dstp += dst_stride * 4;
-    }
-    if (tail) {
-        transpose_block_transfer_into_buf_with_tail_epu16_ps(srcp, src_buf, src_stride, src_w, tail, v_low, v_high, transfer_lo);
-        for (int x = 0; x < dst_w; x++) {
-            __m256d v_acc = _mm256_setzero_pd();
-            for (int i = weights.row_ptr[x]; i < weights.row_ptr[x + 1]; i++) {
-                __m128 pix = _mm_load_ps(src_buf + weights.col_idx[i] * 4);
-                __m256d v_weights = _mm256_set1_pd(weights.values[i]);
-                v_acc = _mm256_fmadd_pd(_mm256_cvtps_pd(pix), v_weights, v_acc);
-            }
-            _mm_store_ps(dst_buf + x * 4, _mm256_cvtpd_ps(v_acc));
-        }
-        transpose_block_from_buf_with_tail_ps(dst_buf, dstp, dst_stride, dst_w, tail);
     }
     _mm_sfence();
     _mm_free(dst_buf);
@@ -2300,154 +2286,19 @@ static void resize_width_single_32(
     
     for (int y = 0; y < mod4_h; y += 4) {
         transpose_block_transfer_into_buf_ps(srcp, src_buf, src_stride, src_w, transfer_lo);
-        for (int x = 0; x < dst_w; x++) {
-            __m256d v_acc = _mm256_setzero_pd();
-            for (int i = weights.row_ptr[x]; i < weights.row_ptr[x + 1]; i++) {
-                __m128 pix = _mm_load_ps(src_buf + weights.col_idx[i] * 4);
-                __m256d v_weights = _mm256_set1_pd(weights.values[i]);
-                v_acc = _mm256_fmadd_pd(_mm256_cvtps_pd(pix), v_weights, v_acc);
-            }
-            _mm_store_ps(dst_buf + x * 4, _mm256_cvtpd_ps(v_acc));
-        }
+        resize_dot_product_x4_ps(src_buf, dst_buf, weights);
         transpose_block_transfer_from_buf_ps(dst_buf, dstp, dst_stride, dst_w, transfer_hi);
         srcp += src_stride * 4;
         dstp += dst_stride * 4;
     }
     if (tail) {
         transpose_block_transfer_into_buf_with_tail_ps(srcp, src_buf, src_stride, src_w, tail, transfer_lo);
-        for (int x = 0; x < dst_w; x++) {
-            __m256d v_acc = _mm256_setzero_pd();
-            for (int i = weights.row_ptr[x]; i < weights.row_ptr[x + 1]; i++) {
-                __m128 pix = _mm_load_ps(src_buf + weights.col_idx[i] * 4);
-                __m256d v_weights = _mm256_set1_pd(weights.values[i]);
-                v_acc = _mm256_fmadd_pd(_mm256_cvtps_pd(pix), v_weights, v_acc);
-            }
-            _mm_store_ps(dst_buf + x * 4, _mm256_cvtpd_ps(v_acc));
-        }
+        resize_dot_product_x4_ps(src_buf, dst_buf, weights);
         transpose_block_transfer_from_buf_with_tail_ps(dst_buf, dstp, dst_stride, dst_w, tail, transfer_hi);
     }
     _mm_sfence();
     _mm_free(dst_buf);
     _mm_free(src_buf);
-}
-
-static void resize_width_half_32(
-    const void* VS_RESTRICT ptrs, void* VS_RESTRICT ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, int dst_w, const csr_t& weights, int bits UNUSED, bool range UNUSED, bool chroma,
-    transfer_func transfer_lo, transfer_func transfer_hi UNUSED
-) {
-    const float* srcp = (const float*)ptrs;
-    float* dstp = (float*)ptrd;
-    float* VS_RESTRICT src_buf = (float*)_mm_malloc(sizeof(float) * src_stride * 4, 64);
-    float* VS_RESTRICT dst_buf = (float*)_mm_malloc(sizeof(float) * dst_stride * 4, 64);
-    if (!src_buf || !dst_buf) {
-        _mm_free(src_buf);
-        _mm_free(dst_buf);
-        throw std::bad_alloc();
-    }
-    
-    if (chroma) transfer_lo = nullptr;
-    
-    int tail = src_h % 4;
-    int mod4_h = src_h - tail;
-    
-    for (int y = 0; y < mod4_h; y += 4) {
-        transpose_block_transfer_into_buf_ps(srcp, src_buf, src_stride, src_w, transfer_lo);
-        for (int x = 0; x < dst_w; x++) {
-            __m256d v_acc = _mm256_setzero_pd();
-            for (int i = weights.row_ptr[x]; i < weights.row_ptr[x + 1]; i++) {
-                __m128 pix = _mm_load_ps(src_buf + weights.col_idx[i] * 4);
-                __m256d v_weights = _mm256_set1_pd(weights.values[i]);
-                v_acc = _mm256_fmadd_pd(_mm256_cvtps_pd(pix), v_weights, v_acc);
-            }
-            _mm_store_ps(dst_buf + x * 4, _mm256_cvtpd_ps(v_acc));
-        }
-        transpose_block_from_buf_ps(dst_buf, dstp, dst_stride, dst_w);
-        srcp += src_stride * 4;
-        dstp += dst_stride * 4;
-    }
-    if (tail) {
-        transpose_block_transfer_into_buf_with_tail_ps(srcp, src_buf, src_stride, src_w, tail, transfer_lo);
-        for (int x = 0; x < dst_w; x++) {
-            __m256d v_acc = _mm256_setzero_pd();
-            for (int i = weights.row_ptr[x]; i < weights.row_ptr[x + 1]; i++) {
-                __m128 pix = _mm_load_ps(src_buf + weights.col_idx[i] * 4);
-                __m256d v_weights = _mm256_set1_pd(weights.values[i]);
-                v_acc = _mm256_fmadd_pd(_mm256_cvtps_pd(pix), v_weights, v_acc);
-            }
-            _mm_store_ps(dst_buf + x * 4, _mm256_cvtpd_ps(v_acc));
-        }
-        transpose_block_from_buf_with_tail_ps(dst_buf, dstp, dst_stride, dst_w, tail);
-    }
-    _mm_sfence();
-    _mm_free(dst_buf);
-    _mm_free(src_buf);
-}
-
-static void resize_height_single_pre_8(
-    const uint8_t* VS_RESTRICT srcp, float* VS_RESTRICT dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, __m256 v_low, __m256 v_high, transfer_func transfer_lo
-) noexcept {
-    
-    for (int y = 0; y < src_h; y++) {
-        for (int x = 0; x < src_w; x += 8) {
-            __m128i pix = _mm_loadl_epi64((const __m128i*)(srcp + x));
-            __m256 res = simd_bitdepth_epu8_ps(pix, v_low, v_high);
-            if (transfer_lo) res = transfer_lo(res);
-            _mm256_stream_ps(dstp + x, res);
-        }
-        srcp += src_stride;
-        dstp += dst_stride;
-    }
-    _mm_sfence();
-}
-
-static void resize_height_single_8(
-    const void* VS_RESTRICT ptrs, void* VS_RESTRICT ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, int dst_h, const csr_t& weights, int bits UNUSED, bool range, bool chroma,
-    transfer_func transfer_lo, transfer_func transfer_hi
-) {
-    const uint8_t* srcp = (const uint8_t*)ptrs;
-    uint8_t* dstp = (uint8_t*)ptrd;
-    
-    ptrdiff_t buf_stride = (src_w + 7) & 0xFFFFFFF8;
-    float* VS_RESTRICT bufp = (float*)_mm_malloc(sizeof(float) * buf_stride * src_h, 64);
-    if (!bufp) throw std::bad_alloc();
-    
-    if (chroma) {
-        transfer_lo = nullptr;
-        transfer_hi = nullptr;
-    }
-    
-    __m256 v_low, v_high;
-    if (range) {
-        v_low = _mm256_set1_ps(chroma ? 128.0F : 0.0F);
-        v_high = _mm256_set1_ps(chroma ? 256.0F : 255.0F);
-    } else {
-        v_low = _mm256_set1_ps(chroma ? 128.0F : 16.0F);
-        v_high = _mm256_set1_ps(chroma ? 224.0F : 219.0F);
-    }
-    
-    resize_height_single_pre_8(srcp, bufp, src_stride, buf_stride, src_w, src_h, v_low, v_high, transfer_lo);
-    
-    for (int y = 0; y < dst_h; y++) {
-        for (int x = 0; x < src_w; x += 8) {
-            __m256d v_acc_0 = _mm256_setzero_pd();
-            __m256d v_acc_1 = _mm256_setzero_pd();
-            for (int i = weights.row_ptr[y]; i < weights.row_ptr[y + 1]; i++) {
-                __m256 pix = _mm256_load_ps(bufp + weights.col_idx[i] * buf_stride + x);
-                __m256d v_weights = _mm256_set1_pd(weights.values[i]);
-                v_acc_0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), v_weights, v_acc_0);
-                v_acc_1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), v_weights, v_acc_1);
-            }
-            __m256 res = _mm256_setr_m128(_mm256_cvtpd_ps(v_acc_0), _mm256_cvtpd_ps(v_acc_1));
-            if (transfer_hi) res = transfer_hi(res);
-            _mm_stream_si64((__int64*)(dstp + x), _mm_cvtsi128_si64(simd_bitdepth_ps_epu8(res, v_high, v_low)));
-        }
-        dstp += dst_stride;
-    }
-    _mm_sfence();
-    _mm_free(bufp);
 }
 
 static void resize_height_half_8(
@@ -2457,8 +2308,14 @@ static void resize_height_half_8(
 ) noexcept {
     const float* srcp = (const float*)ptrs;
     uint8_t* dstp = (uint8_t*)ptrd;
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
     
     if (chroma) transfer_hi = nullptr;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((const __m256i*)mask_arr);
     
     __m256 v_low, v_high;
     if (range) {
@@ -2470,7 +2327,8 @@ static void resize_height_half_8(
     }
     
     for (int y = 0; y < dst_h; y++) {
-        for (int x = 0; x < src_w; x += 8) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
             __m256d v_acc_0 = _mm256_setzero_pd();
             __m256d v_acc_1 = _mm256_setzero_pd();
             for (int i = weights.row_ptr[y]; i < weights.row_ptr[y + 1]; i++) {
@@ -2482,180 +2340,6 @@ static void resize_height_half_8(
             __m256 res = _mm256_setr_m128(_mm256_cvtpd_ps(v_acc_0), _mm256_cvtpd_ps(v_acc_1));
             if (transfer_hi) res = transfer_hi(res);
             _mm_stream_si64((__int64*)(dstp + x), _mm_cvtsi128_si64(simd_bitdepth_ps_epu8(res, v_high, v_low)));
-        }
-        dstp += dst_stride;
-    }
-    _mm_sfence();
-}
-
-static void resize_height_single_pre_16(
-    const uint16_t* VS_RESTRICT srcp, float* VS_RESTRICT dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, __m256 v_low, __m256 v_high, transfer_func transfer_lo
-) noexcept {
-    for (int y = 0; y < src_h; y++) {
-        for (int x = 0; x < src_w; x += 8) {
-            __m128i pix = _mm_load_si128((const __m128i*)(srcp + x));
-            __m256 res = simd_bitdepth_epu16_ps(pix, v_low, v_high);
-            if (transfer_lo) res = transfer_lo(res);
-            _mm256_stream_ps(dstp + x, res);
-        }
-        srcp += src_stride;
-        dstp += dst_stride;
-    }
-    _mm_sfence();
-}
-
-static void resize_height_single_16(
-    const void* VS_RESTRICT ptrs, void* VS_RESTRICT ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, int dst_h, const csr_t& weights, int bits, bool range, bool chroma,
-    transfer_func transfer_lo, transfer_func transfer_hi
-) {
-    const uint16_t* srcp = (const uint16_t*)ptrs;
-    uint16_t* dstp = (uint16_t*)ptrd;
-    
-    ptrdiff_t buf_stride = (src_w + 7) & 0xFFFFFFF8;
-    float* VS_RESTRICT bufp = (float*)_mm_malloc(sizeof(float) * buf_stride * src_h, 64);
-    if (!bufp) throw std::bad_alloc();
-    
-    if (chroma) {
-        transfer_lo = nullptr;
-        transfer_hi = nullptr;
-    }
-    
-    __m256i v_max = _mm256_set1_epi32((1 << bits) - 1);
-    __m256 v_low, v_high;
-    if (range) {
-        v_low = _mm256_set1_ps(chroma ? (128 << (bits - 8)) : 0);
-        v_high = _mm256_set1_ps((chroma ? 256 : 255) << (bits - 8));
-    } else {
-        v_low = _mm256_set1_ps((chroma ? 128 : 16) << (bits - 8));
-        v_high = _mm256_set1_ps((chroma ? 224 : 219) << (bits - 8));
-    }
-    
-    resize_height_single_pre_16(srcp, bufp, src_stride, buf_stride, src_w, src_h, v_low, v_high, transfer_lo);
-    
-    for (int y = 0; y < dst_h; y++) {
-        for (int x = 0; x < src_w; x += 8) {
-            __m256d v_acc_0 = _mm256_setzero_pd();
-            __m256d v_acc_1 = _mm256_setzero_pd();
-            for (int i = weights.row_ptr[y]; i < weights.row_ptr[y + 1]; i++) {
-                __m256 pix = _mm256_load_ps(bufp + weights.col_idx[i] * buf_stride + x);
-                __m256d v_weights = _mm256_set1_pd(weights.values[i]);
-                v_acc_0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), v_weights, v_acc_0);
-                v_acc_1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), v_weights, v_acc_1);
-            }
-            __m256 res = _mm256_setr_m128(_mm256_cvtpd_ps(v_acc_0), _mm256_cvtpd_ps(v_acc_1));
-            if (transfer_hi) res = transfer_hi(res);
-            _mm_stream_si128((__m128i*)(dstp + x), simd_bitdepth_ps_epu16(res, v_high, v_low, v_max));
-        }
-        dstp += dst_stride;
-    }
-    _mm_sfence();
-    _mm_free(bufp);
-}
-
-static void resize_height_half_16(
-    const void* VS_RESTRICT ptrs, void* VS_RESTRICT ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h UNUSED, int dst_h, const csr_t& weights, int bits, bool range, bool chroma,
-    transfer_func transfer_lo UNUSED, transfer_func transfer_hi
-) noexcept {
-    const float* srcp = (const float*)ptrs;
-    uint16_t* dstp = (uint16_t*)ptrd;
-    
-    if (chroma) transfer_hi = nullptr;
-    
-    __m256i v_max = _mm256_set1_epi32((1 << bits) - 1);
-    __m256 v_low, v_high;
-    if (range) {
-        v_low = _mm256_set1_ps(chroma ? (128 << (bits - 8)) : 0);
-        v_high = _mm256_set1_ps((chroma ? 256 : 255) << (bits - 8));
-    } else {
-        v_low = _mm256_set1_ps((chroma ? 128 : 16) << (bits - 8));
-        v_high = _mm256_set1_ps((chroma ? 224 : 219) << (bits - 8));
-    }
-    
-    for (int y = 0; y < dst_h; y++) {
-        for (int x = 0; x < src_w; x += 8) {
-            __m256d v_acc_0 = _mm256_setzero_pd();
-            __m256d v_acc_1 = _mm256_setzero_pd();
-            for (int i = weights.row_ptr[y]; i < weights.row_ptr[y + 1]; i++) {
-                __m256 pix = _mm256_load_ps(srcp + weights.col_idx[i] * src_stride + x);
-                __m256d v_weights = _mm256_set1_pd(weights.values[i]);
-                v_acc_0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), v_weights, v_acc_0);
-                v_acc_1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), v_weights, v_acc_1);
-            }
-            __m256 res = _mm256_setr_m128(_mm256_cvtpd_ps(v_acc_0), _mm256_cvtpd_ps(v_acc_1));
-            if (transfer_hi) res = transfer_hi(res);
-            _mm_stream_si128((__m128i*)(dstp + x), simd_bitdepth_ps_epu16(res, v_high, v_low, v_max));
-        }
-        dstp += dst_stride;
-    }
-    _mm_sfence();
-}
-
-static void resize_height_single_pre_32(
-    const float* VS_RESTRICT srcp, float* VS_RESTRICT dstp, ptrdiff_t stride,
-    int src_h, int tail, int mod8_w, __m256i tail_mask, transfer_func transfer_lo
-) noexcept {
-    for (int y = 0; y < src_h; y++) {
-        int x = 0;
-        for (; x < mod8_w; x += 8) {
-            __m256 pix = _mm256_load_ps(srcp + x);
-            pix = transfer_lo(pix);
-            _mm256_stream_ps(dstp + x, pix);
-        }
-        if (tail) {
-            __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
-            pix = transfer_lo(pix);
-            _mm256_stream_ps(dstp + x, pix);
-        }
-        srcp += stride;
-        dstp += stride;
-    }
-    _mm_sfence();
-}
-
-static void resize_height_single_32(
-    const void* VS_RESTRICT ptrs, void* VS_RESTRICT ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
-    int src_w, int src_h, int dst_h, const csr_t& weights, int bits UNUSED, bool range UNUSED, bool chroma,
-    transfer_func transfer_lo, transfer_func transfer_hi
-) {
-    const float* srcp = (const float*)ptrs;
-    float* dstp = (float*)ptrd;
-    float* VS_RESTRICT bufp = nullptr;
-    int tail = src_w % 8;
-    int mod8_w = src_w - tail;
-    
-    if (chroma) {
-        transfer_lo = nullptr;
-        transfer_hi = nullptr;
-    }
-    
-    int32_t mask_arr[8] = {0};
-    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
-    __m256i tail_mask = _mm256_loadu_si256((const __m256i*)mask_arr);
-    
-    if (transfer_lo) {
-        bufp = (float*)_mm_malloc(sizeof(float) * src_stride * src_h, 64);
-        if (!bufp) throw std::bad_alloc();
-        resize_height_single_pre_32(srcp, bufp, src_stride, src_h, tail, mod8_w, tail_mask, transfer_lo);
-        srcp = bufp;
-    }
-    
-    for (int y = 0; y < dst_h; y++) {
-        int x = 0;
-        for (; x < mod8_w; x += 8) {
-            __m256d v_acc_0 = _mm256_setzero_pd();
-            __m256d v_acc_1 = _mm256_setzero_pd();
-            for (int i = weights.row_ptr[y]; i < weights.row_ptr[y + 1]; i++) {
-                __m256 pix = _mm256_load_ps(srcp + weights.col_idx[i] * src_stride + x);
-                __m256d v_weights = _mm256_set1_pd(weights.values[i]);
-                v_acc_0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), v_weights, v_acc_0);
-                v_acc_1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), v_weights, v_acc_1);
-            }
-            __m256 res = _mm256_setr_m128(_mm256_cvtpd_ps(v_acc_0), _mm256_cvtpd_ps(v_acc_1));
-            if (transfer_hi) res = transfer_hi(res);
-            _mm256_stream_ps(dstp + x, res);
         }
         if (tail) {
             __m256d v_acc_0 = _mm256_setzero_pd();
@@ -2668,12 +2352,70 @@ static void resize_height_single_32(
             }
             __m256 res = _mm256_setr_m128(_mm256_cvtpd_ps(v_acc_0), _mm256_cvtpd_ps(v_acc_1));
             if (transfer_hi) res = transfer_hi(res);
-            _mm256_stream_ps(dstp + x, res);
+            _mm_stream_si64((__int64*)(dstp + x), _mm_cvtsi128_si64(simd_bitdepth_ps_epu8(res, v_high, v_low)));
         }
         dstp += dst_stride;
     }
     _mm_sfence();
-    _mm_free(bufp);
+}
+
+static void resize_height_half_16(
+    const void* VS_RESTRICT ptrs, void* VS_RESTRICT ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
+    int src_w, int src_h UNUSED, int dst_h, const csr_t& weights, int bits, bool range, bool chroma,
+    transfer_func transfer_lo UNUSED, transfer_func transfer_hi
+) noexcept {
+    const float* srcp = (const float*)ptrs;
+    uint16_t* dstp = (uint16_t*)ptrd;
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    if (chroma) transfer_hi = nullptr;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((const __m256i*)mask_arr);
+    
+    __m256i v_max = _mm256_set1_epi32((1 << bits) - 1);
+    __m256 v_low, v_high;
+    if (range) {
+        v_low = _mm256_set1_ps(chroma ? (128 << (bits - 8)) : 0);
+        v_high = _mm256_set1_ps((chroma ? 256 : 255) << (bits - 8));
+    } else {
+        v_low = _mm256_set1_ps((chroma ? 128 : 16) << (bits - 8));
+        v_high = _mm256_set1_ps((chroma ? 224 : 219) << (bits - 8));
+    }
+    
+    for (int y = 0; y < dst_h; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m256d v_acc_0 = _mm256_setzero_pd();
+            __m256d v_acc_1 = _mm256_setzero_pd();
+            for (int i = weights.row_ptr[y]; i < weights.row_ptr[y + 1]; i++) {
+                __m256 pix = _mm256_load_ps(srcp + weights.col_idx[i] * src_stride + x);
+                __m256d v_weights = _mm256_set1_pd(weights.values[i]);
+                v_acc_0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), v_weights, v_acc_0);
+                v_acc_1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), v_weights, v_acc_1);
+            }
+            __m256 res = _mm256_setr_m128(_mm256_cvtpd_ps(v_acc_0), _mm256_cvtpd_ps(v_acc_1));
+            if (transfer_hi) res = transfer_hi(res);
+            _mm_stream_si128((__m128i*)(dstp + x), simd_bitdepth_ps_epu16(res, v_high, v_low, v_max));
+        }
+        if (tail) {
+            __m256d v_acc_0 = _mm256_setzero_pd();
+            __m256d v_acc_1 = _mm256_setzero_pd();
+            for (int i = weights.row_ptr[y]; i < weights.row_ptr[y + 1]; i++) {
+                __m256 pix = _mm256_maskload_ps(srcp + weights.col_idx[i] * src_stride + x, tail_mask);
+                __m256d v_weights = _mm256_set1_pd(weights.values[i]);
+                v_acc_0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), v_weights, v_acc_0);
+                v_acc_1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), v_weights, v_acc_1);
+            }
+            __m256 res = _mm256_setr_m128(_mm256_cvtpd_ps(v_acc_0), _mm256_cvtpd_ps(v_acc_1));
+            if (transfer_hi) res = transfer_hi(res);
+            _mm_stream_si128((__m128i*)(dstp + x), simd_bitdepth_ps_epu16(res, v_high, v_low, v_max));
+        }
+        dstp += dst_stride;
+    }
+    _mm_sfence();
 }
 
 static void resize_height_half_32(
@@ -2723,6 +2465,145 @@ static void resize_height_half_32(
         dstp += dst_stride;
     }
     _mm_sfence();
+}
+
+static void resize_height_single_pre_8(
+    const void* VS_RESTRICT ptrs, void* VS_RESTRICT ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
+    int src_w, int src_h, bool range, bool chroma, transfer_func transfer_lo
+) noexcept {
+    const uint8_t* srcp = (const uint8_t*)ptrs;
+    float* dstp = (float*)ptrd;
+    
+    if (chroma) transfer_lo = nullptr;
+    
+    __m256 v_low, v_high;
+    if (range) {
+        v_low = _mm256_set1_ps(chroma ? 128.0F : 0.0F);
+        v_high = _mm256_set1_ps(chroma ? 256.0F : 255.0F);
+    } else {
+        v_low = _mm256_set1_ps(chroma ? 128.0F : 16.0F);
+        v_high = _mm256_set1_ps(chroma ? 224.0F : 219.0F);
+    }
+    
+    for (int y = 0; y < src_h; y++) {
+        for (int x = 0; x < src_w; x += 8) {
+            __m128i pix = _mm_loadl_epi64((const __m128i*)(srcp + x));
+            __m256 res = simd_bitdepth_epu8_ps(pix, v_low, v_high);
+            if (transfer_lo) res = transfer_lo(res);
+            _mm256_stream_ps(dstp + x, res);
+        }
+        srcp += src_stride;
+        dstp += dst_stride;
+    }
+    _mm_sfence();
+}
+
+static void resize_height_single_pre_16(
+    const void* VS_RESTRICT ptrs, void* VS_RESTRICT ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
+    int src_w, int src_h, int bits, bool range, bool chroma, transfer_func transfer_lo
+) noexcept {
+    const uint16_t* srcp = (const uint16_t*)ptrs;
+    float* dstp = (float*)ptrd;
+    
+    if (chroma) transfer_lo = nullptr;
+    
+    __m256 v_low, v_high;
+    if (range) {
+        v_low = _mm256_set1_ps(chroma ? (128 << (bits - 8)) : 0);
+        v_high = _mm256_set1_ps((chroma ? 256 : 255) << (bits - 8));
+    } else {
+        v_low = _mm256_set1_ps((chroma ? 128 : 16) << (bits - 8));
+        v_high = _mm256_set1_ps((chroma ? 224 : 219) << (bits - 8));
+    }
+    
+    for (int y = 0; y < src_h; y++) {
+        for (int x = 0; x < src_w; x += 8) {
+            __m128i pix = _mm_load_si128((const __m128i*)(srcp + x));
+            __m256 res = simd_bitdepth_epu16_ps(pix, v_low, v_high);
+            if (transfer_lo) res = transfer_lo(res);
+            _mm256_stream_ps(dstp + x, res);
+        }
+        srcp += src_stride;
+        dstp += dst_stride;
+    }
+    _mm_sfence();
+}
+
+static void resize_height_single_pre_32(
+    const void* VS_RESTRICT ptrs, void* VS_RESTRICT ptrd, ptrdiff_t stride,
+    int src_w, int src_h, transfer_func transfer_lo
+) noexcept {
+    const float* srcp = (const float*)ptrs;
+    float* dstp = (float*)ptrd;
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((const __m256i*)mask_arr);
+    
+    for (int y = 0; y < src_h; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m256 pix = _mm256_load_ps(srcp + x);
+            pix = transfer_lo(pix);
+            _mm256_stream_ps(dstp + x, pix);
+        }
+        if (tail) {
+            __m256 pix = _mm256_maskload_ps(srcp + x, tail_mask);
+            pix = transfer_lo(pix);
+            _mm256_stream_ps(dstp + x, pix);
+        }
+        srcp += stride;
+        dstp += stride;
+    }
+    _mm_sfence();
+}
+
+static void resize_height_single_8(
+    const void* VS_RESTRICT ptrs, void* VS_RESTRICT ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
+    int src_w, int src_h, int dst_h, const csr_t& weights, int bits, bool range, bool chroma,
+    transfer_func transfer_lo, transfer_func transfer_hi
+) {
+    ptrdiff_t buf_stride = (src_w + 7) & 0xFFFFFFF8;
+    void* VS_RESTRICT bufp = _mm_malloc(sizeof(float) * buf_stride * src_h, 64);
+    if (!bufp) throw std::bad_alloc();
+    
+    resize_height_single_pre_8(ptrs, bufp, src_stride, buf_stride, src_w, src_h, range, chroma, transfer_lo);
+    resize_height_half_8(bufp, ptrd, buf_stride, dst_stride, src_w, src_h, dst_h, weights, bits, range, chroma, transfer_lo, transfer_hi);
+    _mm_free(bufp);
+}
+
+static void resize_height_single_16(
+    const void* VS_RESTRICT ptrs, void* VS_RESTRICT ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
+    int src_w, int src_h, int dst_h, const csr_t& weights, int bits, bool range, bool chroma,
+    transfer_func transfer_lo, transfer_func transfer_hi
+) {
+    ptrdiff_t buf_stride = (src_w + 7) & 0xFFFFFFF8;
+    void* VS_RESTRICT bufp = _mm_malloc(sizeof(float) * buf_stride * src_h, 64);
+    if (!bufp) throw std::bad_alloc();
+    
+    resize_height_single_pre_16(ptrs, bufp, src_stride, buf_stride, src_w, src_h, bits, range, chroma, transfer_lo);
+    resize_height_half_16(bufp, ptrd, buf_stride, dst_stride, src_w, src_h, dst_h, weights, bits, range, chroma, transfer_lo, transfer_hi);
+    _mm_free(bufp);
+}
+
+static void resize_height_single_32(
+    const void* VS_RESTRICT ptrs, void* VS_RESTRICT ptrd, ptrdiff_t src_stride, ptrdiff_t dst_stride,
+    int src_w, int src_h, int dst_h, const csr_t& weights, int bits, bool range, bool chroma,
+    transfer_func transfer_lo, transfer_func transfer_hi
+) {
+    void* VS_RESTRICT bufp = nullptr;
+    
+    if (transfer_lo && !chroma) {
+        bufp = _mm_malloc(sizeof(float) * src_stride * src_h, 64);
+        if (!bufp) throw std::bad_alloc();
+        resize_height_single_pre_32(ptrs, bufp, src_stride, src_w, src_h, transfer_lo);
+        ptrs = bufp;
+    }
+    
+    resize_height_half_32(ptrs, ptrd, src_stride, dst_stride, src_w, src_h, dst_h, weights, bits, range, chroma, transfer_lo, transfer_hi);
+    _mm_free(bufp);
 }
 
 static const VSFrame* VS_CC ResizeGetFrame(
@@ -2787,7 +2668,7 @@ static const VSFrame* VS_CC ResizeGetFrame(
             
             csr_t chroma_w{}, chroma_h{};
             
-            if (d->process_w && fi->subSamplingW) {
+            if (d->resize_width && fi->subSamplingW) {
                 int chroma_src_w = d->vi.width >> fi->subSamplingW;
                 int chroma_dst_w = d->dst_width >> fi->subSamplingW;
                 double start_w = d->start_w / (1 << fi->subSamplingW);
@@ -2799,7 +2680,7 @@ static const VSFrame* VS_CC ResizeGetFrame(
                 chroma_w = d->csr_weights(d->kernel_w, chroma_src_w, chroma_dst_w, start_w, real_w);
             }
             
-            if (d->process_h && fi->subSamplingH) {
+            if (d->resize_height && fi->subSamplingH) {
                 int chroma_src_h = d->vi.height >> fi->subSamplingH;
                 int chroma_dst_h = d->dst_height >> fi->subSamplingH;
                 double start_h = d->start_h / (1 << fi->subSamplingH);
@@ -2814,7 +2695,7 @@ static const VSFrame* VS_CC ResizeGetFrame(
                 chroma_h = d->csr_weights(d->kernel_h, chroma_src_h, chroma_dst_h, start_h, real_h);
             }
             
-            if (d->process_w && d->process_h) {
+            if (d->resize_width && d->resize_height) {
                 tmp = vsapi->newVideoFrame(&d->vi.format, d->dst_width, d->vi.height, nullptr, core);
             }
             
@@ -2835,7 +2716,7 @@ static const VSFrame* VS_CC ResizeGetFrame(
                 bool sub_w = plane && fi->subSamplingW;
                 bool sub_h = plane && fi->subSamplingH;
                 
-                if (d->process_w && d->process_h) {
+                if (d->resize_width && d->resize_height) {
                     void* tmpp = (void*)vsapi->getWritePtr(tmp, plane);
                     ptrdiff_t tmp_stride = vsapi->getStride(tmp, plane) / sizeof(float);
                     d->resize_width(
@@ -2846,12 +2727,12 @@ static const VSFrame* VS_CC ResizeGetFrame(
                         tmpp, dstp, tmp_stride, dst_stride, dst_w, src_h, dst_h, sub_h ? chroma_h : d->luma_h,
                         fi->bitsPerSample, range, chroma, transfer_lo, transfer_hi
                     );
-                } else if (d->process_w) {
+                } else if (d->resize_width) {
                     d->resize_width(
                         srcp, dstp, src_stride, dst_stride, src_w, src_h, dst_w, sub_w ? chroma_w : d->luma_w,
                         fi->bitsPerSample, range, chroma, transfer_lo, transfer_hi
                     );
-                } else if (d->process_h) {
+                } else if (d->resize_height) {
                     d->resize_height(
                         srcp, dstp, src_stride, dst_stride, dst_w, src_h, dst_h, sub_h ? chroma_h : d->luma_h,
                         fi->bitsPerSample, range, chroma, transfer_lo, transfer_hi
@@ -3119,18 +3000,18 @@ static void VS_CC ResizeCreate(const VSMap* in, VSMap* out, void* userData UNUSE
             throw std::runtime_error("invalid kernel specified");
         }
         
-        d->process_w = (d->dst_width != d->vi.width || d->real_w != d->vi.width || d->start_w != 0.0);
-        d->process_h = (d->dst_height != d->vi.height || d->real_h != d->vi.height || d->start_h != 0.0);
+        bool process_w = (d->dst_width != d->vi.width || d->real_w != d->vi.width || d->start_w != 0.0);
+        bool process_h = (d->dst_height != d->vi.height || d->real_h != d->vi.height || d->start_h != 0.0);
         
-        if (d->process_w) {
+        if (process_w) {
             d->luma_w = d->csr_weights(d->kernel_w, d->vi.width, d->dst_width, d->start_w, d->real_w);
         }
         
-        if (d->process_h) {
+        if (process_h) {
             d->luma_h = d->csr_weights(d->kernel_h, d->vi.height, d->dst_height, d->start_h, d->real_h);
         }
         
-        if (d->process_w && d->process_h) {
+        if (process_w && process_h) {
             if (d->vi.format.bytesPerSample == 1) {
                 d->resize_width = resize_width_half_8;
                 d->resize_height = resize_height_half_8;
@@ -3141,7 +3022,7 @@ static void VS_CC ResizeCreate(const VSMap* in, VSMap* out, void* userData UNUSE
                 d->resize_width = resize_width_half_32;
                 d->resize_height = resize_height_half_32;
             }
-        } else if (d->process_w) {
+        } else if (process_w) {
             if (d->vi.format.bytesPerSample == 1) {
                 d->resize_width = resize_width_single_8;
             } else if (d->vi.format.bytesPerSample == 2) {
@@ -3149,7 +3030,7 @@ static void VS_CC ResizeCreate(const VSMap* in, VSMap* out, void* userData UNUSE
             } else {
                 d->resize_width = resize_width_single_32;
             }
-        } else if (d->process_h) {
+        } else if (process_h) {
             if (d->vi.format.bytesPerSample == 1) {
                 d->resize_height = resize_height_single_8;
             } else if (d->vi.format.bytesPerSample == 2) {
@@ -19794,7 +19675,7 @@ struct TreapNode {
     int count = 1, size = 1;
     std::unique_ptr<TreapNode> left;
     std::unique_ptr<TreapNode> right;
-    explicit TreapNode(uint32_t k) noexcept : key(k), priority(rdrand32()) {}
+    explicit TreapNode(uint32_t key) noexcept : key(key), priority(rdrand32()) {}
 };
 
 static void treap_update_size_32(std::unique_ptr<TreapNode>& node) noexcept {
@@ -38628,7 +38509,7 @@ static void VS_CC BinarizeCreate(
 }
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI* vspapi) {
-    vspapi->configPlugin("com.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(23, 1), VAPOURSYNTH_API_VERSION, 0, plugin);
+    vspapi->configPlugin("com.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(23, 2), VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction(
         "BitDepth",
         "clip:vnode;"
