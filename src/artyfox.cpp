@@ -3285,173 +3285,171 @@ static void banded_cholesky_from_gramian(const banded_t& banded) noexcept {
     }
 }
 
-static void banded_solve_cholesky_x4(const banded_t& banded, double* dstp) noexcept {
+static void banded_solve_cholesky_x8_ps(const banded_t& banded, float* dstp) noexcept {
     int kf = banded.kd + 1;
     
-    for (int i = 0; i < banded.row_n; i++) {
-        __m256d v_acc = _mm256_load_pd(dstp + i * 4);
-        int j_start = std::max(i - banded.kd, 0);
-        for (int j = j_start; j < i; j++) {
-            __m256d pix = _mm256_load_pd(dstp + j * 4);
-            __m256d v_weights = _mm256_set1_pd(banded.values[j * kf + (i - j)]);
-            v_acc = _mm256_fnmadd_pd(pix, v_weights, v_acc);
+    for (int x = 0; x < banded.row_n; x++) {
+        __m256 pix = _mm256_load_ps(dstp + x * 8);
+        __m256d v_acc_0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0));
+        __m256d v_acc_1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1));
+        int i_start = std::max(x - banded.kd, 0);
+        for (int i = i_start; i < x; i++) {
+            pix = _mm256_load_ps(dstp + i * 8);
+            __m256d v_weights = _mm256_set1_pd(banded.values[i * kf + (x - i)]);
+            v_acc_0 = _mm256_fnmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), v_weights, v_acc_0);
+            v_acc_1 = _mm256_fnmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), v_weights, v_acc_1);
         }
-        __m256d v_div = _mm256_set1_pd(banded.values[i * kf]);
-        _mm256_store_pd(dstp + i * 4, _mm256_div_pd(v_acc, v_div));
+        __m256d v_div = _mm256_set1_pd(banded.values[x * kf]);
+        v_acc_0 = _mm256_div_pd(v_acc_0, v_div);
+        v_acc_1 = _mm256_div_pd(v_acc_1, v_div);
+        _mm256_store_ps(dstp + x * 8, _mm256_setr_m128(_mm256_cvtpd_ps(v_acc_0), _mm256_cvtpd_ps(v_acc_1)));
     }
     
-    for (int i = banded.row_n - 1; i >= 0; i--) {
-        __m256d v_acc = _mm256_load_pd(dstp + i * 4);
-        int j_end = std::min(i + banded.kd, banded.row_n - 1);
-        for (int j = j_end; j > i; j--) {
-            __m256d pix = _mm256_load_pd(dstp + j * 4);
-            __m256d v_weights = _mm256_set1_pd(banded.values[i * kf + (j - i)]);
-            v_acc = _mm256_fnmadd_pd(pix, v_weights, v_acc);
+    for (int x = banded.row_n - 1; x >= 0; x--) {
+        __m256 pix = _mm256_load_ps(dstp + x * 8);
+        __m256d v_acc_0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0));
+        __m256d v_acc_1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1));
+        int i_end = std::min(x + banded.kd, banded.row_n - 1);
+        for (int i = i_end; i > x; i--) {
+            pix = _mm256_load_ps(dstp + i * 8);
+            __m256d v_weights = _mm256_set1_pd(banded.values[x * kf + (i - x)]);
+            v_acc_0 = _mm256_fnmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), v_weights, v_acc_0);
+            v_acc_1 = _mm256_fnmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), v_weights, v_acc_1);
         }
-        __m256d v_div = _mm256_set1_pd(banded.values[i * kf]);
-        _mm256_store_pd(dstp + i * 4, _mm256_div_pd(v_acc, v_div));
+        __m256d v_div = _mm256_set1_pd(banded.values[x * kf]);
+        v_acc_0 = _mm256_div_pd(v_acc_0, v_div);
+        v_acc_1 = _mm256_div_pd(v_acc_1, v_div);
+        _mm256_store_ps(dstp + x * 8, _mm256_setr_m128(_mm256_cvtpd_ps(v_acc_0), _mm256_cvtpd_ps(v_acc_1)));
     }
 }
 
-static void banded_solve_cholesky_x8(const banded_t& banded, double* dstp) noexcept {
+static void banded_solve_cholesky_xx_ps(
+    const banded_t& banded, float* dstp, ptrdiff_t stride, int src_w
+) noexcept {
     int kf = banded.kd + 1;
     
-    for (int i = 0; i < banded.row_n; i++) {
-        __m256d v_acc_0 = _mm256_load_pd(dstp + i * 8 + 0);
-        __m256d v_acc_1 = _mm256_load_pd(dstp + i * 8 + 4);
-        int j_start = std::max(i - banded.kd, 0);
-        for (int j = j_start; j < i; j++) {
-            __m256d pix_0 = _mm256_load_pd(dstp + j * 8 + 0);
-            __m256d pix_1 = _mm256_load_pd(dstp + j * 8 + 4);
-            __m256d v_weights = _mm256_set1_pd(banded.values[j * kf + (i - j)]);
-            v_acc_0 = _mm256_fnmadd_pd(pix_0, v_weights, v_acc_0);
-            v_acc_1 = _mm256_fnmadd_pd(pix_1, v_weights, v_acc_1);
+    for (int y = 0; y < banded.row_n; y++) {
+        for (int x = 0; x < src_w; x += 8) {
+            __m256 pix = _mm256_load_ps(dstp + y * stride + x);
+            __m256d v_acc_0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0));
+            __m256d v_acc_1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1));
+            int i_start = std::max(y - banded.kd, 0);
+            for (int i = i_start; i < y; i++) {
+                pix = _mm256_load_ps(dstp + i * stride + x);
+                __m256d v_weights = _mm256_set1_pd(banded.values[i * kf + (y - i)]);
+                v_acc_0 = _mm256_fnmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), v_weights, v_acc_0);
+                v_acc_1 = _mm256_fnmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), v_weights, v_acc_1);
+            }
+            __m256d v_div = _mm256_set1_pd(banded.values[y * kf]);
+            v_acc_0 = _mm256_div_pd(v_acc_0, v_div);
+            v_acc_1 = _mm256_div_pd(v_acc_1, v_div);
+            _mm256_store_ps(dstp + y * stride + x, _mm256_setr_m128(_mm256_cvtpd_ps(v_acc_0), _mm256_cvtpd_ps(v_acc_1)));
         }
-        __m256d v_div = _mm256_set1_pd(banded.values[i * kf]);
-        _mm256_store_pd(dstp + i * 8 + 0, _mm256_div_pd(v_acc_0, v_div));
-        _mm256_store_pd(dstp + i * 8 + 4, _mm256_div_pd(v_acc_1, v_div));
     }
     
-    for (int i = banded.row_n - 1; i >= 0; i--) {
-        __m256d v_acc_0 = _mm256_load_pd(dstp + i * 8 + 0);
-        __m256d v_acc_1 = _mm256_load_pd(dstp + i * 8 + 4);
-        int j_end = std::min(i + banded.kd, banded.row_n - 1);
-        for (int j = j_end; j > i; j--) {
-            __m256d pix_0 = _mm256_load_pd(dstp + j * 8 + 0);
-            __m256d pix_1 = _mm256_load_pd(dstp + j * 8 + 4);
-            __m256d v_weights = _mm256_set1_pd(banded.values[i * kf + (j - i)]);
-            v_acc_0 = _mm256_fnmadd_pd(pix_0, v_weights, v_acc_0);
-            v_acc_1 = _mm256_fnmadd_pd(pix_1, v_weights, v_acc_1);
+    for (int y = banded.row_n - 1; y >= 0; y--) {
+        for (int x = 0; x < src_w; x += 8) {
+            __m256 pix = _mm256_load_ps(dstp + y * stride + x);
+            __m256d v_acc_0 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0));
+            __m256d v_acc_1 = _mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1));
+            int i_end = std::min(y + banded.kd, banded.row_n - 1);
+            for (int i = i_end; i > y; i--) {
+                pix = _mm256_load_ps(dstp + i * stride + x);
+                __m256d v_weights = _mm256_set1_pd(banded.values[y * kf + (i - y)]);
+                v_acc_0 = _mm256_fnmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), v_weights, v_acc_0);
+                v_acc_1 = _mm256_fnmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), v_weights, v_acc_1);
+            }
+            __m256d v_div = _mm256_set1_pd(banded.values[y * kf]);
+            v_acc_0 = _mm256_div_pd(v_acc_0, v_div);
+            v_acc_1 = _mm256_div_pd(v_acc_1, v_div);
+            _mm256_store_ps(dstp + y * stride + x, _mm256_setr_m128(_mm256_cvtpd_ps(v_acc_0), _mm256_cvtpd_ps(v_acc_1)));
         }
-        __m256d v_div = _mm256_set1_pd(banded.values[i * kf]);
-        _mm256_store_pd(dstp + i * 8 + 0, _mm256_div_pd(v_acc_0, v_div));
-        _mm256_store_pd(dstp + i * 8 + 4, _mm256_div_pd(v_acc_1, v_div));
     }
 }
 
-static void transpose_block_from_buf_pd_ps(
-    const double* VS_RESTRICT srcp, float* VS_RESTRICT dstp, ptrdiff_t stride, int dst_w
+static void descale_dot_product_x8_ps(
+    const float* VS_RESTRICT srcp, float* VS_RESTRICT dstp, const csr_t& weights
 ) noexcept {
-    for (int x = 0; x < dst_w; x += 8) {
-        __m256 pix0 = _mm256_setr_m128(
-            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 0)),
-            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 4))
-        );
-        __m256 pix1 = _mm256_setr_m128(
-            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 8)),
-            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 12))
-        );
-        __m256 pix2 = _mm256_setr_m128(
-            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 16)),
-            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 20))
-        );
-        __m256 pix3 = _mm256_setr_m128(
-            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 24)),
-            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 28))
-        );
-        SIMD_TRANSPOSE4X8_PS(pix0, pix1, pix2, pix3);
-        _mm256_stream_ps(dstp + stride * 0, pix0);
-        _mm256_stream_ps(dstp + stride * 1, pix1);
-        _mm256_stream_ps(dstp + stride * 2, pix2);
-        _mm256_stream_ps(dstp + stride * 3, pix3);
-        srcp += 32;
-        dstp += 8;
+    for (int i = 0; i < weights.row_n; i++) {
+        __m256d v_acc_0 = _mm256_setzero_pd();
+        __m256d v_acc_1 = _mm256_setzero_pd();
+        for (int j = weights.row_ptr[i]; j < weights.row_ptr[i + 1]; j++) {
+            __m256 pix = _mm256_load_ps(srcp + weights.col_idx[j] * 8);
+            __m256d v_weights = _mm256_set1_pd(weights.values[j]);
+            v_acc_0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), v_weights, v_acc_0);
+            v_acc_1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), v_weights, v_acc_1);
+        }
+        _mm256_store_ps(dstp + i * 8, _mm256_setr_m128(_mm256_cvtpd_ps(v_acc_0), _mm256_cvtpd_ps(v_acc_1)));
     }
 }
 
-static void transpose_block_from_buf_with_tail_pd_ps(
-    const double* VS_RESTRICT srcp, float* VS_RESTRICT dstp, ptrdiff_t stride, int dst_w, int tail
+static void descale_dot_product_xx_ps(
+    const float* VS_RESTRICT srcp, float* VS_RESTRICT dstp, const csr_t& weights, ptrdiff_t stride, int src_w
 ) noexcept {
-    for (int x = 0; x < dst_w; x += 8) {
-        __m256 pix0 = _mm256_setr_m128(
-            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 0)),
-            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 4))
-        );
-        __m256 pix1 = _mm256_setr_m128(
-            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 8)),
-            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 12))
-        );
-        __m256 pix2 = _mm256_setr_m128(
-            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 16)),
-            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 20))
-        );
-        __m256 pix3 = _mm256_setr_m128(
-            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 24)),
-            _mm256_cvtpd_ps(_mm256_load_pd(srcp + 28))
-        );
-        SIMD_TRANSPOSE4X8_PS(pix0, pix1, pix2, pix3);
-        _mm256_stream_ps(dstp + stride * 0, pix0);
-        if (tail > 1) _mm256_stream_ps(dstp + stride * 1, pix1);
-        if (tail > 2) _mm256_stream_ps(dstp + stride * 2, pix2);
-        srcp += 32;
-        dstp += 8;
+    int tail = src_w % 8;
+    int mod8_w = src_w - tail;
+    
+    int32_t mask_arr[8] = {0};
+    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
+    __m256i tail_mask = _mm256_loadu_si256((const __m256i*)mask_arr);
+    
+    for (int y = 0; y < weights.row_n; y++) {
+        int x = 0;
+        for (; x < mod8_w; x += 8) {
+            __m256d v_acc_0 = _mm256_setzero_pd();
+            __m256d v_acc_1 = _mm256_setzero_pd();
+            for (int i = weights.row_ptr[y]; i < weights.row_ptr[y + 1]; i++) {
+                __m256 pix = _mm256_load_ps(srcp + weights.col_idx[i] * stride + x);
+                __m256d v_weights = _mm256_set1_pd(weights.values[i]);
+                v_acc_0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), v_weights, v_acc_0);
+                v_acc_1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), v_weights, v_acc_1);
+            }
+            _mm256_stream_ps(dstp + x, _mm256_setr_m128(_mm256_cvtpd_ps(v_acc_0), _mm256_cvtpd_ps(v_acc_1)));
+        }
+        if (tail) {
+            __m256d v_acc_0 = _mm256_setzero_pd();
+            __m256d v_acc_1 = _mm256_setzero_pd();
+            for (int i = weights.row_ptr[y]; i < weights.row_ptr[y + 1]; i++) {
+                __m256 pix = _mm256_maskload_ps(srcp + weights.col_idx[i] * stride + x, tail_mask);
+                __m256d v_weights = _mm256_set1_pd(weights.values[i]);
+                v_acc_0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), v_weights, v_acc_0);
+                v_acc_1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), v_weights, v_acc_1);
+            }
+            _mm256_stream_ps(dstp + x, _mm256_setr_m128(_mm256_cvtpd_ps(v_acc_0), _mm256_cvtpd_ps(v_acc_1)));
+        }
+        dstp += stride;
     }
+    _mm_sfence();
 }
 
 static void descale_width(
     const float* VS_RESTRICT srcp, float* VS_RESTRICT dstp, ptrdiff_t src_stride, ptrdiff_t dst_stride,
     int src_w, int src_h, int dst_w, const csr_t& weights, const banded_t& banded
 ) {
-    int tail = src_h % 4;
-    int mod4_h = src_h - tail;
-    
-    float* VS_RESTRICT src_buf = (float*)_mm_malloc(sizeof(float) * src_stride * 4, 64);
-    double* VS_RESTRICT dst_buf = (double*)_mm_malloc(sizeof(double) * dst_stride * 4, 64);
+    int tail = src_h % 8;
+    int mod8_h = src_h - tail;
+
+    float* VS_RESTRICT src_buf = (float*)_mm_malloc(sizeof(float) * src_stride * 8, 64);
+    float* VS_RESTRICT dst_buf = (float*)_mm_malloc(sizeof(float) * dst_stride * 8, 64);
     if (!src_buf || !dst_buf) {
         _mm_free(src_buf);
         _mm_free(dst_buf);
         throw std::bad_alloc();
     }
-    
-    for (int y = 0; y < mod4_h; y += 4) {
-        transpose_block_into_buf_ps(srcp, src_buf, src_stride, src_w);
-        for (int x = 0; x < dst_w; x++) {
-            __m256d v_acc = _mm256_setzero_pd();
-            for (int i = weights.row_ptr[x]; i < weights.row_ptr[x + 1]; i++) {
-                __m128 pix = _mm_load_ps(src_buf + weights.col_idx[i] * 4);
-                __m256d v_weights = _mm256_set1_pd(weights.values[i]);
-                v_acc = _mm256_fmadd_pd(_mm256_cvtps_pd(pix), v_weights, v_acc);
-            }
-            _mm256_store_pd(dst_buf + x * 4, v_acc);
-        }
-        banded_solve_cholesky_x4(banded, dst_buf);
-        transpose_block_from_buf_pd_ps(dst_buf, dstp, dst_stride, dst_w);
-        dstp += dst_stride * 4;
-        srcp += src_stride * 4;
+
+    for (int y = 0; y < mod8_h; y += 8) {
+        transpose_square_into_buf_ps(srcp, src_buf, src_stride, src_w);
+        descale_dot_product_x8_ps(src_buf, dst_buf, weights);
+        banded_solve_cholesky_x8_ps(banded, dst_buf);
+        transpose_square_from_buf_ps(dst_buf, dstp, dst_stride, dst_w);
+        dstp += dst_stride * 8;
+        srcp += src_stride * 8;
     }
     if (tail) {
-        transpose_block_into_buf_with_tail_ps(srcp, src_buf, src_stride, src_w, tail);
-        for (int x = 0; x < dst_w; x++) {
-            __m256d v_acc = _mm256_setzero_pd();
-            for (int i = weights.row_ptr[x]; i < weights.row_ptr[x + 1]; i++) {
-                __m128 pix = _mm_load_ps(src_buf + weights.col_idx[i] * 4);
-                __m256d v_weights = _mm256_set1_pd(weights.values[i]);
-                v_acc = _mm256_fmadd_pd(_mm256_cvtps_pd(pix), v_weights, v_acc);
-            }
-            _mm256_store_pd(dst_buf + x * 4, v_acc);
-        }
-        banded_solve_cholesky_x4(banded, dst_buf);
-        transpose_block_from_buf_with_tail_pd_ps(dst_buf, dstp, dst_stride, dst_w, tail);
+        transpose_square_into_buf_with_tail_ps(srcp, src_buf, src_stride, src_w, tail);
+        descale_dot_product_x8_ps(src_buf, dst_buf, weights);
+        banded_solve_cholesky_x8_ps(banded, dst_buf);
+        transpose_square_from_buf_with_tail_ps(dst_buf, dstp, dst_stride, dst_w, tail);
     }
     _mm_sfence();
     _mm_free(dst_buf);
@@ -3460,62 +3458,12 @@ static void descale_width(
 
 static void descale_height(
     const float* VS_RESTRICT srcp, float* VS_RESTRICT dstp, ptrdiff_t src_stride,
-    int src_w, int src_h UNUSED, int dst_h, const csr_t& weights, const banded_t& banded
-) {
-    int tail = src_w % 8;
-    int mod8_w = src_w - tail;
+    int src_w, int src_h UNUSED, int dst_h UNUSED, const csr_t& weights, const banded_t& banded
+) noexcept {
     
-    int32_t mask_arr[8] = {0};
-    for (int i = 0; i < tail; i++) mask_arr[i] = -1;
-    __m256i tail_mask = _mm256_loadu_si256((const __m256i*)mask_arr);
+    descale_dot_product_xx_ps(srcp, dstp, weights, src_stride, src_w);
+    banded_solve_cholesky_xx_ps(banded, dstp, src_stride, src_w);
     
-    double* VS_RESTRICT dst_buf = (double*)_mm_malloc(sizeof(double) * dst_h * 8, 64);
-    if (!dst_buf) throw std::bad_alloc();
-    
-    for (int x = 0; x < mod8_w; x += 8) {
-        for (int y = 0; y < dst_h; y++) {
-            __m256d v_acc_0 = _mm256_setzero_pd();
-            __m256d v_acc_1 = _mm256_setzero_pd();
-            for (int i = weights.row_ptr[y]; i < weights.row_ptr[y + 1]; i++) {
-                __m256 pix = _mm256_load_ps(srcp + weights.col_idx[i] * src_stride);
-                __m256d v_weights = _mm256_set1_pd(weights.values[i]);
-                v_acc_0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), v_weights, v_acc_0);
-                v_acc_1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), v_weights, v_acc_1);
-            }
-            _mm256_store_pd(dst_buf + y * 8 + 0, v_acc_0);
-            _mm256_store_pd(dst_buf + y * 8 + 4, v_acc_1);
-        }
-        banded_solve_cholesky_x8(banded, dst_buf);
-        for (int y = 0; y < dst_h; y++) {
-            __m128 pix0 = _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + y * 8 + 0));
-            __m128 pix1 = _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + y * 8 + 4));
-            _mm256_stream_ps(dstp + y * src_stride, _mm256_setr_m128(pix0, pix1));
-        }
-        srcp += 8;
-        dstp += 8;
-    }
-    if (tail) {
-        for (int y = 0; y < dst_h; y++) {
-            __m256d v_acc_0 = _mm256_setzero_pd();
-            __m256d v_acc_1 = _mm256_setzero_pd();
-            for (int i = weights.row_ptr[y]; i < weights.row_ptr[y + 1]; i++) {
-                __m256 pix = _mm256_maskload_ps(srcp + weights.col_idx[i] * src_stride, tail_mask);
-                __m256d v_weights = _mm256_set1_pd(weights.values[i]);
-                v_acc_0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 0)), v_weights, v_acc_0);
-                v_acc_1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(pix, 1)), v_weights, v_acc_1);
-            }
-            _mm256_store_pd(dst_buf + y * 8 + 0, v_acc_0);
-            _mm256_store_pd(dst_buf + y * 8 + 4, v_acc_1);
-        }
-        banded_solve_cholesky_x8(banded, dst_buf);
-        for (int y = 0; y < dst_h; y++) {
-            __m128 pix0 = _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + y * 8 + 0));
-            __m128 pix1 = _mm256_cvtpd_ps(_mm256_load_pd(dst_buf + y * 8 + 4));
-            _mm256_stream_ps(dstp + y * src_stride, _mm256_setr_m128(pix0, pix1));
-        }
-    }
-    _mm_sfence();
-    _mm_free(dst_buf);
 }
 
 static const VSFrame* VS_CC DescaleGetFrame(
