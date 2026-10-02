@@ -1067,6 +1067,56 @@ struct kernel_lanczos {
     }
 };
 
+// Based on: https://forum.doom9.org/showthread.php?t=147117
+struct kernel_spline {
+    double taps;
+    std::shared_ptr<double[]> coef;
+    explicit kernel_spline(double taps) : taps(taps) {
+        int itaps = (int)taps;
+        coef = std::make_shared_for_overwrite<double[]>(4 * itaps);
+        auto y = std::make_unique<double[]>(2 * itaps + 1);
+        auto f = std::make_unique<double[]>(2 * itaps - 1);
+        auto w = std::make_unique_for_overwrite<double[]>(2 * itaps);
+        auto z = std::make_unique_for_overwrite<double[]>(2 * itaps);
+        auto x = std::make_unique<double[]>(2 * itaps + 1);
+        
+        y[itaps] = 1.0;
+        if (itaps > 1) {
+            f[itaps - 2] = 6.0;
+            f[itaps] = 6.0;
+        }
+        f[itaps - 1] = -12.0;
+        w[0] = 4.0;
+        z[0] = f[0] / w[0];
+        for (int i = 1; i < 2 * itaps; i++) {
+            w[i] = 4.0 - 1.0 / w[i - 1];
+            z[i] = (f[i] - z[i - 1]) / w[i];
+        }
+        for (int i = 2 * itaps - 1; i > 0; i--) {
+            x[i] = z[i - 1] - x[i + 1] / w[i - 1];
+        }
+        for (int i = itaps; i < 2 * itaps; i++) {
+            int idx = 4 * (i - itaps);
+            coef[idx + 0] = (x[i + 1] - x[i]) / 6.0;
+            coef[idx + 1] = x[i] / 2.0;
+            coef[idx + 2] = (y[i + 1] - y[i]) - (x[i + 1] + 2.0 * x[i]) / 6.0;
+            coef[idx + 3] = y[i];
+        }
+    }
+    double operator()(double x) const noexcept {
+        x = std::abs(x);
+        if (x < taps) {
+            int idx = 4 * (int)x;
+            x -= std::trunc(x);
+            return ((coef[idx] * x + coef[idx + 1]) * x + coef[idx + 2]) * x + coef[idx + 3];
+        }
+        return 0.0;
+    }
+    double radius() const noexcept {
+        return taps;
+    }
+};
+
 struct kernel_spline16 {
     double operator()(double x) const noexcept {
         x = std::abs(x);
@@ -1202,7 +1252,6 @@ struct kernel_point {
             return 1.0;
         }
         return 0.0;
-        
     }
     double radius() const noexcept {
         return taps;
@@ -1268,24 +1317,10 @@ struct kernel_gauss {
     }
 };
 
-struct kernel_box {
-    double taps;
-    double operator()(double x) const noexcept {
-        x = std::abs(x);
-        if (x < taps) {
-            return 1.0;
-        }
-        return 0.0;
-    }
-    double radius() const noexcept {
-        return taps;
-    }
-};
-
 using kernel_t = std::variant<
-    kernel_area, kernel_magic, kernel_magic_2013, kernel_magic_2021, kernel_bilinear, kernel_bicubic,
-    kernel_lanczos, kernel_spline16, kernel_spline36, kernel_spline64, kernel_spline100, kernel_spline144,
-    kernel_point, kernel_blackman, kernel_nuttall, kernel_kaiser, kernel_gauss, kernel_box
+    kernel_area, kernel_magic, kernel_magic_2013, kernel_magic_2021, kernel_bilinear, kernel_bicubic, kernel_lanczos,
+    kernel_spline, kernel_spline16, kernel_spline36, kernel_spline64, kernel_spline100, kernel_spline144, kernel_point,
+    kernel_blackman, kernel_nuttall, kernel_kaiser, kernel_gauss
 >;
 
 static inline double kernel_value(const kernel_t& kernel, double x) noexcept {
@@ -2993,6 +3028,18 @@ static void VS_CC ResizeCreate(const VSMap* in, VSMap* out, void* userData UNUSE
                 throw std::runtime_error("taps must be between 1 and 128");
             }
             d->kernel_w = d->kernel_h = kernel_lanczos{taps};
+        } else if (kernel == "spline") {
+            double taps = vsapi->mapGetFloat(in, "taps", 0, &err);
+            if (err) {
+                taps = 3.0;
+            }
+            if (taps < 1.0 || taps > 128.0) {
+                throw std::runtime_error("taps must be between 1 and 128");
+            }
+            if (std::fmod(taps, 1.0) != 0.0) {
+                throw std::runtime_error("taps must be integer");
+            }
+            d->kernel_w = d->kernel_h = kernel_spline{taps};
         } else if (kernel == "spline16") {
             d->kernel_w = d->kernel_h = kernel_spline16{};
         } else if (kernel == "spline36") {
@@ -3036,7 +3083,7 @@ static void VS_CC ResizeCreate(const VSMap* in, VSMap* out, void* userData UNUSE
             }
             double beta = vsapi->mapGetFloat(in, "b", 0, &err);
             if (err) {
-            beta = 4.0;
+                beta = 4.0;
             }
             if (beta <= 0.0 || beta > 32.0) {
                 throw std::runtime_error("beta must be between 0 and 32");
@@ -3045,7 +3092,7 @@ static void VS_CC ResizeCreate(const VSMap* in, VSMap* out, void* userData UNUSE
         } else if (kernel == "gauss") {
             double p = vsapi->mapGetFloat(in, "b", 0, &err);
             if (err) {
-            p = 30.0;
+                p = 30.0;
             }
             if (p < 1.0 || p > 100.0) {
                 throw std::runtime_error("p must be between 1 and 100");
@@ -3067,7 +3114,7 @@ static void VS_CC ResizeCreate(const VSMap* in, VSMap* out, void* userData UNUSE
             if (taps < 1.0 || taps > 128.0) {
                 throw std::runtime_error("taps must be between 1 and 128");
             }
-            d->kernel_w = d->kernel_h = kernel_box{taps};
+            d->kernel_w = d->kernel_h = kernel_point{taps};
         } else {
             throw std::runtime_error("invalid kernel specified");
         }
@@ -3705,7 +3752,7 @@ static void VS_CC DescaleCreate(const VSMap* in, VSMap* out, void* userData UNUS
             if (err) {
                 c = 1.0 / 3.0;
             }
-            d->kernel_w = d->kernel_h = kernel_bicubic{b ,c};
+            d->kernel_w = d->kernel_h = kernel_bicubic{b, c};
         } else if (kernel == "lanczos") {
             double taps = vsapi->mapGetFloat(in, "taps", 0, &err);
             if (err) {
@@ -3715,6 +3762,18 @@ static void VS_CC DescaleCreate(const VSMap* in, VSMap* out, void* userData UNUS
                 throw std::runtime_error("taps must be between 1 and 128");
             }
             d->kernel_w = d->kernel_h = kernel_lanczos{taps};
+        } else if (kernel == "spline") {
+            double taps = vsapi->mapGetFloat(in, "taps", 0, &err);
+            if (err) {
+                taps = 3.0;
+            }
+            if (taps < 1.0 || taps > 128.0) {
+                throw std::runtime_error("taps must be between 1 and 128");
+            }
+            if (std::fmod(taps, 1.0) != 0.0) {
+                throw std::runtime_error("taps must be integer");
+            }
+            d->kernel_w = d->kernel_h = kernel_spline{taps};
         } else if (kernel == "spline16") {
             d->kernel_w = d->kernel_h = kernel_spline16{};
         } else if (kernel == "spline36") {
@@ -3755,7 +3814,7 @@ static void VS_CC DescaleCreate(const VSMap* in, VSMap* out, void* userData UNUS
             }
             double beta = vsapi->mapGetFloat(in, "b", 0, &err);
             if (err) {
-            beta = 4.0;
+                beta = 4.0;
             }
             if (beta <= 0.0 || beta > 32.0) {
                 throw std::runtime_error("beta must be between 0 and 32");
@@ -3764,7 +3823,7 @@ static void VS_CC DescaleCreate(const VSMap* in, VSMap* out, void* userData UNUS
         } else if (kernel == "gauss") {
             double p = vsapi->mapGetFloat(in, "b", 0, &err);
             if (err) {
-            p = 30.0;
+                p = 30.0;
             }
             if (p < 1.0 || p > 100.0) {
                 throw std::runtime_error("p must be between 1 and 100");
@@ -3786,7 +3845,7 @@ static void VS_CC DescaleCreate(const VSMap* in, VSMap* out, void* userData UNUS
             if (taps < 1.0 || taps > 128.0) {
                 throw std::runtime_error("taps must be between 1 and 128");
             }
-            d->kernel_w = d->kernel_h = kernel_box{taps};
+            d->kernel_w = d->kernel_h = kernel_point{taps};
         } else {
             throw std::runtime_error("invalid kernel specified");
         }
