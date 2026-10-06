@@ -79,14 +79,15 @@ Implementation of multiple resize functions using double-precision convolution m
   * `bilinear`: Bilinear interpolation, used by default.
   * `blackman`: Blackman windowed sinc.
   * `box`: Box interpolation.
-  * `gauss`: Gaussian kernel. `p` is specified via the `b` parameter, it must be between 1 and 100, the default value is `30.0`. `taps` must be in the range from 1 to 128, the default value is `4.0`.
-  * `kaiser`: Kaiser–Bessel windowed sinc. `beta` (`Pi` * `alpha`) is specified via the `b` parameter, it must be between 0 and 32, the default value is `4.0`.
+  * `gauss`: Gaussian kernel. `p` is specified via the `b` parameter. It must be between 1 and 100, the default value is `30.0`. `taps` must be in the range from 1 to 128, the default value is `4.0`.
+  * `kaiser`: Kaiser–Bessel windowed sinc. `beta` (`Pi` * `alpha`) is specified via the `b` parameter. It must be between 0 and 32, the default value is `4.0`.
   * `lanczos`: Lanczos windowed sinc.
   * `magic`: Magic Kernel.
   * `magic13`: Magic Kernel Sharp 2013.
   * `magic21`: Magic Kernel Sharp 2021.
   * `nuttall`: Nuttall windowed sinc.
   * `point`: Nearest neighbour interpolation.
+  * `sinc`: Bounded sinc function.
   * `spline`: Cubic spline with `taps * 2` sample points.
   * `spline16`: Cubic spline with 4 sample points.
   * `spline36`: Cubic spline with 6 sample points.
@@ -95,7 +96,7 @@ Implementation of multiple resize functions using double-precision convolution m
   * `spline144`: Cubic spline with 12 sample points.
 * `b`: The `b` parameter in the `bicubic` kernel. Defaults to `1/3`.
 * `c`: The `c` parameter in the `bicubic` kernel. Defaults to `1/3`.
-* `taps`: Window radius value for `blackman`, `box`, `gauss`, `kaiser`, `lanczos`, `nuttall` and `spline` kernels, it must be between 1 and 128, the default value is `3.0` (except for `gauss`).
+* `taps`: Window radius value for `blackman`, `box`, `gauss`, `kaiser`, `lanczos`, `nuttall`, `sinc` and `spline` kernels. It must be between 1 and 128, the default value is `3.0` (except for `gauss`).
 * `confine`: A method for representing pixels that are outside the frame. Possible values:
   * `zero`: Pixels outside the frame are considered zero.
   * `inf`: Pixels outside the frame are replaced with the nearest pixels within the frame, used by default.
@@ -128,14 +129,15 @@ Descaling via Tikhonov regularization and Cholesky decomposition (L @ L.T) using
   * `bilinear`: Bilinear interpolation, used by default.
   * `blackman`: Blackman windowed sinc.
   * `box`: Box interpolation.
-  * `gauss`: Gaussian kernel. `p` is specified via the `b` parameter, it must be between 1 and 100, the default value is `30.0`. `taps` must be in the range from 1 to 128, the default value is `4.0`.
-  * `kaiser`: Kaiser–Bessel windowed sinc. `beta` (`Pi` * `alpha`) is specified via the `b` parameter, it must be between 0 and 32, the default value is `4.0`.
+  * `gauss`: Gaussian kernel. `p` is specified via the `b` parameter. It must be between 1 and 100, the default value is `30.0`. `taps` must be in the range from 1 to 128, the default value is `4.0`.
+  * `kaiser`: Kaiser–Bessel windowed sinc. `beta` (`Pi` * `alpha`) is specified via the `b` parameter. It must be between 0 and 32, the default value is `4.0`.
   * `lanczos`: Lanczos windowed sinc.
   * `magic`: Magic Kernel.
   * `magic13`: Magic Kernel Sharp 2013.
   * `magic21`: Magic Kernel Sharp 2021.
   * `nuttall`: Nuttall windowed sinc.
   * `point`: Nearest neighbour interpolation.
+  * `sinc`: Bounded sinc function.
   * `spline`: Cubic spline with `taps * 2` sample points.
   * `spline16`: Cubic spline with 4 sample points.
   * `spline36`: Cubic spline with 6 sample points.
@@ -144,7 +146,7 @@ Descaling via Tikhonov regularization and Cholesky decomposition (L @ L.T) using
   * `spline144`: Cubic spline with 12 sample points.
 * `b`: The `b` parameter in the `bicubic` kernel. Defaults to `1/3`.
 * `c`: The `c` parameter in the `bicubic` kernel. Defaults to `1/3`.
-* `taps`: Window radius value for `blackman`, `box`, `gauss`, `kaiser`, `lanczos`, `nuttall` and `spline` kernels, it must be between 1 and 128, the default value is `3.0` (except for `gauss`).
+* `taps`: Window radius value for `blackman`, `box`, `gauss`, `kaiser`, `lanczos`, `nuttall`, `sinc` and `spline` kernels. It must be between 1 and 128, the default value is `3.0` (except for `gauss`).
 * `confine`: A method for representing pixels that are outside the frame. Possible values:
   * `zero`: Pixels outside the frame are considered zero.
   * `inf`: Pixels outside the frame are replaced with the nearest pixels within the frame, used by default.

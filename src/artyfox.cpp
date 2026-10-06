@@ -1317,10 +1317,24 @@ struct kernel_gauss {
     }
 };
 
+struct kernel_sinc {
+    double taps;
+    double operator()(double x) const noexcept {
+        x = std::abs(x);
+        if (x <= taps) {
+            return sinc(x);
+        }
+        return 0.0;
+    }
+    double radius() const noexcept {
+        return taps;
+    }
+};
+
 using kernel_t = std::variant<
     kernel_area, kernel_magic, kernel_magic_2013, kernel_magic_2021, kernel_bilinear, kernel_bicubic, kernel_lanczos,
     kernel_spline, kernel_spline16, kernel_spline36, kernel_spline64, kernel_spline100, kernel_spline144, kernel_point,
-    kernel_blackman, kernel_nuttall, kernel_kaiser, kernel_gauss
+    kernel_blackman, kernel_nuttall, kernel_kaiser, kernel_gauss, kernel_sinc
 >;
 
 static inline double kernel_value(const kernel_t& kernel, double x) noexcept {
@@ -2978,7 +2992,6 @@ static void VS_CC ResizeCreate(const VSMap* in, VSMap* out, void* userData UNUSE
             if (p < 1.0 || p > 100.0) {
                 throw std::runtime_error("p must be between 1 and 100");
             }
-            p *= 0.1;
             double taps = vsapi->mapGetFloat(in, "taps", 0, &err);
             if (err) {
                 taps = 4.0;
@@ -2986,7 +2999,7 @@ static void VS_CC ResizeCreate(const VSMap* in, VSMap* out, void* userData UNUSE
             if (taps < 1.0 || taps > 128.0) {
                 throw std::runtime_error("taps must be between 1 and 128");
             }
-            d->kernel_w = d->kernel_h = kernel_gauss{p, taps};
+            d->kernel_w = d->kernel_h = kernel_gauss{p / 10.0, taps};
         } else if (kernel == "box") {
             double taps = vsapi->mapGetFloat(in, "taps", 0, &err);
             if (err) {
@@ -2996,6 +3009,15 @@ static void VS_CC ResizeCreate(const VSMap* in, VSMap* out, void* userData UNUSE
                 throw std::runtime_error("taps must be between 1 and 128");
             }
             d->kernel_w = d->kernel_h = kernel_point{taps};
+        } else if (kernel == "sinc") {
+            double taps = vsapi->mapGetFloat(in, "taps", 0, &err);
+            if (err) {
+                taps = 3.0;
+            }
+            if (taps < 1.0 || taps > 128.0) {
+                throw std::runtime_error("taps must be between 1 and 128");
+            }
+            d->kernel_w = d->kernel_h = kernel_sinc{taps};
         } else {
             throw std::runtime_error("invalid kernel specified");
         }
@@ -3657,7 +3679,6 @@ static void VS_CC DescaleCreate(const VSMap* in, VSMap* out, void* userData UNUS
             if (p < 1.0 || p > 100.0) {
                 throw std::runtime_error("p must be between 1 and 100");
             }
-            p *= 0.1;
             double taps = vsapi->mapGetFloat(in, "taps", 0, &err);
             if (err) {
                 taps = 4.0;
@@ -3665,7 +3686,7 @@ static void VS_CC DescaleCreate(const VSMap* in, VSMap* out, void* userData UNUS
             if (taps < 1.0 || taps > 128.0) {
                 throw std::runtime_error("taps must be between 1 and 128");
             }
-            d->kernel_w = d->kernel_h = kernel_gauss{p, taps};
+            d->kernel_w = d->kernel_h = kernel_gauss{p / 10.0, taps};
         } else if (kernel == "box") {
             double taps = vsapi->mapGetFloat(in, "taps", 0, &err);
             if (err) {
@@ -3675,6 +3696,15 @@ static void VS_CC DescaleCreate(const VSMap* in, VSMap* out, void* userData UNUS
                 throw std::runtime_error("taps must be between 1 and 128");
             }
             d->kernel_w = d->kernel_h = kernel_point{taps};
+        } else if (kernel == "sinc") {
+            double taps = vsapi->mapGetFloat(in, "taps", 0, &err);
+            if (err) {
+                taps = 3.0;
+            }
+            if (taps < 1.0 || taps > 128.0) {
+                throw std::runtime_error("taps must be between 1 and 128");
+            }
+            d->kernel_w = d->kernel_h = kernel_sinc{taps};
         } else {
             throw std::runtime_error("invalid kernel specified");
         }
@@ -38509,7 +38539,7 @@ static void VS_CC BinarizeCreate(
 }
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI* vspapi) {
-    vspapi->configPlugin("com.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(23, 2), VAPOURSYNTH_API_VERSION, 0, plugin);
+    vspapi->configPlugin("com.artyfox.plugins", "artyfox", "A disjointed set of filters", VS_MAKE_VERSION(23, 3), VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction(
         "BitDepth",
         "clip:vnode;"
